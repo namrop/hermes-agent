@@ -54,6 +54,22 @@ class TestHostHeaderValidator:
                     f"bound={bound} must reject attacker host={attacker!r}"
                 )
 
+    def test_loopback_bind_accepts_explicit_tailnet_proxy_host(self, monkeypatch):
+        """Tailscale Serve terminates on a tailnet Host while proxying to loopback."""
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(
+            ws,
+            "_EXTRA_ACCEPTED_HOSTS",
+            {"earth.tailnet-example.ts.net"},
+        )
+
+        assert ws._is_accepted_host(
+            "earth.tailnet-example.ts.net:443",
+            "127.0.0.1",
+        )
+        assert not ws._is_accepted_host("evil.example", "127.0.0.1")
+
     def test_zero_zero_bind_accepts_anything(self):
         """0.0.0.0 means operator explicitly opted into all-interfaces
         (requires --insecure). No Host-layer defence is possible — rely
@@ -146,3 +162,96 @@ class TestHostHeaderMiddleware:
         resp = client.get("/api/status")
         # Should get through to the status endpoint, not a 400
         assert resp.status_code != 400
+
+
+class TestWebSocketHostOriginGuard:
+    """WebSocket upgrades must enforce the same dashboard boundary as HTTP."""
+
+    def test_rebinding_websocket_host_is_rejected(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                url,
+                headers={
+                    "Host": "evil.example",
+                    "Origin": "http://evil.example",
+                },
+            ):
+                pass
+
+        assert exc.value.code == 4403
+
+    def test_rebinding_websocket_origin_is_rejected(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                url,
+                headers={
+                    "Host": "localhost:9119",
+                    "Origin": "http://evil.example",
+                },
+            ):
+                pass
+
+        assert exc.value.code == 4403
+
+    def test_loopback_websocket_host_and_origin_are_accepted(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": "localhost:9119",
+                "Origin": "http://localhost:9119",
+            },
+        ):
+            pass
+
+    def test_tailnet_proxy_websocket_host_and_origin_are_accepted(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        monkeypatch.setattr(
+            ws,
+            "_EXTRA_ACCEPTED_HOSTS",
+            {"earth.tailnet-example.ts.net"},
+        )
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": "earth.tailnet-example.ts.net",
+                "Origin": "https://earth.tailnet-example.ts.net",
+            },
+        ):
+            pass

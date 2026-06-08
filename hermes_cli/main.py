@@ -10341,6 +10341,7 @@ def cmd_dashboard(args):
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
         embedded_chat=embedded_chat,
+        allowed_hosts=getattr(args, "allowed_hosts", None),
     )
 
 
@@ -13145,6 +13146,17 @@ Examples:
     )
     dashboard_parser.add_argument(
         "--host", default="127.0.0.1", help="Host (default 127.0.0.1)"
+    )
+    dashboard_parser.add_argument(
+        "--allowed-host",
+        dest="allowed_hosts",
+        action="append",
+        default=[],
+        help=(
+            "Additional Host/Origin names to accept when serving through a "
+            "trusted local reverse proxy such as Tailscale Serve. May be "
+            "repeated or comma-separated."
+        ),
     )
     dashboard_parser.add_argument(
         "--no-open", action="store_true", help="Don't open browser automatically"

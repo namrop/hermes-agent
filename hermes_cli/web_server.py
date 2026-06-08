@@ -157,6 +157,74 @@ def _require_token(request: Request) -> None:
 _LOOPBACK_HOST_VALUES: frozenset = frozenset({
     "localhost", "127.0.0.1", "::1",
 })
+_EXTRA_ACCEPTED_HOSTS: set[str] = set()
+
+
+def should_require_auth(host: str, allow_public: bool) -> bool:
+    """Return True iff the dashboard OAuth auth gate must be active.
+
+    Truth table:
+      host == loopback                              → False (no auth)
+      host != loopback AND allow_public (--insecure)→ False (legacy escape hatch)
+      host != loopback AND NOT allow_public         → True  (gate engages)
+
+    "Loopback" matches the same set used by ``--insecure`` enforcement in
+    ``start_server``: 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local
+    are deliberately treated as PUBLIC — a hostile device on the same LAN is
+    exactly the threat model the gate is designed for.
+    """
+    return (host not in _LOOPBACK_HOST_VALUES) and (not allow_public)
+
+
+def _host_only_from_header(host_header: str) -> str:
+    """Extract and normalise the host component from Host/Origin netloc text."""
+    h = (host_header or "").strip()
+    if h.startswith("["):
+        # IPv6 bracketed — port (if any) follows "]:"
+        close = h.find("]")
+        if close != -1:
+            return h[1:close].lower()
+        return h.strip("[]").lower()
+    return (h.rsplit(":", 1)[0] if ":" in h else h).lower()
+
+
+def _normalise_allowed_hosts(hosts: object) -> set[str]:
+    """Coerce CLI/config/env host allowlists into normalised host names."""
+    if hosts is None:
+        return set()
+    if isinstance(hosts, str):
+        raw_hosts = hosts.split(",")
+    elif isinstance(hosts, (list, tuple, set)):
+        raw_hosts = hosts
+    else:
+        raw_hosts = [hosts]
+    return {
+        _host_only_from_header(str(host))
+        for host in raw_hosts
+        if str(host).strip()
+    }
+
+
+def _configured_extra_hosts() -> set[str]:
+    """Extra Host header values explicitly trusted by the operator.
+
+    This is for loopback dashboards reached through a trusted local proxy such
+    as Tailscale Serve: uvicorn binds to 127.0.0.1, but the browser's Host /
+    Origin is the tailnet name. Keeping this explicit preserves the DNS
+    rebinding guard by default.
+    """
+    hosts = set(_EXTRA_ACCEPTED_HOSTS)
+    hosts.update(_normalise_allowed_hosts(os.getenv("HERMES_DASHBOARD_ALLOWED_HOSTS")))
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        dashboard_cfg = cfg.get("dashboard", {}) if isinstance(cfg, dict) else {}
+        if isinstance(dashboard_cfg, dict):
+            hosts.update(_normalise_allowed_hosts(dashboard_cfg.get("allowed_hosts")))
+    except Exception:
+        pass
+    return hosts
 
 
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
@@ -167,26 +235,15 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     - Loopback aliases when bound to loopback
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
+    - Operator-allowlisted hosts for trusted local reverse proxies such as
+      Tailscale Serve
     """
     if not host_header:
         return False
-    # Strip port suffix. IPv6 addresses use bracket notation:
-    #   [::1]         — no port
-    #   [::1]:9119    — with port
-    # Plain hosts/v4:
-    #   localhost:9119
-    #   127.0.0.1:9119
-    h = host_header.strip()
-    if h.startswith("["):
-        # IPv6 bracketed — port (if any) follows "]:"
-        close = h.find("]")
-        if close != -1:
-            host_only = h[1:close]  # strip brackets
-        else:
-            host_only = h.strip("[]")
-    else:
-        host_only = h.rsplit(":", 1)[0] if ":" in h else h
-    host_only = host_only.lower()
+    host_only = _host_only_from_header(host_header)
+
+    if host_only in _configured_extra_hosts():
+        return True
 
     # 0.0.0.0 bind means operator explicitly opted into all-interfaces
     # (requires --insecure per web_server.start_server). No Host-layer
@@ -4518,12 +4575,15 @@ def start_server(
     allow_public: bool = False,
     *,
     embedded_chat: bool = False,
+    allowed_hosts: object = None,
 ):
     """Start the web UI server."""
     import uvicorn
 
     global _DASHBOARD_EMBEDDED_CHAT_ENABLED
     _DASHBOARD_EMBEDDED_CHAT_ENABLED = embedded_chat
+    _EXTRA_ACCEPTED_HOSTS.clear()
+    _EXTRA_ACCEPTED_HOSTS.update(_normalise_allowed_hosts(allowed_hosts))
 
     _LOCALHOST = ("127.0.0.1", "localhost", "::1")
     if host not in _LOCALHOST and not allow_public:
