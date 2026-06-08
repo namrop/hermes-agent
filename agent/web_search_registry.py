@@ -42,7 +42,17 @@ logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, WebSearchProvider] = {}
+_PROVIDER_ALIASES = {
+    # Compatibility with local/pre-plugin configs that used ``brave`` for the
+    # Brave Search backend before upstream standardized on ``brave-free``.
+    "brave": "brave-free",
+}
 _lock = threading.Lock()
+
+
+def _normalize_provider_name(name: str | None) -> str:
+    raw = (name or "").strip()
+    return _PROVIDER_ALIASES.get(raw, raw)
 
 
 def register_provider(provider: WebSearchProvider) -> None:
@@ -87,7 +97,7 @@ def get_provider(name: str) -> Optional[WebSearchProvider]:
     if not isinstance(name, str):
         return None
     with _lock:
-        return _providers.get(name.strip())
+        return _providers.get(_normalize_provider_name(name))
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +194,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     #    user gets a precise downstream error message rather than a silent
     #    backend switch. Matches _get_backend() in web_tools.py.
     if configured:
+        configured = _normalize_provider_name(configured)
         provider = snapshot.get(configured)
         if provider is not None and _capable(provider):
             return provider
