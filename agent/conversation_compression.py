@@ -41,6 +41,55 @@ from agent.model_metadata import estimate_request_tokens_rough
 logger = logging.getLogger(__name__)
 
 
+def _compression_lock_holder(agent: Any) -> str:
+    """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
+
+    The pid+tid prefix lets ops tell crashed/abandoned holders apart from
+    live ones (expiry-based recovery uses the timestamp, but ``holder``
+    is what shows up in diagnostics + log lines). The agent instance id
+    and a per-acquire uuid disambiguate two co-resident agents on the
+    same thread (background_review forks run on a worker thread, but
+    on machines where compression itself dispatches to a thread pool
+    we want each acquire to be unique).
+    """
+    import threading
+    return (
+        f"pid={os.getpid()}"
+        f":tid={threading.get_ident()}"
+        f":agent={id(agent):x}"
+        f":nonce={uuid.uuid4().hex[:8]}"
+    )
+
+
+def _forward_goal_state_on_compression(agent: Any, old_session_id: str) -> None:
+    """Forward standing /goal state to a compression continuation session.
+
+    Goal state is keyed in SessionDB.state_meta as ``goal:<session_id>``.
+    Auto-compression rotates ``agent.session_id`` after creating a child
+    session. Without copying the parent's goal blob to the child key, the next
+    GoalManager binds to the child session, sees no active goal, and the /goal
+    continuation loop silently dies.
+    """
+    if not old_session_id or not getattr(agent, "session_id", None):
+        return
+    db = getattr(agent, "_session_db", None)
+    if db is None:
+        return
+    try:
+        old_key = f"goal:{old_session_id}"
+        new_key = f"goal:{agent.session_id}"
+        goal_blob = db.get_meta(old_key)
+        if goal_blob:
+            db.set_meta(new_key, goal_blob)
+            logger.info(
+                "goal: forwarded standing goal from %s → %s on compression",
+                old_session_id,
+                agent.session_id,
+            )
+    except Exception as exc:
+        logger.debug("goal forward on compression failed: %s", exc)
+
+
 def check_compression_model_feasibility(agent: Any) -> None:
     """Warn at session start if the auxiliary compression model's context
     window is smaller than the main model's compression threshold.
@@ -396,6 +445,7 @@ def compress_context(
                 parent_session_id=old_session_id,
             )
             agent._session_db_created = True
+            _forward_goal_state_on_compression(agent, old_session_id)
             # Auto-number the title for the continuation session
             if old_title:
                 try:
