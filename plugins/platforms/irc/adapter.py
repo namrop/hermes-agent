@@ -89,6 +89,33 @@ def _extract_nick(prefix: str) -> str:
     return prefix.split("!")[0] if "!" in prefix else prefix
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Coerce config/env booleans without treating non-empty strings as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _coerce_list(value: Any) -> List[str]:
+    """Coerce comma-separated env strings or config lists to trimmed strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
 # ---------------------------------------------------------------------------
 # IRC Adapter
 # ---------------------------------------------------------------------------
@@ -119,10 +146,35 @@ class IRCAdapter(BasePlatformAdapter):
         self.server_password = os.getenv("IRC_SERVER_PASSWORD") or extra.get("server_password", "")
         self.nickserv_password = os.getenv("IRC_NICKSERV_PASSWORD") or extra.get("nickserv_password", "")
 
+        # Channel topology. ``channel`` remains the home/default target for
+        # outbound sends; ``channels`` and ``join_all_channels`` control the
+        # live listener footprint.
+        raw_channels = os.getenv("IRC_CHANNELS") or extra.get("channels") or self.channel
+        self.channels: List[str] = _coerce_list(raw_channels)
+        self.join_all_channels = _coerce_bool(
+            os.getenv("IRC_JOIN_ALL_CHANNELS"),
+            _coerce_bool(extra.get("join_all_channels"), self.channel.strip().lower() in {"*", "all"}),
+        )
+        self.join_all_channels_interval = float(
+            os.getenv("IRC_JOIN_ALL_CHANNELS_INTERVAL")
+            or extra.get("join_all_channels_interval", 60)
+        )
+
         # Auth
         self.allowed_users: list = extra.get("allowed_users", [])
         # IRC nicks are case-insensitive — normalise for lookups
         self._allowed_users_lower: set = {u.lower() for u in self.allowed_users if isinstance(u, str)}
+
+        # Control-plane mode: allowed users' channel messages are assumed to
+        # be addressed to Hermes unless they explicitly prefix another bot.
+        self.assume_addressed_from_allowed_users = _coerce_bool(
+            os.getenv("IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS"),
+            _coerce_bool(extra.get("assume_addressed_from_allowed_users"), False),
+        )
+        self.other_bot_nicks: List[str] = _coerce_list(
+            os.getenv("IRC_OTHER_BOT_NICKS") or extra.get("other_bot_nicks")
+        )
+        self._other_bot_nicks_lower: set = {n.lower() for n in self.other_bot_nicks}
 
         # IRC limits
         max_msg = extra.get("max_message_length")
@@ -143,6 +195,8 @@ class IRCAdapter(BasePlatformAdapter):
         self._current_nick = self.nickname
         self._registered = False  # IRC registration complete
         self._registration_event = asyncio.Event()
+        self._joined_channels: set[str] = set()
+        self._list_task: Optional[asyncio.Task] = None
 
     @property
     def name(self) -> str:
@@ -210,11 +264,23 @@ class IRCAdapter(BasePlatformAdapter):
             await self._send_raw(f"PRIVMSG NickServ :IDENTIFY {self.nickserv_password}")
             await asyncio.sleep(2)  # Give NickServ time to process
 
-        # Join channel
-        await self._send_raw(f"JOIN {self.channel}")
+        # Join configured channels. Server-wide mode also periodically LISTs
+        # public channels and joins them as they appear.
+        for channel in self.channels:
+            if channel.strip().lower() not in {"*", "all"}:
+                await self._join_channel_once(channel)
 
         self._mark_connected()
-        logger.info("IRC: connected to %s:%s as %s, joined %s", self.server, self.port, self._current_nick, self.channel)
+        if self.join_all_channels:
+            self._list_task = asyncio.create_task(self._list_channels_loop())
+        logger.info(
+            "IRC: connected to %s:%s as %s, joined %s%s",
+            self.server,
+            self.port,
+            self._current_nick,
+            ",".join(sorted(self._joined_channels)) or self.channel,
+            " (server-wide listener enabled)" if self.join_all_channels else "",
+        )
         return True
 
     async def disconnect(self) -> None:
@@ -246,10 +312,40 @@ class IRCAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
 
+        if self._list_task and not self._list_task.done():
+            self._list_task.cancel()
+            try:
+                await self._list_task
+            except asyncio.CancelledError:
+                pass
+
         self._reader = None
         self._writer = None
         self._registered = False
         self._registration_event.clear()
+        self._joined_channels.clear()
+
+    async def _join_channel_once(self, channel: str) -> None:
+        """JOIN a channel if it is valid and not already joined."""
+        channel = channel.strip()
+        if not _is_irc_channel(channel):
+            return
+        key = channel.lower()
+        if key in self._joined_channels:
+            return
+        await self._send_raw(f"JOIN {channel}")
+        self._joined_channels.add(key)
+
+    async def _list_channels_loop(self) -> None:
+        """Periodically ask the server for public channels and join them."""
+        try:
+            while self._writer and not self._writer.is_closing():
+                await self._send_raw("LIST")
+                await asyncio.sleep(max(self.join_all_channels_interval, 5.0))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("IRC: server-wide LIST loop stopped: %s", e)
 
     # ── Sending ───────────────────────────────────────────────────────────
 
@@ -424,6 +520,12 @@ class IRCAdapter(BasePlatformAdapter):
             await self._send_raw(f"NICK {self._current_nick}")
             return
 
+        # RPL_LIST (322) — public channel announced by LIST. In server-wide
+        # mode, join public channels as the server reports them.
+        if command == "322" and self.join_all_channels and len(params) >= 2:
+            await self._join_channel_once(params[1])
+            return
+
         # PRIVMSG — incoming message (channel or DM)
         if command == "PRIVMSG" and len(params) >= 2:
             sender_nick = _extract_nick(msg["prefix"])
@@ -447,22 +549,26 @@ class IRCAdapter(BasePlatformAdapter):
             chat_id = target if is_channel else sender_nick
             chat_type = "group" if is_channel else "dm"
 
-            # In channels, only respond if addressed (nick: or nick,)
-            if is_channel:
-                addressed = False
-                for prefix in (f"{self._current_nick}:", f"{self._current_nick},",
-                               f"{self._current_nick} "):
-                    if text.lower().startswith(prefix.lower()):
-                        text = text[len(prefix):].strip()
-                        addressed = True
-                        break
-                if not addressed:
-                    return  # Ignore unaddressed channel messages
-
-            # Auth check (case-insensitive)
-            if self._allowed_users_lower and sender_nick.lower() not in self._allowed_users_lower:
+            # Auth check (case-insensitive). Apply before channel-addressing
+            # mode so auto-addressed control-plane messages are still scoped
+            # to explicit allowed nicks when configured.
+            sender_allowed = not self._allowed_users_lower or sender_nick.lower() in self._allowed_users_lower
+            if not sender_allowed:
                 logger.debug("IRC: ignoring message from unauthorized user %s", sender_nick)
                 return
+
+            # In normal channel mode, only respond if addressed. In
+            # control-plane mode, allowed users are assumed addressed unless
+            # they explicitly prefix a configured other bot.
+            if is_channel:
+                addressed, stripped_text = self._strip_self_address(text)
+                if addressed:
+                    text = stripped_text
+                elif self.assume_addressed_from_allowed_users:
+                    if self._is_addressed_to_other_bot(text):
+                        return
+                else:
+                    return  # Ignore unaddressed channel messages
 
             await self._dispatch_message(
                 text=text,
@@ -476,6 +582,20 @@ class IRCAdapter(BasePlatformAdapter):
         if command == "NICK" and _extract_nick(msg["prefix"]).lower() == self._current_nick.lower():
             if params:
                 self._current_nick = params[0]
+
+    def _strip_self_address(self, text: str) -> tuple[bool, str]:
+        """Return (addressed_to_self, text_without_prefix)."""
+        for prefix in (f"{self._current_nick}:", f"{self._current_nick},", f"{self._current_nick} "):
+            if text.lower().startswith(prefix.lower()):
+                return True, text[len(prefix):].strip()
+        return False, text
+
+    def _is_addressed_to_other_bot(self, text: str) -> bool:
+        """Detect configured alternate bot prefixes at the start of text."""
+        if not self._other_bot_nicks_lower:
+            return False
+        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_\-\[\]{}\\`^|]*)(?::|,|\s)\s+", text)
+        return bool(match and match.group(1).lower() in self._other_bot_nicks_lower)
 
     async def _dispatch_message(
         self,
@@ -687,6 +807,25 @@ def _env_enablement() -> dict | None:
         seed["server_password"] = os.getenv("IRC_SERVER_PASSWORD")
     if os.getenv("IRC_NICKSERV_PASSWORD"):
         seed["nickserv_password"] = os.getenv("IRC_NICKSERV_PASSWORD")
+    allowed = os.getenv("IRC_ALLOWED_USERS", "").strip()
+    allow_all = os.getenv("IRC_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
+    if allowed and not allow_all:
+        seed["allowed_users"] = _coerce_list(allowed)
+    if os.getenv("IRC_CHANNELS"):
+        seed["channels"] = _coerce_list(os.getenv("IRC_CHANNELS"))
+    if os.getenv("IRC_JOIN_ALL_CHANNELS"):
+        seed["join_all_channels"] = _coerce_bool(os.getenv("IRC_JOIN_ALL_CHANNELS"))
+    if os.getenv("IRC_JOIN_ALL_CHANNELS_INTERVAL"):
+        try:
+            seed["join_all_channels_interval"] = float(os.getenv("IRC_JOIN_ALL_CHANNELS_INTERVAL", "60"))
+        except ValueError:
+            pass
+    if os.getenv("IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS"):
+        seed["assume_addressed_from_allowed_users"] = _coerce_bool(
+            os.getenv("IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS")
+        )
+    if os.getenv("IRC_OTHER_BOT_NICKS"):
+        seed["other_bot_nicks"] = _coerce_list(os.getenv("IRC_OTHER_BOT_NICKS"))
     # Optional home-channel (usually the same as IRC_CHANNEL, but can be a
     # dedicated reports channel).  Defaults to IRC_CHANNEL so cron jobs
     # with ``deliver=irc`` have a sensible target without extra config.

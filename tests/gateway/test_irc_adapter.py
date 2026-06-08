@@ -78,7 +78,11 @@ class TestIRCAdapterInit:
 
     def test_init_from_config_extra(self, monkeypatch):
         # Clear any env vars
-        for key in ("IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS"):
+        for key in (
+            "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS",
+            "IRC_CHANNELS", "IRC_JOIN_ALL_CHANNELS", "IRC_JOIN_ALL_CHANNELS_INTERVAL",
+            "IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS", "IRC_OTHER_BOT_NICKS",
+        ):
             monkeypatch.delenv(key, raising=False)
 
         from gateway.config import PlatformConfig
@@ -116,7 +120,11 @@ class TestIRCAdapterSend:
 
     @pytest.fixture
     def adapter(self, monkeypatch):
-        for key in ("IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS"):
+        for key in (
+            "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS",
+            "IRC_CHANNELS", "IRC_JOIN_ALL_CHANNELS", "IRC_JOIN_ALL_CHANNELS_INTERVAL",
+            "IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS", "IRC_OTHER_BOT_NICKS",
+        ):
             monkeypatch.delenv(key, raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(
@@ -172,7 +180,11 @@ class TestIRCAdapterMessageParsing:
 
     @pytest.fixture
     def adapter(self, monkeypatch):
-        for key in ("IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS"):
+        for key in (
+            "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS",
+            "IRC_CHANNELS", "IRC_JOIN_ALL_CHANNELS", "IRC_JOIN_ALL_CHANNELS_INTERVAL",
+            "IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS", "IRC_OTHER_BOT_NICKS",
+        ):
             monkeypatch.delenv(key, raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(
@@ -305,7 +317,11 @@ class TestIRCAdapterMessageParsing:
     @pytest.mark.asyncio
     async def test_allowed_users_case_insensitive(self, monkeypatch):
         """Allowlist should match nicks case-insensitively."""
-        for key in ("IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS"):
+        for key in (
+            "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS",
+            "IRC_CHANNELS", "IRC_JOIN_ALL_CHANNELS", "IRC_JOIN_ALL_CHANNELS_INTERVAL",
+            "IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS", "IRC_OTHER_BOT_NICKS",
+        ):
             monkeypatch.delenv(key, raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(
@@ -338,7 +354,11 @@ class TestIRCAdapterMessageParsing:
     @pytest.mark.asyncio
     async def test_unauthorized_user_blocked(self, monkeypatch):
         """Nicks not in allowlist should be ignored."""
-        for key in ("IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS"):
+        for key in (
+            "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL", "IRC_USE_TLS",
+            "IRC_CHANNELS", "IRC_JOIN_ALL_CHANNELS", "IRC_JOIN_ALL_CHANNELS_INTERVAL",
+            "IRC_ASSUME_ADDRESSED_FROM_ALLOWED_USERS", "IRC_OTHER_BOT_NICKS",
+        ):
             monkeypatch.delenv(key, raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(
