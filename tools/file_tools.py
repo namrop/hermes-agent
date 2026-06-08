@@ -150,7 +150,11 @@ def _is_blocked_device(filepath: str) -> bool:
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
+    "/private/etc/",
+    # macOS user tempdirs live under /private/var/folders/... after realpath().
+    # Blocking all of /private/var breaks pytest/tmpdir-backed file operations,
+    # so keep high-risk system/admin subtrees blocked while allowing temp files.
+    "/private/var/db/", "/private/var/log/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -828,7 +832,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
             cross_warning = file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            write_target = path if Path(path).expanduser().is_absolute() else _resolved
+            result = file_ops.write_file(write_target, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning
             if effective_warning:
@@ -909,7 +914,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
-                result = file_ops.patch_replace(path, old_string, new_string, replace_all)
+                # Pass the resolved ABSOLUTE path for relative inputs so the
+                # shell layer cannot disagree with tool-layer path resolution.
+                # Absolute inputs are already cwd-independent, so preserve the
+                # user-supplied spelling (e.g. /tmp on macOS instead of its
+                # /private/tmp realpath) while still using _resolved for locks,
+                # stale tracking, warnings, and result metadata.
+                _replace_target = _path_to_resolved.get(path) or path
+                if Path(path).expanduser().is_absolute():
+                    _replace_target = path
+                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")

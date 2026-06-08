@@ -4189,6 +4189,51 @@ def test_browser_manage_connect_strips_discovery_path(monkeypatch):
     assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
 
 
+def test_browser_manage_connect_preserves_discovery_query_params(monkeypatch):
+    """Managed CDP discovery URLs may carry auth/profile query params.
+    Normalize away discovery paths without dropping the query string, and probe
+    by inserting /json/version before that query string."""
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    probed: list[str] = []
+    fake = types.SimpleNamespace(
+        cleanup_all_browsers=lambda: None,
+        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
+    )
+
+    def fake_urlopen(url, timeout=None):
+        probed.append(url)
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return _Resp()
+
+    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "browser.manage",
+                    "params": {
+                        "action": "connect",
+                        "url": "https://cdp.example/json/version?fingerprint=seed-1&token=abc",
+                    },
+                }
+            )
+
+    assert resp is not None
+    assert resp["result"]["connected"] is True
+    assert resp["result"]["url"] == "https://cdp.example?fingerprint=seed-1&token=abc"
+    assert os.environ["BROWSER_CDP_URL"] == "https://cdp.example?fingerprint=seed-1&token=abc"
+    assert probed[0] == "https://cdp.example/json/version?fingerprint=seed-1&token=abc"
+
+
 def test_browser_manage_connect_preserves_devtools_browser_endpoint(monkeypatch):
     """Concrete devtools websocket endpoints (e.g. Browserbase) must
     survive verbatim — we only collapse discovery-style paths."""

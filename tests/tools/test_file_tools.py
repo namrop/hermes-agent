@@ -142,6 +142,16 @@ class TestWriteFileHandler:
         assert "error" in result
         assert "string" in result["error"].lower() or "content" in result["error"].lower()
 
+    def test_macos_private_var_tempdirs_are_not_sensitive_paths(self):
+        """macOS resolves user temp paths through /private/var/folders/...;
+        file tools must allow those while still blocking system/admin subtrees."""
+        from tools.file_tools import _check_sensitive_path
+
+        assert _check_sensitive_path("/private/var/folders/zz/pytest-1/out.txt") is None
+        assert _check_sensitive_path("/private/var/db/example") is not None
+        assert _check_sensitive_path("/private/var/log/system.log") is not None
+        assert _check_sensitive_path("/private/var/root/.ssh/authorized_keys") is not None
+
 
 class TestPatchHandler:
     @patch("tools.file_tools._get_file_ops")
