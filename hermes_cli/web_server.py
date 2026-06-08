@@ -3350,23 +3350,83 @@ _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 
 
-def _is_public_bind() -> bool:
-    """True when bound to all-interfaces (operator used --insecure)."""
-    return getattr(app.state, "bound_host", "") in {"0.0.0.0", "::"}
-
-
 def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     """Check if the WebSocket client IP is acceptable.
 
-    Allows loopback always; allows any IP when bound to all-interfaces
-    (--insecure mode, guarded by session token auth).
+    Loopback bind: only loopback clients allowed — the legacy
+    ``?token=<_SESSION_TOKEN>`` path is the only auth we have, so we
+    don't want LAN hosts guessing tokens.
+
+    Explicit non-loopback bind (``--host 0.0.0.0``, ``--host ::``, or a
+    specific address such as a Tailscale/LAN IP, always with
+    ``--insecure``): allow any peer. The operator explicitly opted into
+    non-loopback exposure, so the loopback-only peer restriction does not
+    apply. DNS-rebinding is still blocked by the Host/Origin guard in
+    :func:`_ws_host_origin_is_allowed`, which mirrors the HTTP layer and
+    requires the Host header to match the bound interface — the same
+    defence ``_is_accepted_host`` applies to non-loopback HTTP requests.
+
+    Gated mode: any peer is allowed — uvicorn's ``proxy_headers=True``
+    (enabled when the OAuth gate is active so cookies can pick up
+    ``X-Forwarded-Proto``) rewrites ``ws.client.host`` to the
+    X-Forwarded-For value, which is the real internet client IP. The
+    OAuth gate + single-use ``?ticket=`` is the auth at that point; the
+    Host/Origin guard in :func:`_ws_host_origin_is_allowed` is what
+    blocks DNS-rebinding here, not the peer IP.
     """
-    if _is_public_bind():
+    if getattr(app.state, "auth_required", False):
+        return True
+    # Any explicit non-loopback bind (0.0.0.0, ::, or a specific LAN /
+    # Tailscale address) means the operator opted into non-loopback
+    # access via --insecure.  The loopback-only peer gate only applies to
+    # an actual loopback bind; otherwise the WS handshake is rejected even
+    # though same-bind HTTP requests pass _is_accepted_host.
+    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    if bound_host and bound_host not in _LOOPBACK_HOSTS:
         return True
     client_host = ws.client.host if ws.client else ""
     if not client_host:
         return True
     return client_host in _LOOPBACK_HOSTS
+
+
+def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:
+    """Apply the dashboard Host/Origin guard to WebSocket upgrades.
+
+    FastAPI HTTP middleware does not run for WebSocket routes, so the
+    DNS-rebinding Host check used for normal dashboard HTTP requests must be
+    repeated here before accepting the upgrade.  Browsers also send an Origin
+    header on WebSocket handshakes; when present, require it to target the
+    same bound dashboard host.
+    """
+    bound_host = getattr(app.state, "bound_host", None)
+    if not bound_host:
+        return True
+
+    host_header = ws.headers.get("host", "")
+    if not _is_accepted_host(host_header, bound_host):
+        return False
+
+    origin = ws.headers.get("origin", "")
+    if not origin:
+        return True
+
+    parsed = urllib.parse.urlparse(origin)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+
+    return _is_accepted_host(parsed.netloc, bound_host)
+
+
+def _ws_request_is_allowed(ws: "WebSocket") -> bool:
+    """Return True when the WebSocket upgrade matches dashboard boundaries."""
+    return _ws_host_origin_is_allowed(ws) and _ws_client_is_allowed(ws)
+
+
+def _ws_auth_ok(ws: "WebSocket") -> bool:
+    """Validate the legacy WS session token query parameter."""
+    token = ws.query_params.get("token", "")
+    return hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -3463,13 +3523,11 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # --- auth + loopback check (before accept so we can close cleanly) ---
-    token = ws.query_params.get("token", "")
-    expected = _SESSION_TOKEN
-    if not hmac.compare_digest(token.encode(), expected.encode()):
+    if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
 
-    if not _ws_client_is_allowed(ws):
+    if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
 
@@ -3583,12 +3641,11 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    token = ws.query_params.get("token", "")
-    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+    if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
 
-    if not _ws_client_is_allowed(ws):
+    if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
 
@@ -3615,12 +3672,11 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    token = ws.query_params.get("token", "")
-    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+    if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
 
-    if not _ws_client_is_allowed(ws):
+    if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
 
@@ -3644,12 +3700,11 @@ async def events_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    token = ws.query_params.get("token", "")
-    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+    if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
 
-    if not _ws_client_is_allowed(ws):
+    if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
 
