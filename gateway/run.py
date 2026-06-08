@@ -8548,6 +8548,8 @@ class GatewayRunner:
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
+                    elapsed_seconds=_response_time,
+                    api_calls=_api_calls,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                 )
             except Exception as _footer_err:

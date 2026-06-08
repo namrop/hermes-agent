@@ -1,7 +1,7 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
+Renders a compact footer showing runtime state (model, context %, elapsed time,
+API calls, cwd) and appends it to the FINAL message of an agent turn when enabled.  Off by default
 to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
@@ -9,7 +9,7 @@ Config (``~/.hermes/config.yaml``)::
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
+        fields: [model, context_pct, elapsed, api_calls, cwd]   # order shown; drop any to hide
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -94,6 +94,8 @@ def format_runtime_footer(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    elapsed_seconds: Optional[float] = None,
+    api_calls: Optional[int] = None,
     cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
@@ -112,6 +114,16 @@ def format_runtime_footer(
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field in ("elapsed", "elapsed_s", "time"):
+            if elapsed_seconds is not None and elapsed_seconds >= 0:
+                if elapsed_seconds < 60:
+                    parts.append(f"{elapsed_seconds:.1f}s")
+                else:
+                    mins, secs = divmod(int(round(elapsed_seconds)), 60)
+                    parts.append(f"{mins}m{secs:02d}s")
+        elif field in ("api_calls", "calls"):
+            if api_calls is not None and api_calls >= 0:
+                parts.append(f"{api_calls} calls")
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
@@ -130,6 +142,8 @@ def build_footer_line(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    elapsed_seconds: Optional[float] = None,
+    api_calls: Optional[int] = None,
     cwd: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
@@ -145,6 +159,8 @@ def build_footer_line(
         model=model,
         context_tokens=context_tokens,
         context_length=context_length,
+        elapsed_seconds=elapsed_seconds,
+        api_calls=api_calls,
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
