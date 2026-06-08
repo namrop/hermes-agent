@@ -1783,8 +1783,38 @@ class AIAgent:
                         "error_preview": preview,
                     }
         else:
-            for path in targets:
-                state.pop(path, None)
+            paths_to_clear = set(targets)
+            try:
+                data = json.loads(result.strip()) if isinstance(result, str) else {}
+            except Exception:
+                data = {}
+            if isinstance(data, dict):
+                modified = data.get("files_modified")
+                if isinstance(modified, list):
+                    paths_to_clear.update(str(p) for p in modified if p)
+                resolved = data.get("resolved_path")
+                if resolved:
+                    paths_to_clear.add(str(resolved))
+
+            clear_aliases: set[str] = set(paths_to_clear)
+            for path in list(paths_to_clear):
+                try:
+                    expanded = os.path.expanduser(str(path))
+                    clear_aliases.add(os.path.abspath(expanded))
+                    clear_aliases.add(os.path.realpath(expanded))
+                except Exception:
+                    pass
+
+            for path in list(state.keys()):
+                aliases = {path}
+                try:
+                    expanded = os.path.expanduser(str(path))
+                    aliases.add(os.path.abspath(expanded))
+                    aliases.add(os.path.realpath(expanded))
+                except Exception:
+                    pass
+                if aliases.intersection(clear_aliases):
+                    state.pop(path, None)
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
