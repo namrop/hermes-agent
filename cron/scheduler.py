@@ -87,6 +87,35 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+_CRON_PROTECTED_DISABLED_TOOLSETS = ("cronjob", "messaging", "clarify")
+_CRON_TOOLSET_EXCEPTION_ALLOWLIST = {"messaging"}
+
+
+def _resolve_cron_disabled_toolsets(job: dict) -> list[str]:
+    """Return toolsets disabled for cron-spawned agents.
+
+    Cron agents are normally denied recursive scheduling, direct messaging, and
+    interactive clarification. A small per-job escape hatch exists for trusted
+    local jobs that intentionally send bounded notifications into existing
+    channels/threads; keep that exception narrow so ``cronjob`` and ``clarify``
+    cannot be re-enabled from persisted job data.
+    """
+    raw_exceptions = job.get("cron_toolset_exceptions") or []
+    if isinstance(raw_exceptions, str):
+        requested = {raw_exceptions}
+    elif isinstance(raw_exceptions, (list, tuple, set)):
+        requested = {str(item) for item in raw_exceptions}
+    else:
+        requested = set()
+
+    allowed_exceptions = requested & _CRON_TOOLSET_EXCEPTION_ALLOWLIST
+    return [
+        toolset
+        for toolset in _CRON_PROTECTED_DISABLED_TOOLSETS
+        if toolset not in allowed_exceptions
+    ]
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -1571,7 +1600,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=["cronjob", "messaging", "clarify"],
+            disabled_toolsets=_resolve_cron_disabled_toolsets(job),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project

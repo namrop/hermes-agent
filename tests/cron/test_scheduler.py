@@ -1689,11 +1689,94 @@ class TestRunJobSkillBacked:
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert "cronjob" in (kwargs["disabled_toolsets"] or [])
+        assert "messaging" in (kwargs["disabled_toolsets"] or [])
+        assert "clarify" in (kwargs["disabled_toolsets"] or [])
 
         prompt_arg = mock_agent.run_conversation.call_args.args[0]
         assert "blogwatcher" in prompt_arg
         assert "Follow this skill" in prompt_arg
         assert "Check the feeds and summarize anything new." in prompt_arg
+
+    def test_run_job_honors_per_job_messaging_exception_only(self, tmp_path):
+        job = {
+            "id": "messaging-exception-job",
+            "name": "trusted local notifier",
+            "prompt": "Send one bounded notification.",
+            "enabled_toolsets": ["messaging", "file"],
+            "cron_toolset_exceptions": ["messaging", "cronjob", "clarify"],
+        }
+
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ["messaging", "file"]
+        assert "messaging" not in (kwargs["disabled_toolsets"] or [])
+        assert "cronjob" in (kwargs["disabled_toolsets"] or [])
+        assert "clarify" in (kwargs["disabled_toolsets"] or [])
+
+    def test_run_job_keeps_messaging_disabled_without_exception(self, tmp_path):
+        job = {
+            "id": "normal-cron-job",
+            "name": "normal job",
+            "prompt": "Summarize something.",
+            "enabled_toolsets": ["messaging", "file"],
+        }
+
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ["messaging", "file"]
+        assert "messaging" in (kwargs["disabled_toolsets"] or [])
+        assert "cronjob" in (kwargs["disabled_toolsets"] or [])
+        assert "clarify" in (kwargs["disabled_toolsets"] or [])
 
     def test_run_job_loads_multiple_skills_in_order(self, tmp_path):
         job = {
