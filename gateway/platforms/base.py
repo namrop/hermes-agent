@@ -1812,8 +1812,11 @@ class BasePlatformAdapter(ABC):
         Adapters with native button UIs (Telegram, Discord) SHOULD
         override this for a richer UX.
         """
+        attention = ""
+        if metadata:
+            attention = str(metadata.get("clarify_attention_prefix", "") or "")
         if choices:
-            lines = [f"❓ {question}", ""]
+            lines = [f"{attention}❓ {question}", ""]
             for i, choice in enumerate(choices, start=1):
                 lines.append(f"  {i}. {choice}")
             lines.append("")
@@ -1824,7 +1827,7 @@ class BasePlatformAdapter(ABC):
             from tools.clarify_gateway import mark_awaiting_text
             mark_awaiting_text(clarify_id)
         else:
-            text = f"❓ {question}"
+            text = f"{attention}❓ {question}"
         return await self.send(
             chat_id=chat_id,
             content=text,

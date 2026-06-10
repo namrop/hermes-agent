@@ -150,6 +150,26 @@ def _build_allowed_mentions():
     )
 
 
+def _discord_ping_content(metadata: Optional[dict], key: str) -> Optional[str]:
+    """Return same-message Discord mention content for a safe snowflake key."""
+    if not metadata:
+        return None
+    raw_user_id = str(metadata.get(key, "") or "").strip()
+    if not re.fullmatch(r"\d{5,25}", raw_user_id):
+        return None
+    return f"<@{raw_user_id}> 🔔"
+
+
+def _discord_approval_ping_content(metadata: Optional[dict]) -> Optional[str]:
+    """Return same-message Discord mention content for approval prompts."""
+    return _discord_ping_content(metadata, "approval_ping_user_id")
+
+
+def _discord_clarify_ping_content(metadata: Optional[dict]) -> Optional[str]:
+    """Return same-message Discord mention content for clarify prompts."""
+    return _discord_ping_content(metadata, "clarify_ping_user_id")
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -4046,7 +4066,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_role_ids=self._allowed_role_ids,
             )
 
-            msg = await channel.send(embed=embed, view=view)
+            msg = await channel.send(
+                content=_discord_approval_ping_content(metadata),
+                embed=embed,
+                view=view,
+            )
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
@@ -4162,7 +4186,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 view = None
 
-            msg = await channel.send(embed=embed, view=view) if view else await channel.send(embed=embed)
+            content = _discord_clarify_ping_content(metadata)
+            if view:
+                msg = await channel.send(content=content, embed=embed, view=view)
+            else:
+                msg = await channel.send(content=content, embed=embed)
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, e)

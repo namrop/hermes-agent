@@ -836,6 +836,85 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _approval_attention_prefix(source: Optional[SessionSource]) -> str:
+    """Return a safe platform-native attention prefix for blocking prompts."""
+    if source is None:
+        return ""
+
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    if platform is None:
+        platform = str(getattr(source, "platform", "") or "").lower()
+    else:
+        platform = str(platform).lower()
+
+    chat_type = str(getattr(source, "chat_type", "") or "").lower()
+    if chat_type == "dm":
+        return ""
+
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    if not user_id:
+        return ""
+
+    if platform in {"discord", "slack"}:
+        return f"<@{user_id}> "
+    return ""
+
+
+def _format_gateway_approval_prompt(
+    command: str,
+    description: str,
+    source: Optional[SessionSource] = None,
+) -> str:
+    """Build the plain-text fallback approval prompt sent by gateway/run.py."""
+    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    attention = _approval_attention_prefix(source)
+    return (
+        f"{attention}🔔 ⚠️ **Dangerous command requires approval:**\n"
+        f"```\n{cmd_preview}\n```\n"
+        f"Reason: {description}\n\n"
+        f"Reply `/approve` to execute, `/approve session` to approve this pattern "
+        f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+    )
+
+
+def _approval_metadata_with_ping(
+    metadata: Optional[dict],
+    source: Optional[SessionSource],
+) -> Optional[dict]:
+    """Copy send metadata and add same-thread approval ping hints."""
+    attention = _approval_attention_prefix(source)
+    if not attention:
+        return metadata
+
+    out = dict(metadata or {})
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    out["approval_ping_user_id"] = user_id
+    out["approval_attention_prefix"] = attention
+    if platform is not None:
+        out["approval_ping_platform"] = str(platform).lower()
+    return out
+
+
+def _clarify_metadata_with_ping(
+    metadata: Optional[dict],
+    source: Optional[SessionSource],
+) -> Optional[dict]:
+    """Copy send metadata and add same-thread clarify ping hints."""
+    attention = _approval_attention_prefix(source)
+    if not attention:
+        return metadata
+
+    out = dict(metadata or {})
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    out["clarify_ping_user_id"] = user_id
+    out["clarify_attention_prefix"] = attention
+    if platform is not None:
+        out["clarify_ping_platform"] = str(platform).lower()
+    return out
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -16425,7 +16504,10 @@ class GatewayRunner:
                         choices=list(choices) if choices else None,
                         clarify_id=clarify_id,
                         session_key=session_key or "",
-                        metadata=_status_thread_metadata,
+                        metadata=_clarify_metadata_with_ping(
+                            _status_thread_metadata,
+                            source,
+                        ),
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -16572,7 +16654,10 @@ class GatewayRunner:
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata_with_ping(
+                                    _status_thread_metadata,
+                                    source,
+                                ),
                             ),
                             _loop_for_step,
                             logger=logger,
@@ -16593,14 +16678,7 @@ class GatewayRunner:
                         )
 
                 # Fallback: plain text approval prompt
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
-                )
+                msg = _format_gateway_approval_prompt(cmd, desc, source)
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
                         _status_adapter.send(
