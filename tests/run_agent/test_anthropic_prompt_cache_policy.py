@@ -65,6 +65,28 @@ class TestOpenRouter:
         assert should is True
         assert native is False  # OpenRouter uses envelope layout
 
+    def test_fable_on_openrouter_caches_with_envelope_layout(self):
+        # Fable is an Anthropic-family model but should not depend on a
+        # substring check for "claude" to get cache_control markers.
+        agent = _make_agent(
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            model="anthropic/claude-fable-5",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+
+    def test_anthropic_vendored_non_claude_slug_on_openrouter_caches(self):
+        # Future Anthropic routes may not all expose "claude" in their routed
+        # slug. The vendor namespace is the stronger signal for OpenRouter.
+        agent = _make_agent(
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            model="anthropic/fable-5",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+
     def test_non_claude_on_openrouter_does_not_cache(self):
         agent = _make_agent(
             provider="openrouter",
@@ -280,8 +302,17 @@ class TestQwenAlibabaFamily:
         )
         assert agent._anthropic_prompt_cache_policy() == (True, False)
 
+    def test_fable_on_nous_portal_caches(self):
+        agent = _make_agent(
+            provider="nous",
+            base_url="https://inference-api.nousresearch.com/v1",
+            api_mode="chat_completions",
+            model="anthropic/claude-fable-5",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+
     def test_non_qwen_non_claude_on_nous_portal_does_not_cache(self):
-        # Portal scope is narrow: Claude OR Qwen only. Other models
+        # Portal scope is narrow: Anthropic OR Qwen only. Other models
         # routed through Portal keep their existing fall-through behavior.
         agent = _make_agent(
             provider="nous",

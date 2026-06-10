@@ -1082,6 +1082,27 @@ def dump_api_request_debug(
 
 
 
+def _is_anthropic_prompt_cache_model(model: str) -> bool:
+    """Return True for Anthropic-family models that support cache_control.
+
+    OpenRouter/Portal model IDs use a vendor prefix (``anthropic/...``), while
+    native/Anthropic-wire routes often use the bare Claude model ID
+    (``claude-opus-4-8``).  New Anthropic families such as Fable are still
+    cache-capable even though their name does not contain the substring
+    ``claude`` in every routed form, so key off the provider namespace first
+    and the bare Claude prefix second.
+    """
+    raw = str(model or "").strip().lower()
+    if not raw:
+        return False
+    base = raw.split(":", 1)[0]
+    if base.startswith("anthropic/"):
+        return True
+    if "/" in base:
+        _vendor, base = base.split("/", 1)
+    return base.startswith("claude-")
+
+
 def anthropic_prompt_cache_policy(
     agent,
     *,
@@ -1122,7 +1143,7 @@ def anthropic_prompt_cache_policy(
 
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()
-    is_claude = "claude" in model_lower
+    is_anthropic_model = _is_anthropic_prompt_cache_model(model_lower)
     is_openrouter = base_url_host_matches(eff_base_url, "openrouter.ai")
     # Nous Portal proxies to OpenRouter behind the scenes — identical
     # OpenAI-wire envelope cache_control semantics. Treat it as an
@@ -1136,7 +1157,7 @@ def anthropic_prompt_cache_policy(
 
     if is_native_anthropic:
         return True, True
-    if (is_openrouter or is_nous_portal) and is_claude:
+    if (is_openrouter or is_nous_portal) and is_anthropic_model:
         return True, False
     # Nous Portal Qwen (e.g. qwen3.6-plus) takes the same envelope-layout
     # cache_control path as Portal Claude. Portal proxies to OpenRouter
@@ -1147,7 +1168,7 @@ def anthropic_prompt_cache_policy(
     # prompt on every turn.
     if is_nous_portal and "qwen" in model_lower:
         return True, False
-    if is_anthropic_wire and is_claude:
+    if is_anthropic_wire and is_anthropic_model:
         # Third-party Anthropic-compatible gateway.
         return True, True
 

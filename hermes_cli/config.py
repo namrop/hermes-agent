@@ -818,8 +818,11 @@ DEFAULT_CONFIG = {
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
+    # provider_overrides.<provider>.cache_ttl can override the global default for a
+    # specific configured model provider, e.g. anthropic: 1h while openrouter stays 5m.
     "prompt_caching": {
         "cache_ttl": "5m",
+        "provider_overrides": {},
     },
 
     # OpenRouter-specific settings.

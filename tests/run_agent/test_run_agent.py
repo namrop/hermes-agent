@@ -787,6 +787,65 @@ class TestInit:
             )
             assert a._cache_ttl == "1h"
 
+    def test_prompt_caching_cache_ttl_provider_override(self):
+        """prompt_caching.provider_overrides.<provider>.cache_ttl wins over global TTL."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "prompt_caching": {
+                        "cache_ttl": "5m",
+                        "provider_overrides": {
+                            "anthropic": {"cache_ttl": "1h"},
+                        },
+                    }
+                },
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                provider="anthropic",
+                api_mode="anthropic_messages",
+                model="claude-fable-5",
+                base_url="https://api.anthropic.com",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._cache_ttl == "1h"
+
+    def test_prompt_caching_cache_ttl_provider_override_does_not_leak(self):
+        """Provider-specific TTL override only affects the matching provider."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "prompt_caching": {
+                        "cache_ttl": "5m",
+                        "provider_overrides": {
+                            "anthropic": {"cache_ttl": "1h"},
+                        },
+                    }
+                },
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                provider="openrouter",
+                model="anthropic/claude-fable-5",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._cache_ttl == "5m"
+
     def test_model_max_tokens_from_config(self):
         """model.max_tokens config populates the chat-completions request cap."""
         with (

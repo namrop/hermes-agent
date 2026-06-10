@@ -1142,6 +1142,18 @@ class TestBuildAnthropicKwargs:
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kwargs["output_config"] == {"effort": "xhigh"}
 
+    def test_reasoning_config_preserves_xhigh_for_opus_4_8_and_fable_5(self):
+        for model in ("claude-opus-4-8", "claude-fable-5"):
+            kwargs = build_anthropic_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "think harder"}],
+                tools=None,
+                max_tokens=4096,
+                reasoning_config={"enabled": True, "effort": "xhigh"},
+            )
+            assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+            assert kwargs["output_config"] == {"effort": "xhigh"}
+
     def test_reasoning_config_maps_max_effort_for_4_7_models(self):
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-7",
@@ -1170,6 +1182,8 @@ class TestBuildAnthropicKwargs:
         # calling the internal predicate directly.
         from agent.anthropic_adapter import _forbids_sampling_params
         assert _forbids_sampling_params("claude-opus-4-7") is True
+        assert _forbids_sampling_params("claude-opus-4-8") is True
+        assert _forbids_sampling_params("claude-fable-5") is True
         assert _forbids_sampling_params("claude-opus-4-6") is False
         assert _forbids_sampling_params("claude-sonnet-4-5") is False
 

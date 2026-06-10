@@ -32,6 +32,8 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
+    ("anthropic/claude-fable-5",               ""),
+    ("anthropic/claude-opus-4.8",              ""),
     ("anthropic/claude-opus-4.7",              ""),
     ("anthropic/claude-opus-4.6",              ""),
     ("anthropic/claude-sonnet-4.6",            ""),
@@ -78,6 +80,8 @@ VERCEL_AI_GATEWAY_MODELS: list[tuple[str, str]] = [
     ("alibaba/qwen3.6-plus",                 ""),
     ("zai/glm-5.1",                          ""),
     ("minimax/minimax-m2.7",                 ""),
+    ("anthropic/claude-fable-5",             ""),
+    ("anthropic/claude-opus-4.8",            ""),
     ("anthropic/claude-sonnet-4.6",          ""),
     ("anthropic/claude-opus-4.7",            ""),
     ("anthropic/claude-opus-4.6",            ""),
@@ -162,6 +166,8 @@ def _xai_curated_models() -> list[str]:
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
+        "anthropic/claude-fable-5",
+        "anthropic/claude-opus-4.8",
         "anthropic/claude-opus-4.7",
         "anthropic/claude-opus-4.6",
         "anthropic/claude-sonnet-4.6",
@@ -301,6 +307,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2",
     ],
     "anthropic": [
+        "claude-fable-5",
+        "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
         "claude-sonnet-4-6",

@@ -408,14 +408,22 @@ def init_agent(
     )
     # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from
     # config.yaml under prompt_caching.cache_ttl; unknown values keep "5m".
-    # 1h tier costs 2x on write vs 1.25x for 5m, but amortizes across long
-    # sessions with >5-minute pauses between turns (#14971).
+    # Provider-specific overrides live under
+    # prompt_caching.provider_overrides.<provider>.cache_ttl and win over the
+    # global default. 1h tier costs 2x on write vs 1.25x for 5m, but amortizes
+    # across long sessions with >5-minute pauses between turns (#14971).
     agent._cache_ttl = "5m"
     try:
         from hermes_cli.config import load_config as _load_pc_cfg
 
         _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
         _ttl = _pc_cfg.get("cache_ttl", "5m")
+        _overrides = _pc_cfg.get("provider_overrides", {}) or {}
+        _provider = (agent.provider or "").strip().lower()
+        if _provider and isinstance(_overrides, dict):
+            _provider_cfg = _overrides.get(_provider, {}) or {}
+            if isinstance(_provider_cfg, dict):
+                _ttl = _provider_cfg.get("cache_ttl", _ttl)
         if _ttl in {"5m", "1h"}:
             agent._cache_ttl = _ttl
     except Exception:
