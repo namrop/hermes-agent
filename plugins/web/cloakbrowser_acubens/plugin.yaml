@@ -1,0 +1,7 @@
+name: web-cloakbrowser-acubens
+version: 1.0.0
+description: "Stealth rendered-page extraction through a configured Acubens CloakBrowser CDP endpoint."
+author: local
+kind: backend
+provides_web_providers:
+  - cloakbrowser-acubens

@@ -673,6 +673,21 @@ DEFAULT_CONFIG = {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        # Explicit rendered extraction lanes. These are separate from ordinary
+        # public web_extract so signed-in browser access and stealth-browser
+        # routing stay visible in the tool name / provenance.
+        "authenticated_extract_backend": "earthglass",
+        "stealth_extract_backend": "cloakbrowser-acubens",
+        "earthglass": {
+            "endpoint": "http://127.0.0.1:9223",
+            "enabled": True,
+            "auto_start": False,
+            "require_opt_in": True,
+        },
+        "cloakbrowser_acubens": {
+            "endpoint": "",
+            "require_domain_allowlist": True,
+        },
     },
 
     "browser": {
