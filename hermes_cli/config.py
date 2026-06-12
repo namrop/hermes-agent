@@ -1171,9 +1171,12 @@ DEFAULT_CONFIG = {
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+            "timeout_seconds": 120,  # local command fallback timeout
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+            "timeout_seconds": 120,
+            "fallback_to_local": False,  # if OpenAI-compatible STT fails, try local faster-whisper/whisper CLI
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602

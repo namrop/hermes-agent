@@ -352,6 +352,65 @@ class TestTranscribeOpenAIExtended:
         assert "Permission denied" in result["error"]
         mock_client.close.assert_called_once()
 
+    def test_uses_configured_timeout_seconds(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "test"
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"openai": {"timeout_seconds": 123}}), \
+             patch("openai.OpenAI", return_value=mock_client) as mock_openai_cls:
+            from tools.transcription_tools import _transcribe_openai
+            result = _transcribe_openai(sample_wav, "whisper-1")
+
+        assert result["success"] is True
+        assert mock_openai_cls.call_args.kwargs["timeout"] == 123
+
+    def test_openai_failure_can_fall_back_to_local_command(self, sample_wav):
+        stt_config = {
+            "enabled": True,
+            "provider": "openai",
+            "openai": {"model": "whisper-1", "fallback_to_local": True},
+            "local": {"model": "base", "language": "en"},
+        }
+
+        with patch("tools.transcription_tools._load_stt_config", return_value=stt_config), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_openai_audio_backend", return_value=True), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._has_local_command", return_value=True), \
+             patch("tools.transcription_tools._transcribe_openai", return_value={"success": False, "transcript": "", "error": "Request timeout"}), \
+             patch("tools.transcription_tools._transcribe_local_command", return_value={"success": True, "transcript": "fallback transcript", "provider": "local_command"}) as fallback:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is True
+        assert result["transcript"] == "fallback transcript"
+        assert result["provider"] == "local_command"
+        assert result["fallback_from"] == "openai"
+        assert result["primary_error"] == "Request timeout"
+        fallback.assert_called_once_with(sample_wav, "base")
+
+    def test_openai_failure_without_configured_fallback_returns_primary_error(self, sample_wav):
+        stt_config = {
+            "enabled": True,
+            "provider": "openai",
+            "openai": {"model": "whisper-1"},
+        }
+
+        with patch("tools.transcription_tools._load_stt_config", return_value=stt_config), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_openai_audio_backend", return_value=True), \
+             patch("tools.transcription_tools._transcribe_openai", return_value={"success": False, "transcript": "", "error": "Request timeout"}), \
+             patch("tools.transcription_tools._transcribe_local_command") as fallback:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is False
+        assert result["error"] == "Request timeout"
+        fallback.assert_not_called()
+
 
 class TestTranscribeLocalCommand:
     def test_auto_detects_local_whisper_binary(self, monkeypatch):

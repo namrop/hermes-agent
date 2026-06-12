@@ -86,7 +86,10 @@ DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
-COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+LOCAL_STT_COMMAND_TIMEOUT_ENV = "HERMES_LOCAL_STT_COMMAND_TIMEOUT_SECONDS"
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 120
+DEFAULT_LOCAL_COMMAND_TIMEOUT_SECONDS = 120
+COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/run/current-system/sw/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -170,6 +173,74 @@ def _get_local_command_template() -> Optional[str]:
 
 def _has_local_command() -> bool:
     return _get_local_command_template() is not None
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _get_openai_timeout_seconds(stt_config: Optional[dict] = None) -> int:
+    if stt_config is None:
+        stt_config = _load_stt_config()
+    openai_cfg = stt_config.get("openai", {}) if isinstance(stt_config, dict) else {}
+    return _coerce_positive_int(
+        openai_cfg.get("timeout_seconds")
+        or os.getenv("STT_OPENAI_TIMEOUT_SECONDS")
+        or os.getenv("VOICE_TOOLS_OPENAI_TIMEOUT_SECONDS"),
+        DEFAULT_OPENAI_TIMEOUT_SECONDS,
+    )
+
+
+def _get_local_command_timeout_seconds(stt_config: Optional[dict] = None) -> int:
+    if stt_config is None:
+        stt_config = _load_stt_config()
+    local_cfg = stt_config.get("local", {}) if isinstance(stt_config, dict) else {}
+    return _coerce_positive_int(
+        local_cfg.get("timeout_seconds") or os.getenv(LOCAL_STT_COMMAND_TIMEOUT_ENV),
+        DEFAULT_LOCAL_COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def _openai_local_fallback_enabled(stt_config: dict) -> bool:
+    openai_cfg = stt_config.get("openai", {}) if isinstance(stt_config, dict) else {}
+    fallback_cfg = stt_config.get("fallback", {}) if isinstance(stt_config, dict) else {}
+    if isinstance(openai_cfg, dict) and is_truthy_value(openai_cfg.get("fallback_to_local", False), default=False):
+        return True
+    if isinstance(fallback_cfg, dict):
+        provider = str(fallback_cfg.get("provider", "")).strip()
+        enabled = is_truthy_value(fallback_cfg.get("enabled", bool(provider)), default=bool(provider))
+        return enabled and provider in {"local", "local_command"}
+    return str(stt_config.get("fallback_provider", "")).strip() in {"local", "local_command"}
+
+
+def _transcribe_local_fallback(file_path: str, model_name: Optional[str], primary_error: str) -> Dict[str, Any]:
+    local_model = _normalize_local_model(model_name or DEFAULT_LOCAL_MODEL)
+    if _HAS_FASTER_WHISPER:
+        result = _transcribe_local(file_path, local_model)
+    elif _has_local_command():
+        result = _transcribe_local_command(file_path, local_model)
+    else:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"Primary STT failed ({primary_error}); local fallback unavailable",
+        }
+
+    if result.get("success"):
+        result = dict(result)
+        result["fallback_from"] = "openai"
+        result["primary_error"] = primary_error
+        return result
+
+    result = dict(result)
+    result["error"] = f"Primary STT failed ({primary_error}); local fallback failed: {result.get('error', 'unknown error')}"
+    result["fallback_from"] = "openai"
+    result["primary_error"] = primary_error
+    return result
 
 
 def _normalize_local_model(model_name: Optional[str]) -> str:
@@ -512,12 +583,13 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
                 language=shlex.quote(language),
                 model=shlex.quote(normalized_model),
             )
+            timeout_seconds = _get_local_command_timeout_seconds()
             # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
             use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
             if use_shell:
-                subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+                subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=timeout_seconds)
             else:
-                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True)
+                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True, timeout=timeout_seconds)
             
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
@@ -547,6 +619,13 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
         details = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error("Local STT command failed for %s: %s", file_path, details)
         return {"success": False, "transcript": "", "error": f"Local STT failed: {details}"}
+    except subprocess.TimeoutExpired as e:
+        details = e.stderr or e.stdout or str(e)
+        if isinstance(details, bytes):
+            details = details.decode("utf-8", "replace")
+        details = str(details).strip() or str(e)
+        logger.error("Local STT command timed out for %s: %s", file_path, details)
+        return {"success": False, "transcript": "", "error": f"Local STT timed out: {details}"}
     except Exception as e:
         logger.error("Unexpected error during local command transcription: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
@@ -629,7 +708,12 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=_get_openai_timeout_seconds(),
+            max_retries=0,
+        )
         try:
             with open(file_path, "rb") as audio_file:
                 transcription = client.audio.transcriptions.create(
@@ -867,7 +951,18 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     if provider == "openai":
         openai_cfg = stt_config.get("openai", {})
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
-        return _transcribe_openai(file_path, model_name)
+        result = _transcribe_openai(file_path, model_name)
+        if result.get("success") or not _openai_local_fallback_enabled(stt_config):
+            return result
+        primary_error = str(result.get("error") or "unknown OpenAI STT error")
+        logger.warning(
+            "OpenAI-compatible STT failed (%s); attempting configured local fallback",
+            primary_error,
+        )
+        local_cfg = stt_config.get("local", {})
+        fallback_cfg = stt_config.get("fallback", {}) if isinstance(stt_config.get("fallback", {}), dict) else {}
+        fallback_model = fallback_cfg.get("model") or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        return _transcribe_local_fallback(file_path, fallback_model, primary_error)
 
     if provider == "mistral":
         mistral_cfg = stt_config.get("mistral", {})
