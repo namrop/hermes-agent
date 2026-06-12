@@ -296,3 +296,60 @@ def test_transcription_uses_model_specific_response_formats(monkeypatch, tmp_pat
     assert json_result["transcript"] == "hello from gpt-4o"
     assert json_capture["transcription_kwargs"]["response_format"] == "json"
     assert json_capture["close_calls"] == 1
+
+
+def test_transcription_passes_configured_prompt_to_openai_compatible_stt(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured, transcription_response="hello from glossary")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TOOL_GATEWAY_DOMAIN", "nousresearch.com")
+    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "nous-token")
+
+    prompt_file = tmp_path / "voice-glossary.txt"
+    prompt_file.write_text("Use canonical terms: Lux, Atrium, Acubens, OpenClaw.\n")
+
+    transcription_tools = _load_tool_module(
+        "tools.transcription_tools",
+        "transcription_tools.py",
+    )
+    transcription_tools._load_stt_config = lambda: {
+        "provider": "openai",
+        "openai": {"initial_prompt_file": str(prompt_file)},
+    }
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"RIFF0000WAVEfmt ")
+
+    result = transcription_tools.transcribe_audio(str(audio_path), model="whisper-1")
+
+    assert result["success"] is True
+    assert captured["transcription_kwargs"]["prompt"] == "Use canonical terms: Lux, Atrium, Acubens, OpenClaw."
+
+
+def test_transcription_omits_missing_or_empty_prompt(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured, transcription_response="hello")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TOOL_GATEWAY_DOMAIN", "nousresearch.com")
+    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "nous-token")
+
+    transcription_tools = _load_tool_module(
+        "tools.transcription_tools",
+        "transcription_tools.py",
+    )
+    transcription_tools._load_stt_config = lambda: {
+        "provider": "openai",
+        "openai": {"initial_prompt_file": str(tmp_path / "missing.txt")},
+    }
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"RIFF0000WAVEfmt ")
+
+    result = transcription_tools.transcribe_audio(str(audio_path), model="whisper-1")
+
+    assert result["success"] is True
+    assert "prompt" not in captured["transcription_kwargs"]

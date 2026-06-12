@@ -26,6 +26,7 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import shlex
@@ -203,6 +204,70 @@ def _get_local_command_timeout_seconds(stt_config: Optional[dict] = None) -> int
         local_cfg.get("timeout_seconds") or os.getenv(LOCAL_STT_COMMAND_TIMEOUT_ENV),
         DEFAULT_LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
+
+
+def _format_glossary_prompt(data: Any) -> str:
+    """Return a compact ASR prompt from a text or JSON glossary payload."""
+    if isinstance(data, str):
+        return data.strip()
+    if not isinstance(data, dict):
+        return ""
+
+    parts: list[str] = []
+    prompt = str(data.get("prompt") or data.get("initial_prompt") or "").strip()
+    if prompt:
+        parts.append(prompt)
+
+    glossary = data.get("glossary") or data.get("terms") or []
+    if isinstance(glossary, dict):
+        glossary = list(glossary.keys())
+    if isinstance(glossary, list):
+        terms = [str(term).strip() for term in glossary if str(term).strip()]
+        if terms:
+            parts.append("Canonical terms: " + ", ".join(terms) + ".")
+
+    return "\n".join(parts).strip()
+
+
+def _read_initial_prompt_file(path_value: Any) -> str:
+    """Read a prompt/glossary file without failing transcription when absent."""
+    if not path_value:
+        return ""
+    try:
+        path = Path(os.path.expandvars(str(path_value))).expanduser()
+        if not path.exists() or not path.is_file():
+            return ""
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not raw:
+            return ""
+        if path.suffix.lower() == ".json":
+            try:
+                return _format_glossary_prompt(json.loads(raw))
+            except json.JSONDecodeError:
+                logger.warning("STT glossary file is not valid JSON: %s", path)
+                return ""
+        return raw
+    except OSError as exc:
+        logger.warning("Could not read STT initial prompt file %r: %s", path_value, exc)
+        return ""
+
+
+def _get_stt_initial_prompt(provider_config: Optional[dict]) -> str:
+    """Resolve direct prompt + prompt/glossary file config for API-backed STT."""
+    if not isinstance(provider_config, dict):
+        provider_config = {}
+    file_prompt = _read_initial_prompt_file(
+        provider_config.get("initial_prompt_file")
+        or provider_config.get("prompt_file")
+        or provider_config.get("glossary_file")
+    )
+    direct_prompt = _format_glossary_prompt(
+        provider_config.get("initial_prompt")
+        or provider_config.get("prompt")
+        or provider_config.get("glossary")
+        or ""
+    )
+    return "\n".join(part for part in (file_prompt, direct_prompt) if part).strip()
 
 
 def _openai_local_fallback_enabled(stt_config: dict) -> bool:
@@ -714,12 +779,19 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
             timeout=_get_openai_timeout_seconds(),
             max_retries=0,
         )
+        transcription_kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "response_format": "text" if model_name == "whisper-1" else "json",
+        }
+        openai_cfg = _load_stt_config().get("openai", {})
+        initial_prompt = _get_stt_initial_prompt(openai_cfg)
+        if initial_prompt:
+            transcription_kwargs["prompt"] = initial_prompt
         try:
             with open(file_path, "rb") as audio_file:
                 transcription = client.audio.transcriptions.create(
-                    model=model_name,
                     file=audio_file,
-                    response_format="text" if model_name == "whisper-1" else "json",
+                    **transcription_kwargs,
                 )
 
             transcript_text = _extract_transcript_text(transcription)

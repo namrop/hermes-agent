@@ -1177,6 +1177,7 @@ DEFAULT_CONFIG = {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
             "timeout_seconds": 120,
             "fallback_to_local": False,  # if OpenAI-compatible STT fails, try local faster-whisper/whisper CLI
+            "initial_prompt_file": "",  # optional glossary/prompt file passed as OpenAI-compatible transcription prompt
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
