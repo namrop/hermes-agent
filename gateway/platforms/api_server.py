@@ -1406,8 +1406,11 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
+            emitted_text_delta = False
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
+                nonlocal emitted_text_delta
                 """Write a single queue item to the SSE stream.
 
                 Plain strings are sent as normal ``delta.content`` chunks.
@@ -1423,6 +1426,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    if item:
+                        emitted_text_delta = True
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -1463,6 +1468,13 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                if agent_final and not emitted_text_delta:
+                    # Some provider/tool paths produce a final_response but do
+                    # not fire stream_delta_callback for the last assistant
+                    # message. Without this fallback, streaming clients see
+                    # tool cards and then a stop chunk with no answer.
+                    last_activity = await _emit(agent_final)
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
 

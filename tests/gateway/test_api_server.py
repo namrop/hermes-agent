@@ -935,6 +935,47 @@ class TestChatCompletionsEndpoint:
                 # Final content must also be present
                 assert "Here are the files." in body
 
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_final_response_when_no_delta_after_tools(self, adapter):
+        """If the agent returns final_response but streams only tool events, emit it.
+
+        Some provider/tool paths do not fire stream_delta_callback for the final
+        assistant text after tool execution. The API still has final_response
+        once the agent task completes; streaming clients must receive it before
+        the finish chunk or UIs render tools with no answer.
+        """
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_terminal_1", "terminal", {"command": "date"})
+                if tc_cb:
+                    tc_cb("call_terminal_1", "terminal", {"command": "date"}, "Mon Jun 15")
+                # Intentionally do NOT call stream_delta_callback.
+                return (
+                    {"final_response": "The date command completed.", "messages": [], "api_calls": 2},
+                    {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "what is the date?"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert "event: hermes.tool.progress" in body
+        assert "The date command completed." in body
+        assert body.index("The date command completed.") < body.index('"finish_reason": "stop"')
+
     @pytest.mark.asyncio
     async def test_stream_tool_progress_skips_internal_events(self, adapter):
         """Internal tool calls (name starting with ``_``) are not streamed."""
