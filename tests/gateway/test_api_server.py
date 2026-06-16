@@ -1047,6 +1047,9 @@ class TestChatCompletionsEndpoint:
                         except _json.JSONDecodeError:
                             break
                         pairs.append((payload.get("status"), payload.get("toolCallId")))
+                        if payload.get("status") == "completed":
+                            assert payload.get("preview") == "ok"
+                            assert payload.get("output") == "ok"
                         break
 
             # Each tool start must emit exactly one event (no duplicate

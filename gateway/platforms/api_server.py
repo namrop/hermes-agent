@@ -1159,6 +1159,26 @@ class APIServerAdapter(BasePlatformAdapter):
             # producing an orphaned event clients can't correlate.
             _started_tool_call_ids: set[str] = set()
 
+            def _bounded_tool_preview(function_result, limit: int = 4000) -> str:
+                """Return a bounded text preview for lifecycle clients.
+
+                Tool results can be structured, huge, or non-string. Keep the
+                SSE event inspectable without trying to ship unbounded stdout or
+                binary-like payloads through every OpenAI-compatible client.
+                """
+                if function_result is None:
+                    return ""
+                if isinstance(function_result, str):
+                    text = function_result
+                else:
+                    try:
+                        text = json.dumps(function_result, ensure_ascii=False, default=str)
+                    except Exception:
+                        text = str(function_result)
+                if len(text) <= limit:
+                    return text
+                return text[:limit] + f"\n… truncated {len(text) - limit} chars"
+
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Emit ``hermes.tool.progress`` with ``status: running``.
 
@@ -1199,6 +1219,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
+                    "preview": _bounded_tool_preview(function_result),
+                    "output": _bounded_tool_preview(function_result),
                 }))
 
             # Start agent in background.  agent_ref is a mutable container
