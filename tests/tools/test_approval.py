@@ -10,10 +10,12 @@ from tools.approval import (
     _get_approval_mode,
     _smart_approve,
     approve_session,
+    check_all_command_guards,
     detect_dangerous_command,
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
+    requires_manual_approval,
     submit_pending,
 )
 
@@ -832,9 +834,11 @@ class TestGitDestructiveOps:
 
     def test_git_reset_hard_detected(self):
         cmd = "git reset --hard HEAD~3"
-        dangerous, _, desc = detect_dangerous_command(cmd)
+        dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is True
         assert "reset" in desc.lower() or "hard" in desc.lower()
+        assert "tracked uncommitted" in desc.lower()
+        assert requires_manual_approval(key, desc) is True
 
     def test_git_push_force_detected(self):
         cmd = "git push --force origin main"
@@ -849,9 +853,76 @@ class TestGitDestructiveOps:
 
     def test_git_clean_force_detected(self):
         cmd = "git clean -fd"
-        dangerous, _, desc = detect_dangerous_command(cmd)
+        dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is True
         assert "clean" in desc.lower()
+        assert "untracked" in desc.lower()
+        assert requires_manual_approval(key, desc) is True
+
+    def test_git_clean_force_x_detected(self):
+        cmd = "git clean -fdx"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "clean" in desc.lower()
+        assert "untracked" in desc.lower()
+        assert requires_manual_approval(key, desc) is True
+
+    def test_git_checkout_full_tree_detected(self):
+        cmd = "git checkout -- ."
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "checkout" in desc.lower()
+        assert "tracked uncommitted" in desc.lower()
+        assert requires_manual_approval(key, desc) is True
+
+    def test_git_restore_worktree_full_tree_detected(self):
+        cmd = "git restore --worktree ."
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "restore" in desc.lower()
+        assert "tracked uncommitted" in desc.lower()
+        assert requires_manual_approval(key, desc) is True
+
+    def test_git_restore_worktree_short_flag_full_tree_detected(self):
+        cmd = "git restore -W :/"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "restore" in desc.lower()
+        assert requires_manual_approval(key, desc) is True
+
+    def test_destructive_worktree_git_ops_skip_smart_approval(self, monkeypatch):
+        """Smart mode must not auto-approve broad destructive Git worktree ops."""
+        session_key = "git_manual_only_smart_test"
+        approval_module._session_approved.pop(session_key, None)
+        approval_module._pending.pop(session_key, None)
+        token = approval_module.set_current_session_key(session_key)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
+        try:
+            with mock_patch(
+                "tools.tirith_security.check_command_security",
+                return_value={"action": "allow", "findings": [], "summary": ""},
+            ), mock_patch("tools.approval._smart_approve", return_value="approve") as smart:
+                for cmd in (
+                    "git reset --hard HEAD~1",
+                    "git clean -fdx",
+                    "git checkout -- .",
+                    "git restore --worktree .",
+                ):
+                    result = check_all_command_guards(cmd, "local")
+                    assert result["approved"] is False
+                    assert result.get("approval_pending") is True
+                    assert result.get("status") == "pending_approval"
+                    assert "uncommitted" in result.get("description", "") or "untracked" in result.get("description", "")
+
+                smart.assert_not_called()
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module._session_approved.pop(session_key, None)
+            approval_module._pending.pop(session_key, None)
 
     def test_git_branch_force_delete_detected(self):
         cmd = "git branch -D feature-branch"
