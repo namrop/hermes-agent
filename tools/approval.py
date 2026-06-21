@@ -384,10 +384,12 @@ DANGEROUS_PATTERNS = [
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
     # Git destructive operations that can lose uncommitted work or rewrite
     # shared history. Not captured by rm/chmod/etc patterns.
-    (r'\bgit\s+reset\s+--hard\b', "git reset --hard (destroys uncommitted changes)"),
+    (r'\bgit\s+reset\s+--hard\b', "git reset --hard (discards tracked uncommitted worktree changes)"),
     (r'\bgit\s+push\b.*--force\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
-    (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
+    (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files/directories)"),
+    (r'\bgit\s+checkout\s+(?:--\s+)?(?:\.|:/)(?:\s|$)', "git checkout full worktree (discards tracked uncommitted worktree changes)"),
+    (r'\bgit\s+restore\b[^\n]*(?:--worktree|-W)\b[^\n]*(?:\s\.|\s:/)(?:\s|$)', "git restore --worktree . (discards tracked uncommitted worktree changes)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
     # Script execution after chmod +x — catches the two-step pattern where
     # a script is first made executable then immediately run. The script
@@ -420,6 +422,25 @@ DANGEROUS_PATTERNS_COMPILED = [
     (re.compile(pattern, _RE_FLAGS), description)
     for pattern, description in DANGEROUS_PATTERNS
 ]
+
+# Risk classes that must reach a human approval surface even when
+# approvals.mode=smart. Smart approval is deliberately allowed to smooth over
+# noisy false positives, but broad destructive Git operations are effect-risky:
+# a backup branch protects commits, not dirty tracked worktree state, and
+# git clean deletes untracked files outright. Keep these approvable (not
+# hardline), but never auto-approved by the auxiliary LLM.
+MANUAL_APPROVAL_PATTERN_KEYS = frozenset({
+    "git reset --hard (discards tracked uncommitted worktree changes)",
+    "git clean with force (deletes untracked files/directories)",
+    "git checkout full worktree (discards tracked uncommitted worktree changes)",
+    "git restore --worktree . (discards tracked uncommitted worktree changes)",
+})
+
+
+def requires_manual_approval(pattern_key: str | None, description: str | None = None) -> bool:
+    """Return True for warning classes that smart approval may not bypass."""
+    candidates = {pattern_key, description} - {None}
+    return any(candidate in MANUAL_APPROVAL_PATTERN_KEYS for candidate in candidates)
 
 
 def _legacy_pattern_key(pattern: str) -> str:
@@ -883,8 +904,8 @@ Flagged reason: {description}
 Assess the ACTUAL risk of this command. Many flagged commands are false positives — for example, `python -c "print('hello')"` is flagged as "script execution via -c flag" but is completely harmless.
 
 Rules:
-- APPROVE if the command is clearly safe (benign script execution, safe file operations, development tools, package installs, git operations, etc.)
-- DENY if the command could genuinely damage the system (recursive delete of important paths, overwriting system files, fork bombs, wiping disks, dropping databases, etc.)
+- APPROVE if the command is clearly safe (benign script execution, safe file operations, development tools, package installs, non-destructive git operations, etc.)
+- DENY if the command could genuinely damage the system (recursive delete of important paths, overwriting system files, fork bombs, wiping disks, dropping databases, destructive git worktree/history operations, etc.)
 - ESCALATE if you're uncertain
 
 Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
@@ -1149,7 +1170,10 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
-    if approval_mode == "smart":
+    has_manual_only_warning = any(
+        requires_manual_approval(key, desc) for key, desc, _ in warnings
+    )
+    if approval_mode == "smart" and not has_manual_only_warning:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
