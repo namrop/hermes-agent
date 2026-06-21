@@ -306,7 +306,47 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_events_stream_includes_tool_completed_output_preview(self, adapter):
+        """Runs tool.completed events should carry bounded tool output for UIs."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
 
+                def _run_conversation(*args, **kwargs):
+                    cb = mock_create.call_args.kwargs["tool_progress_callback"]
+                    cb("tool.started", "terminal", 'terminal(command="date")', {"command": "date"})
+                    cb(
+                        "tool.completed",
+                        "terminal",
+                        None,
+                        None,
+                        output='{"ok":true}',
+                        result_preview='{"ok":true}',
+                        duration=0.1,
+                        is_error=False,
+                    )
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_resp.status == 200
+                body = await events_resp.text()
+
+                assert "tool.completed" in body
+                assert '"output": "{\\"ok\\":true}"' in body
+                assert '"result_preview": "{\\"ok\\":true}"' in body
 
     @pytest.mark.asyncio
     async def test_approval_response_without_pending_returns_409(self, adapter):

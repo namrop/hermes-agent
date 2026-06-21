@@ -2849,6 +2849,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        def _bounded_tool_preview(function_result, limit: int = 4000) -> str:
+            """Return a bounded text preview for /v1/runs tool-result events."""
+            if function_result is None:
+                return ""
+            if isinstance(function_result, str):
+                text = function_result
+            else:
+                try:
+                    text = json.dumps(function_result, ensure_ascii=False, default=str)
+                except Exception:
+                    text = str(function_result)
+            if len(text) <= limit:
+                return text
+            return text[:limit] + f"\n… truncated {len(text) - limit} chars"
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -2874,14 +2889,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
-                _push({
+                result_output = kwargs.get("output")
+                if result_output is None:
+                    result_output = kwargs.get("result_preview")
+                if result_output is None:
+                    result_output = preview
+                bounded_output = _bounded_tool_preview(result_output)
+                event = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
-                })
+                }
+                if bounded_output:
+                    event["output"] = bounded_output
+                    event["result_preview"] = bounded_output
+                _push(event)
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
