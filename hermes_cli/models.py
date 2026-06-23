@@ -55,6 +55,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("qwen/qwen3.6-35b-a3b",                   ""),
     ("stepfun/step-3.5-flash",                 ""),
     ("minimax/minimax-m2.7",                   ""),
+    ("z-ai/glm-5.2",                           ""),
     ("z-ai/glm-5.1",                           ""),
     ("x-ai/grok-4.20",                         ""),
     ("x-ai/grok-4.3",                          ""),
