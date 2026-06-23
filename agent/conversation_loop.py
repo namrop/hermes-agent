@@ -1604,6 +1604,14 @@ def run_conversation(
                             # affects 0 rows without error).
                             if not agent._session_db_created:
                                 agent._ensure_db_session()
+                            estimated_cost = (
+                                float(cost_result.amount_usd)
+                                if cost_result.amount_usd is not None else None
+                            )
+                            billing_mode = (
+                                "subscription_included"
+                                if cost_result.status == "included" else None
+                            )
                             agent._session_db.update_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
@@ -1611,17 +1619,37 @@ def run_conversation(
                                 cache_read_tokens=canonical_usage.cache_read_tokens,
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
-                                estimated_cost_usd=float(cost_result.amount_usd)
-                                if cost_result.amount_usd is not None else None,
+                                estimated_cost_usd=estimated_cost,
                                 cost_status=cost_result.status,
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
-                                billing_mode="subscription_included"
-                                if cost_result.status == "included" else None,
+                                billing_mode=billing_mode,
                                 model=agent.model,
                                 api_call_count=1,
                             )
+                            if hasattr(agent._session_db, "record_llm_usage_event"):
+                                agent._session_db.record_llm_usage_event(
+                                    session_id=agent.session_id,
+                                    source=getattr(agent, "platform", None),
+                                    provider=agent.provider,
+                                    model=agent.model,
+                                    api_mode=agent.api_mode,
+                                    billing_base_url=agent.base_url,
+                                    billing_mode=billing_mode,
+                                    input_tokens=canonical_usage.input_tokens,
+                                    output_tokens=canonical_usage.output_tokens,
+                                    cache_read_tokens=canonical_usage.cache_read_tokens,
+                                    cache_write_tokens=canonical_usage.cache_write_tokens,
+                                    reasoning_tokens=canonical_usage.reasoning_tokens,
+                                    estimated_cost_usd=estimated_cost,
+                                    cost_status=cost_result.status,
+                                    cost_source=cost_result.source,
+                                    pricing_version=cost_result.pricing_version,
+                                    latency_ms=int(api_duration * 1000),
+                                    request_status="ok",
+                                    api_call_index=agent.session_api_calls,
+                                )
                         except Exception as e:
                             # Log token persistence failures so they're
                             # visible in agent.log — silent loss here is

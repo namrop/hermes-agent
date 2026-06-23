@@ -122,6 +122,63 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["model"] == "openai/gpt-5.4"
 
+    def test_record_llm_usage_event_persists_per_call_provider_model_buckets(self, db):
+        db.create_session(session_id="s1", source="discord", model="gpt-5.5")
+
+        event_id = db.record_llm_usage_event(
+            session_id="s1",
+            source="discord",
+            provider="openai-codex",
+            model="gpt-5.5",
+            api_mode="codex_responses",
+            billing_base_url="https://chatgpt.com/backend-api/codex",
+            billing_mode="subscription_included",
+            input_tokens=120,
+            output_tokens=30,
+            cache_read_tokens=80,
+            cache_write_tokens=10,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.0,
+            cost_status="included",
+            cost_source="none",
+            pricing_version="included-route",
+            latency_ms=1234,
+            request_status="ok",
+            api_call_index=3,
+        )
+
+        events = db.get_llm_usage_events(session_id="s1")
+        assert len(events) == 1
+        event = events[0]
+        assert event["id"] == event_id
+        assert event["session_id"] == "s1"
+        assert event["source"] == "discord"
+        assert event["provider"] == "openai-codex"
+        assert event["model"] == "gpt-5.5"
+        assert event["api_mode"] == "codex_responses"
+        assert event["input_tokens"] == 120
+        assert event["output_tokens"] == 30
+        assert event["cache_read_tokens"] == 80
+        assert event["cache_write_tokens"] == 10
+        assert event["reasoning_tokens"] == 7
+        assert event["latency_ms"] == 1234
+        assert event["request_status"] == "ok"
+        assert event["api_call_index"] == 3
+
+    def test_record_llm_usage_event_backfills_source_from_session(self, db):
+        db.create_session(session_id="s1", source="telegram", model="deepseek-v4-pro")
+
+        db.record_llm_usage_event(
+            session_id="s1",
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            input_tokens=10,
+            output_tokens=5,
+        )
+
+        event = db.get_llm_usage_events(session_id="s1")[0]
+        assert event["source"] == "telegram"
+
     def test_update_token_counts_preserves_existing_model(self, db):
         db.create_session(session_id="s1", source="cli", model="anthropic/claude-opus-4.6")
         db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")

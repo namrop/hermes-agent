@@ -221,6 +221,33 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS llm_usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    session_id TEXT REFERENCES sessions(id),
+    source TEXT,
+    provider TEXT,
+    model TEXT,
+    api_mode TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    latency_ms INTEGER,
+    request_status TEXT DEFAULT 'ok',
+    error_class TEXT,
+    api_call_index INTEGER,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -248,6 +275,9 @@ CREATE TABLE IF NOT EXISTS state_meta (
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_events_timestamp ON llm_usage_events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_events_session ON llm_usage_events(session_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_events_provider_model ON llm_usage_events(provider, model, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 """
 
@@ -862,6 +892,122 @@ class SessionDB:
         def _do(conn):
             conn.execute(sql, params)
         self._execute_write(_do)
+
+    def record_llm_usage_event(
+        self,
+        session_id: Optional[str] = None,
+        *,
+        timestamp: Optional[float] = None,
+        source: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        api_mode: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+        latency_ms: Optional[int] = None,
+        request_status: str = "ok",
+        error_class: Optional[str] = None,
+        api_call_index: Optional[int] = None,
+    ) -> int:
+        """Persist one normalized LLM API usage event.
+
+        Session rows keep cumulative counters for quick summaries.  This
+        event table stores per-call facts so provider/model charts can be
+        rebuilt by time window without reconstructing from cumulative session
+        rows.
+        """
+        now = time.time()
+        event_ts = float(timestamp if timestamp is not None else now)
+
+        def _to_int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except Exception:
+                return 0
+
+        def _do(conn):
+            event_source = source
+            if session_id:
+                row = conn.execute(
+                    "SELECT source, model FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is not None:
+                    event_source = event_source or row["source"]
+            cursor = conn.execute(
+                """INSERT INTO llm_usage_events (
+                       timestamp, session_id, source, provider, model, api_mode,
+                       billing_base_url, billing_mode, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                       estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+                       pricing_version, latency_ms, request_status, error_class,
+                       api_call_index, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_ts,
+                    session_id,
+                    event_source,
+                    provider,
+                    model,
+                    api_mode,
+                    billing_base_url,
+                    billing_mode,
+                    _to_int(input_tokens),
+                    _to_int(output_tokens),
+                    _to_int(cache_read_tokens),
+                    _to_int(cache_write_tokens),
+                    _to_int(reasoning_tokens),
+                    estimated_cost_usd,
+                    actual_cost_usd,
+                    cost_status,
+                    cost_source,
+                    pricing_version,
+                    latency_ms,
+                    request_status or "ok",
+                    error_class,
+                    api_call_index,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def get_llm_usage_events(
+        self,
+        session_id: Optional[str] = None,
+        *,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return recent LLM usage events, optionally scoped to one session."""
+        limit = max(1, min(int(limit or 100), 10000))
+        with self._lock:
+            if session_id:
+                rows = self._conn.execute(
+                    """SELECT * FROM llm_usage_events
+                       WHERE session_id = ?
+                       ORDER BY timestamp ASC, id ASC
+                       LIMIT ?""",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT * FROM llm_usage_events
+                       ORDER BY timestamp DESC, id DESC
+                       LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def ensure_session(
         self,
