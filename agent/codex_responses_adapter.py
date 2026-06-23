@@ -507,23 +507,33 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
             if output is None:
                 output = ""
             # Output may be a string OR an array of structured content
-            # items (input_text / input_image) for multimodal tool results.
-            # Both shapes are accepted by the Responses API. We preserve
-            # the array form when present.
+            # items for multimodal tool results. Chat-style tool result
+            # parts commonly arrive as {"type":"text"}; the Codex/ChatGPT
+            # Responses backend rejects that exact shape inside
+            # function_call_output.output with HTTP 400
+            # {'detail': 'Unsupported content type'}. Canonicalize all
+            # textual variants to input_text here so preflight is safe even
+            # when callers pass an already-built Responses input array.
             if isinstance(output, list):
                 # Validate each item is a recognised content shape; drop
                 # anything else to avoid 4xx from the API.
                 cleaned: List[Dict[str, Any]] = []
                 for part in output:
+                    if isinstance(part, str):
+                        if part:
+                            cleaned.append({"type": "input_text", "text": part})
+                        continue
                     if not isinstance(part, dict):
                         continue
-                    ptype = part.get("type")
-                    if ptype == "input_text":
+                    ptype = str(part.get("type") or "").strip().lower()
+                    if ptype in {"text", "input_text", "output_text"}:
                         text = part.get("text")
                         if isinstance(text, str) and text:
                             cleaned.append({"type": "input_text", "text": text})
-                    elif ptype == "input_image":
+                    elif ptype in {"image_url", "input_image"}:
                         url = part.get("image_url")
+                        if isinstance(url, dict):
+                            url = url.get("url")
                         if isinstance(url, str) and url:
                             entry: Dict[str, Any] = {"type": "input_image", "image_url": url}
                             detail = part.get("detail")
