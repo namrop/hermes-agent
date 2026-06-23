@@ -179,6 +179,42 @@ class TestSessionLifecycle:
         event = db.get_llm_usage_events(session_id="s1")[0]
         assert event["source"] == "telegram"
 
+    def test_backfill_llm_usage_events_from_session_totals_is_approximate_and_idempotent(self, db):
+        db.create_session(session_id="s1", source="discord", model="gpt-5.5")
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            output_tokens=25,
+            cache_read_tokens=400,
+            reasoning_tokens=3,
+            estimated_cost_usd=0.0,
+            cost_status="included",
+            cost_source="none",
+            pricing_version="included-route",
+            billing_provider="openai-codex",
+            billing_mode="subscription_included",
+            api_call_count=4,
+        )
+        db.create_session(session_id="empty", source="cli", model="unused")
+
+        inserted = db.backfill_llm_usage_events_from_sessions()
+        inserted_again = db.backfill_llm_usage_events_from_sessions()
+
+        assert inserted == 1
+        assert inserted_again == 0
+        events = db.get_llm_usage_events(session_id="s1")
+        assert len(events) == 1
+        event = events[0]
+        assert event["request_status"] == "approximate_session_backfill"
+        assert event["source"] == "discord"
+        assert event["provider"] == "openai-codex"
+        assert event["model"] == "gpt-5.5"
+        assert event["input_tokens"] == 100
+        assert event["output_tokens"] == 25
+        assert event["cache_read_tokens"] == 400
+        assert event["reasoning_tokens"] == 3
+        assert event["api_call_index"] == 4
+
     def test_update_token_counts_preserves_existing_model(self, db):
         db.create_session(session_id="s1", source="cli", model="anthropic/claude-opus-4.6")
         db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")

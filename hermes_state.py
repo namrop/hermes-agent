@@ -1009,6 +1009,74 @@ class SessionDB:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def backfill_llm_usage_events_from_sessions(self) -> int:
+        """Create one approximate LLM usage event for each historical session.
+
+        This is a lossy migration path for sessions that predate
+        ``llm_usage_events``.  It preserves cumulative session token/cost
+        buckets as a single synthetic event, marked by request_status so
+        analytics can distinguish it from true per-call rows.
+        """
+        now = time.time()
+
+        def _do(conn):
+            rows = conn.execute(
+                """SELECT * FROM sessions s
+                   WHERE (
+                       COALESCE(s.input_tokens, 0) > 0
+                       OR COALESCE(s.output_tokens, 0) > 0
+                       OR COALESCE(s.cache_read_tokens, 0) > 0
+                       OR COALESCE(s.cache_write_tokens, 0) > 0
+                       OR COALESCE(s.reasoning_tokens, 0) > 0
+                       OR COALESCE(s.api_call_count, 0) > 0
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM llm_usage_events e
+                       WHERE e.session_id = s.id
+                         AND e.request_status = 'approximate_session_backfill'
+                   )"""
+            ).fetchall()
+            inserted = 0
+            for row in rows:
+                provider = row["billing_provider"] or "unknown"
+                event_ts = row["ended_at"] or row["started_at"] or now
+                conn.execute(
+                    """INSERT INTO llm_usage_events (
+                           timestamp, session_id, source, provider, model, api_mode,
+                           billing_base_url, billing_mode, input_tokens, output_tokens,
+                           cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                           estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+                           pricing_version, request_status, api_call_index, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event_ts,
+                        row["id"],
+                        row["source"],
+                        provider,
+                        row["model"],
+                        None,
+                        row["billing_base_url"],
+                        row["billing_mode"],
+                        row["input_tokens"] or 0,
+                        row["output_tokens"] or 0,
+                        row["cache_read_tokens"] or 0,
+                        row["cache_write_tokens"] or 0,
+                        row["reasoning_tokens"] or 0,
+                        row["estimated_cost_usd"],
+                        row["actual_cost_usd"],
+                        row["cost_status"],
+                        row["cost_source"],
+                        row["pricing_version"],
+                        "approximate_session_backfill",
+                        row["api_call_count"] or None,
+                        now,
+                    ),
+                )
+                inserted += 1
+            return inserted
+
+        return int(self._execute_write(_do) or 0)
+
     def ensure_session(
         self,
         session_id: str,
