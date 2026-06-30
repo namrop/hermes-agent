@@ -2452,13 +2452,23 @@ class DiscordAdapter(BasePlatformAdapter):
         )
 
         try:
-            await interaction.response.send_message(
-                "You're not authorized to use this command.",
-                ephemeral=True,
-            )
+            response = getattr(interaction, "response", None)
+            is_done = getattr(response, "is_done", None)
+            already_responded = bool(is_done()) if callable(is_done) else False
+            if already_responded:
+                await interaction.edit_original_response(
+                    content="You're not authorized to use this command.",
+                )
+            else:
+                await interaction.response.send_message(
+                    "You're not authorized to use this command.",
+                    ephemeral=True,
+                )
         except Exception as e:
-            # Interaction may already be responded to (e.g. caller deferred
-            # before the auth check, or Discord retried). Best-effort only.
+            # Interaction may already be expired/responded to (e.g. caller
+            # deferred before the auth check, Discord retried, or the event
+            # loop was blocked long enough for the token to expire).
+            # Best-effort only; dispatch remains blocked by the False return.
             logger.debug("[Discord] Could not send unauthorized ephemeral: %s", e)
 
         # Fire-and-forget: don't block the interaction handler on Telegram I/O.
@@ -2910,12 +2920,26 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             pass  # logging must never block command dispatch
 
-        # Auth gate — must run before defer() so an ephemeral rejection can
-        # be delivered on the still-unresponded interaction.
+        # Acknowledge the interaction before doing any work that can stall the
+        # Discord event loop. Discord invalidates an interaction if the first
+        # response is not sent within ~3 seconds; when the gateway is under
+        # agent/tool load even a cheap auth check can be delayed enough to make
+        # /status, /model, etc. fail with Unknown interaction (10062).
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            logger.warning(
+                "[Discord] Could not defer slash %r before dispatch: %s",
+                command_text,
+                e,
+            )
+            return
+
+        # Auth gate still blocks dispatch. _reject_slash knows how to replace
+        # the deferred ephemeral response with a rejection message.
         if not await self._check_slash_authorization(interaction, command_text):
             return
 
-        await interaction.response.defer(ephemeral=True)
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
         try:
