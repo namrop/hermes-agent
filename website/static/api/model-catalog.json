@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-23T12:55:09Z",
+  "updated_at": "2026-07-10T16:29:02Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -12,6 +12,50 @@
         "note": "Descriptions drive picker badges. Live /api/v1/models filters curated ids by tool-calling support and free pricing."
       },
       "models": [
+        {
+          "id": "aion-labs/aion-3.0",
+          "description": ""
+        },
+        {
+          "id": "aion-labs/aion-3.0-mini",
+          "description": ""
+        },
+        {
+          "id": "x-ai/grok-4.5",
+          "description": ""
+        },
+        {
+          "id": "anthropic/claude-sonnet-5",
+          "description": ""
+        },
+        {
+          "id": "minimax/minimax-m3",
+          "description": ""
+        },
+        {
+          "id": "moonshotai/kimi-k2.7-code",
+          "description": ""
+        },
+        {
+          "id": "qwen/qwen3.7-plus",
+          "description": ""
+        },
+        {
+          "id": "tencent/hy3",
+          "description": ""
+        },
+        {
+          "id": "poolside/laguna-xs-2.1",
+          "description": ""
+        },
+        {
+          "id": "anthropic/claude-fable-5",
+          "description": ""
+        },
+        {
+          "id": "anthropic/claude-opus-4.8",
+          "description": ""
+        },
         {
           "id": "anthropic/claude-opus-4.7",
           "description": ""
@@ -148,6 +192,12 @@
         "note": "Free-tier gating is determined live via Portal pricing (partition_nous_models_by_tier), not this manifest."
       },
       "models": [
+        {
+          "id": "anthropic/claude-fable-5"
+        },
+        {
+          "id": "anthropic/claude-opus-4.8"
+        },
         {
           "id": "anthropic/claude-opus-4.7"
         },

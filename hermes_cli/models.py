@@ -32,6 +32,15 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
+    ("aion-labs/aion-3.0",                    ""),
+    ("aion-labs/aion-3.0-mini",               ""),
+    ("x-ai/grok-4.5",                          ""),
+    ("anthropic/claude-sonnet-5",              ""),
+    ("minimax/minimax-m3",                     ""),
+    ("moonshotai/kimi-k2.7-code",              ""),
+    ("qwen/qwen3.7-plus",                      ""),
+    ("tencent/hy3",                            ""),
+    ("poolside/laguna-xs-2.1",                 ""),
     ("anthropic/claude-fable-5",               ""),
     ("anthropic/claude-opus-4.8",              ""),
     ("anthropic/claude-opus-4.7",              ""),
