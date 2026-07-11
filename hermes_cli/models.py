@@ -1145,16 +1145,26 @@ def fetch_openrouter_models(
     if _openrouter_catalog_cache is not None and not force_refresh:
         return list(_openrouter_catalog_cache)
 
-    # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
-    # snapshot when the manifest is unreachable. Both are curated lists that
-    # drive the picker; the OpenRouter live /v1/models filter (tool support,
-    # free pricing) is applied on top either way.
+    # Merge the installed snapshot with the remotely-hosted manifest rather
+    # than letting either one replace the other.  A freshly added in-repo
+    # model can otherwise disappear from the interactive /model picker until
+    # the docs-site manifest is deployed (the typed /model path still sees the
+    # installed snapshot, which makes the two surfaces disagree).  The live
+    # OpenRouter /v1/models pass below remains the authority for whether a
+    # candidate still exists and supports tools, so retaining the union does
+    # not surface stale or non-agentic routes.
     try:
         from hermes_cli.model_catalog import get_curated_openrouter_models
         remote = get_curated_openrouter_models()
     except Exception:
         remote = None
-    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
+
+    fallback = list(OPENROUTER_MODELS)
+    seen_ids = {mid for mid, _ in fallback}
+    for entry in remote or []:
+        if entry[0] not in seen_ids:
+            fallback.append(entry)
+            seen_ids.add(entry[0])
     preferred_ids = [mid for mid, _ in fallback]
 
     try:

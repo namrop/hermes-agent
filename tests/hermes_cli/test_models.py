@@ -61,6 +61,43 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
+    def test_merges_installed_snapshot_with_remote_manifest(self, monkeypatch):
+        """A stale remote manifest must not hide newer installed picker entries."""
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"aion-labs/aion-3.0","pricing":{"prompt":"0.000003","completion":"0.000006"},'
+                    b'"supported_parameters":["tools","tool_choice"]},'
+                    b'{"id":"remote/model","pricing":{"prompt":"0.000001","completion":"0.000002"},'
+                    b'"supported_parameters":["tools"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(
+            _models_mod,
+            "OPENROUTER_MODELS",
+            [("aion-labs/aion-3.0", "")],
+        )
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            lambda: [("remote/model", "")],
+        )
+        with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert [mid for mid, _ in models] == [
+            "aion-labs/aion-3.0",
+            "remote/model",
+        ]
+
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
         class _Resp:
             def __enter__(self):
