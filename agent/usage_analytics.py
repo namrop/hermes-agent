@@ -9,7 +9,9 @@ summary dictionary has these stable keys:
 ``total_tokens``, ``event_count``, ``api_attempt_count``,
 ``successful_call_count``, ``latency_sample_count``, ``latency_total_ms``,
 ``average_latency_ms``, ``historical_aggregate_count``,
-``reconstructed_call_count``, ``estimated_cost_usd``, ``actual_cost_usd``,
+``reconstructed_call_count``, compatibility ``estimated_cost_usd`` and
+``actual_cost_usd`` floats, authoritative ``estimated_cost_usd_exact`` and
+``actual_cost_usd_exact`` decimal strings,
 ``estimated_cost_known_event_count``, ``estimated_cost_unknown_event_count``,
 ``actual_cost_known_event_count``, ``actual_cost_unknown_event_count``,
 ``invalid_numeric_event_count``, and ``invalid_numeric_value_count``.
@@ -33,10 +35,11 @@ Grouped rows add their dimensions: provider/model rows add ``provider`` and
 ``date`` that is either ISO-8601 or the explicit ``unknown`` bucket. Malformed,
 non-finite, or platform-out-of-range timestamps use ``unknown``. Timestamp
 corruption is grouping metadata, not a numeric accounting value, so it does not
-increment the accounting-invalid counters. Costs are accumulated with Decimal
-state and exposed as unrounded finite JSON floats; if a finite ledger's sum is
-outside the JSON-float range, it is saturated at the largest signed finite
-float. Reasoning tokens are an output annotation and are never added to
+increment the accounting-invalid counters. Costs accumulate as exact rational
+state derived from their canonical decimal spelling, so order and group
+boundaries cannot lose cancellation. The ``*_exact`` decimal strings are the
+accounting values; compatibility floats are finite when representable and
+``None`` otherwise. Reasoning tokens are an output annotation and are never added to
 ``total_tokens``. A NULL ``record_kind`` is a legacy API attempt; historical
 aggregates contribute token/cost facts but not attempt, success, or latency
 metrics.
@@ -48,6 +51,7 @@ import math
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
+from fractions import Fraction
 from typing import Any, Iterable, Mapping, Optional, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -62,8 +66,8 @@ _TOKEN_KEYS = (
     "reasoning_tokens",
 )
 _FLOAT_MAX = sys.float_info.max
-_FLOAT_MAX_DECIMAL = Decimal(str(_FLOAT_MAX))
-_DECIMAL_PRECISION = 50
+_FLOAT_MAX_FRACTION = Fraction.from_float(_FLOAT_MAX)
+_SQLITE_INT_MAX = (1 << 63) - 1
 
 
 def _empty_summary() -> Summary:
@@ -85,6 +89,8 @@ def _empty_summary() -> Summary:
         "reconstructed_call_count": 0,
         "estimated_cost_usd": 0.0,
         "actual_cost_usd": 0.0,
+        "estimated_cost_usd_exact": "0",
+        "actual_cost_usd_exact": "0",
         "estimated_cost_known_event_count": 0,
         "estimated_cost_unknown_event_count": 0,
         "actual_cost_known_event_count": 0,
@@ -98,42 +104,68 @@ def _finite_number(value: Any) -> bool:
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
-        return True
+        # Mirror the range SQLite can persist in an INTEGER column and reject
+        # arbitrary Python integers before any string/Decimal conversion.
+        return -_SQLITE_INT_MAX <= value <= _SQLITE_INT_MAX
     return isinstance(value, float) and math.isfinite(value)
 
 
 def _integral_value(value: Any, *, allow_negative: bool) -> Optional[int]:
     if not _finite_number(value):
         return None
-    if isinstance(value, float) and not value.is_integer():
-        return None
+    if isinstance(value, float):
+        if not value.is_integer() or abs(value) > _SQLITE_INT_MAX:
+            return None
     result = int(value)
     if result < 0 and not allow_negative:
         return None
     return result
 
 
-def _finite_decimal(value: Any, *, allow_negative: bool) -> Optional[Decimal]:
+def _finite_fraction(value: Any, *, allow_negative: bool) -> Optional[Fraction]:
     if not _finite_number(value):
         return None
     if value < 0 and not allow_negative:
         return None
-    return Decimal(str(value))
+    if isinstance(value, int):
+        return Fraction(value)
+    # Decimal(str(float)) preserves the canonical decimal fact supplied by
+    # SQLite/Python rather than importing its binary expansion noise.
+    return Fraction(Decimal(str(value)))
 
 
-def _finite_float(value: Decimal) -> float:
-    """Convert Decimal state to a finite JSON float without display rounding."""
-    if value > _FLOAT_MAX_DECIMAL:
-        return _FLOAT_MAX
-    if value < -_FLOAT_MAX_DECIMAL:
-        return -_FLOAT_MAX
-    return float(value)
+def _fraction_to_decimal(value: Fraction) -> Decimal:
+    """Convert a finite decimal fraction exactly, independent of add order."""
+    if not value:
+        return Decimal(0)
+    numerator_bits = abs(value.numerator).bit_length()
+    denominator_bits = value.denominator.bit_length()
+    decimal_digits = int((numerator_bits + denominator_bits) * math.log10(2)) + 10
+    with localcontext() as context:
+        context.prec = max(32, decimal_digits)
+        return Decimal(value.numerator) / Decimal(value.denominator)
 
 
-def _latency_json_number(value: Decimal) -> int | float:
-    if value == value.to_integral_value():
-        return int(value)
-    return _finite_float(value)
+def _fraction_to_decimal_string(value: Fraction) -> str:
+    decimal_value = _fraction_to_decimal(value)
+    text = format(decimal_value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
+
+
+def _fraction_to_json_float(value: Fraction) -> Optional[float]:
+    """Return a finite compatibility float, or NULL when not representable."""
+    if abs(value) > _FLOAT_MAX_FRACTION:
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _latency_json_number(value: Fraction) -> int | float | None:
+    if value.denominator == 1:
+        return value.numerator
+    return _fraction_to_json_float(value)
 
 
 class _SummaryAccumulator:
@@ -143,9 +175,9 @@ class _SummaryAccumulator:
 
     def __init__(self) -> None:
         self.summary = _empty_summary()
-        self.estimated_cost = Decimal(0)
-        self.actual_cost = Decimal(0)
-        self.latency_total = Decimal(0)
+        self.estimated_cost = Fraction(0)
+        self.actual_cost = Fraction(0)
+        self.latency_total = Fraction(0)
 
     def add(self, event: UsageEvent) -> None:
         summary = self.summary
@@ -175,14 +207,12 @@ class _SummaryAccumulator:
                 summary["successful_call_count"] += 1
             raw_latency = event.get("latency_ms")
             if raw_latency is not None:
-                latency = _finite_decimal(raw_latency, allow_negative=False)
+                latency = _finite_fraction(raw_latency, allow_negative=False)
                 if latency is None:
                     invalid_values += 1
                 else:
                     summary["latency_sample_count"] += 1
-                    with localcontext() as context:
-                        context.prec = _DECIMAL_PRECISION
-                        self.latency_total += latency
+                    self.latency_total += latency
 
         if is_historical:
             summary["historical_aggregate_count"] += 1
@@ -202,18 +232,16 @@ class _SummaryAccumulator:
             if raw_cost is None:
                 summary[unknown_key] += 1
                 continue
-            cost = _finite_decimal(raw_cost, allow_negative=is_correction)
+            cost = _finite_fraction(raw_cost, allow_negative=is_correction)
             if cost is None:
                 summary[unknown_key] += 1
                 invalid_values += 1
                 continue
             summary[known_key] += 1
-            with localcontext() as context:
-                context.prec = _DECIMAL_PRECISION
-                if dimension == "estimated":
-                    self.estimated_cost += cost
-                else:
-                    self.actual_cost += cost
+            if dimension == "estimated":
+                self.estimated_cost += cost
+            else:
+                self.actual_cost += cost
 
         if invalid_values:
             summary["invalid_numeric_event_count"] += 1
@@ -227,14 +255,16 @@ class _SummaryAccumulator:
             + summary["cache_write_tokens"]
         )
         summary["total_tokens"] = summary["prompt_tokens"] + summary["output_tokens"]
-        summary["estimated_cost_usd"] = _finite_float(self.estimated_cost)
-        summary["actual_cost_usd"] = _finite_float(self.actual_cost)
+        summary["estimated_cost_usd_exact"] = _fraction_to_decimal_string(
+            self.estimated_cost
+        )
+        summary["actual_cost_usd_exact"] = _fraction_to_decimal_string(self.actual_cost)
+        summary["estimated_cost_usd"] = _fraction_to_json_float(self.estimated_cost)
+        summary["actual_cost_usd"] = _fraction_to_json_float(self.actual_cost)
         summary["latency_total_ms"] = _latency_json_number(self.latency_total)
         if summary["latency_sample_count"]:
-            with localcontext() as context:
-                context.prec = _DECIMAL_PRECISION
-                average = self.latency_total / summary["latency_sample_count"]
-            summary["average_latency_ms"] = _finite_float(average)
+            average = self.latency_total / summary["latency_sample_count"]
+            summary["average_latency_ms"] = _fraction_to_json_float(average)
         return summary
 
 

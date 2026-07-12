@@ -3,17 +3,25 @@
 Every summary row has the keys in ``SUMMARY_KEYS``. Provider/model rows add
 ``provider`` and ``model``; daily rows add ``date``; session-route rows add
 ``provider``, ``model``, and ``purpose``. Daily ``date`` is ISO-8601 or the
-explicit ``unknown`` corruption bucket. Costs are unrounded USD floats and NULL
-provider/model values remain NULL so unattributed usage is visible. Every
-result is strict-JSON safe (no NaN or infinities).
+explicit ``unknown`` corruption bucket. Cost compatibility fields are floats (or
+NULL only when a finite total is not representable); authoritative exact USD
+fields are decimal strings. NULL provider/model values remain NULL so
+unattributed usage is visible. Every result is strict-JSON safe (no NaN or
+infinities).
 """
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
-from agent.usage_analytics import summarize_usage_daily, summarize_usage_events
+from agent.usage_analytics import (
+    summarize_usage_by_provider_model,
+    summarize_usage_daily,
+    summarize_usage_events,
+)
 from hermes_state import SessionDB
 
 
@@ -35,6 +43,8 @@ SUMMARY_KEYS = {
     "reconstructed_call_count",
     "estimated_cost_usd",
     "actual_cost_usd",
+    "estimated_cost_usd_exact",
+    "actual_cost_usd_exact",
     "estimated_cost_known_event_count",
     "estimated_cost_unknown_event_count",
     "actual_cost_known_event_count",
@@ -43,7 +53,8 @@ SUMMARY_KEYS = {
     "invalid_numeric_value_count",
 }
 
-ADDITIVE_SUMMARY_KEYS = SUMMARY_KEYS - {"average_latency_ms"}
+EXACT_COST_KEYS = {"estimated_cost_usd_exact", "actual_cost_usd_exact"}
+ADDITIVE_SUMMARY_KEYS = SUMMARY_KEYS - {"average_latency_ms"} - EXACT_COST_KEYS
 
 
 @pytest.fixture()
@@ -480,6 +491,80 @@ def test_invalid_historical_reconstructed_call_counts_are_ignored_and_flagged():
     assert summary["invalid_numeric_event_count"] == 4
     assert summary["invalid_numeric_value_count"] == 4
     json.dumps(summary, allow_nan=False)
+
+
+def test_exact_cost_strings_preserve_extreme_cancellation_across_groups():
+    events = [
+        {"provider": "p", "model": "a", "estimated_cost_usd": 1e100},
+        {
+            "provider": "p",
+            "model": "b",
+            "record_kind": "correction",
+            "estimated_cost_usd": -1e100,
+        },
+        {
+            "provider": "p",
+            "model": "a",
+            "record_kind": "correction",
+            "estimated_cost_usd": 1.0,
+        },
+    ]
+
+    total = summarize_usage_events(events)
+    rows = summarize_usage_by_provider_model(events)
+
+    assert total["estimated_cost_usd_exact"] == "1"
+    assert sum(
+        Fraction(Decimal(row["estimated_cost_usd_exact"])) for row in rows
+    ) == Fraction(Decimal(total["estimated_cost_usd_exact"]))
+    assert total["estimated_cost_usd"] == pytest.approx(1.0)
+    json.dumps({"total": total, "rows": rows}, allow_nan=False)
+
+
+def test_unrepresentable_cost_total_uses_exact_string_and_null_compatibility_float():
+    summary = summarize_usage_events(
+        [{"estimated_cost_usd": 1e308}, {"estimated_cost_usd": 1e308}]
+    )
+
+    assert Decimal(summary["estimated_cost_usd_exact"]) == Decimal("2e308")
+    assert summary["estimated_cost_usd"] is None
+    json.dumps(summary, allow_nan=False)
+
+
+def test_arbitrary_size_python_integers_are_invalid_without_conversion_crash():
+    huge = 10**5000
+    summary = summarize_usage_events(
+        [
+            {
+                "input_tokens": huge,
+                "estimated_cost_usd": huge,
+                "latency_ms": huge,
+            }
+        ]
+    )
+
+    assert summary["input_tokens"] == 0
+    assert summary["estimated_cost_usd"] == 0.0
+    assert summary["estimated_cost_usd_exact"] == "0"
+    assert summary["estimated_cost_unknown_event_count"] == 1
+    assert summary["latency_sample_count"] == 0
+    assert summary["invalid_numeric_event_count"] == 1
+    assert summary["invalid_numeric_value_count"] == 3
+    json.dumps(summary, allow_nan=False)
+
+
+def test_invalid_cutoffs_raise_and_nonfinite_stored_timestamp_is_excluded(db):
+    _record(db, "finite-time", timestamp=100)
+    _record(db, "infinite-time", timestamp=200, input_tokens=20)
+    _update_event(db, "infinite-time", timestamp=float("inf"))
+
+    rows = db.summarize_usage_daily(cutoff=0, timezone_name="UTC")
+    assert sum(row["event_count"] for row in rows) == 1
+    assert all(row["date"] != "unknown" for row in rows)
+
+    for cutoff in (True, False, float("nan"), float("inf"), float("-inf"), "0"):
+        with pytest.raises(ValueError, match="cutoff must be a finite numeric"):
+            db.summarize_usage_events(cutoff=cutoff)
 
 
 def test_malformed_nonfinite_and_out_of_range_timestamps_group_as_unknown():

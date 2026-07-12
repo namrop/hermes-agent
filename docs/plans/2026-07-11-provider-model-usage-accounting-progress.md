@@ -31,7 +31,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
 | 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
 | 4. Residual-only historical backfill | completed | `cc1b84d72`, `26ff22a71` | spec PASS; quality APPROVED; 241 state + 267 focused tests | Idempotent residuals; ambiguous routes remain unattributed |
-| 5. Event-derived read models | completed | `707a36416` + hardening follow-up (this commit) | spec PASS; quality re-review pending; GREEN 264 + 290 | Streaming, strict-JSON-safe canonical semantics |
+| 5. Event-derived read models | completed | `707a36416`, `a44d047a1` + exactness follow-up (this commit) | spec PASS; quality re-review pending; GREEN 268 + 294 | Streaming, strict-JSON-safe, exact-cost semantics |
 | 6. Insights cutover | in progress | — | RED pending | Keep session activity metrics |
 | 7. Dashboard API cutover | pending | — | — | Event-time daily windows |
 | 8. CLI/gateway `/usage` cutover | pending | — | — | Full persisted mixed routes |
@@ -264,6 +264,25 @@ Append each RED and GREEN command here with exit code and concise result.
 - Combined accounting GREEN: exit 0; `290 passed in 16.73s`.
 - Compilation and scoped diff checks: PASS. Quality re-review remains pending.
 
+#### Task 5 exactness/cutoff follow-up
+
+- Findings: fixed-precision Decimal accumulation could lose valid cancellation
+  across group boundaries; invalid/non-finite cutoff arguments were accepted;
+  and arbitrary Python integers could exceed runtime conversion limits.
+- RED command: four targeted regressions for extreme cross-group cancellation,
+  unrepresentable float totals, oversized integers, and cutoff validation.
+- RED result: exit 1; `4 failed, 23 deselected in 1.04s`.
+- Fix: cost accumulators now use exact rational state derived from canonical
+  decimal input. Authoritative `*_cost_usd_exact` decimal strings reconcile
+  across groups; compatibility floats are finite when representable and NULL
+  otherwise. Integer inputs are bounded to SQLite INTEGER range before
+  conversion. Cutoffs must be finite non-boolean numerics, and SQL cutoff reads
+  exclude non-finite stored REAL timestamps.
+- Target GREEN: exit 0; `4 passed, 23 deselected in 0.96s`.
+- Required GREEN: exit 0; `268 passed in 12.48s`.
+- Combined accounting GREEN: exit 0; `294 passed in 15.46s`.
+- Compilation and scoped diff checks: PASS. Quality re-review remains pending.
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -342,8 +361,10 @@ Append each RED and GREEN command here with exit code and concise result.
 - Invalid numeric accounting fields are ignored rather than allowed to corrupt
   totals, counted explicitly at event/value granularity, and correction rows are
   the only record kind allowed to contribute signed token/cost adjustments.
-  Decimal accumulator state prevents non-finite JSON output; invalid timestamps
-  remain visible in the daily `unknown` bucket.
+  Exact rational cost state yields authoritative decimal-string totals that
+  reconcile across grouping boundaries; finite compatibility floats remain for
+  ordinary consumers and become NULL only when not representable. Invalid
+  timestamps remain visible in the daily `unknown` bucket.
 - Daily read models use event timestamps. `timezone_name=None` uses the local
   process timezone; explicit IANA names use `zoneinfo.ZoneInfo` and invalid
   names raise a clear `ValueError`. Core costs are not rounded.
@@ -395,9 +416,10 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 4 residual-only historical backfill and attribution hardening are
   complete in `cc1b84d72` and `26ff22a71`; spec PASS, quality APPROVED,
   `241` state tests and `267` combined focused tests.
-- Task 5 canonical event-derived read models are committed at `707a36416`, with
-  numeric/streaming hardening green in the current follow-up (`264` required;
-  `290` combined). Quality re-review is the remaining Task 5 gate.
+- Task 5 canonical event-derived read models are committed at `707a36416` and
+  streaming/numeric hardening at `a44d047a1`; exact-cost/cutoff hardening is
+  green in the current follow-up (`268` required; `294` combined). Quality
+  re-review is the remaining Task 5 gate.
 - Task 6 remains the active task. Before its first code change, complete Task 5's
   quality re-review; then cut Insights usage sections over while retaining
   session-derived activity metrics.

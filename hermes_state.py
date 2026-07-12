@@ -16,9 +16,11 @@ Key design decisions:
 
 import json
 import logging
+import math
 import random
 import re
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1351,10 +1353,21 @@ class SessionDB:
         conditions: List[str] = []
         params: List[Any] = []
         if cutoff is not None:
+            if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
+                raise ValueError("cutoff must be a finite numeric Unix timestamp")
+            try:
+                numeric_cutoff = float(cutoff)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "cutoff must be a finite numeric Unix timestamp"
+                ) from exc
+            if not math.isfinite(numeric_cutoff):
+                raise ValueError("cutoff must be a finite numeric Unix timestamp")
             conditions.append(
-                "typeof(timestamp) IN ('integer', 'real') AND timestamp >= ?"
+                "typeof(timestamp) IN ('integer', 'real') "
+                "AND timestamp >= ? AND timestamp >= ? AND timestamp <= ?"
             )
-            params.append(float(cutoff))
+            params.extend((numeric_cutoff, -sys.float_info.max, sys.float_info.max))
         if source is not None:
             conditions.append("source = ?")
             params.append(source)
