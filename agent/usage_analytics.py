@@ -30,9 +30,10 @@ fractional milliseconds) is accepted. Every inspected invalid value increments
 ``invalid_numeric_value_count`` and each affected event increments
 ``invalid_numeric_event_count`` once.
 
-Grouped rows add their dimensions: provider/model rows add ``provider`` and
-``model``; session-route rows additionally add ``purpose``; daily rows add a
-``date`` that is either ISO-8601 or the explicit ``unknown`` bucket. Malformed,
+Grouped rows add JSON-safe dimensions: schema-conforming provider/model rows add
+``provider`` and ``model``; session-route rows additionally add ``purpose``;
+malformed dimensions remain visible as explicit ``[invalid:...]`` strings. Daily
+rows add a ``date`` that is either ISO-8601 or the explicit ``unknown`` bucket. Malformed,
 non-finite, or platform-out-of-range timestamps use ``unknown``. Timestamp
 corruption is grouping metadata, not a numeric accounting value, so it does not
 increment the accounting-invalid counters. Costs accumulate as exact rational
@@ -67,6 +68,7 @@ _TOKEN_KEYS = (
 )
 _FLOAT_MAX = sys.float_info.max
 _FLOAT_MAX_FRACTION = Fraction.from_float(_FLOAT_MAX)
+_SQLITE_INT_MIN = -(1 << 63)
 _SQLITE_INT_MAX = (1 << 63) - 1
 
 
@@ -106,7 +108,7 @@ def _finite_number(value: Any) -> bool:
     if isinstance(value, int):
         # Mirror the range SQLite can persist in an INTEGER column and reject
         # arbitrary Python integers before any string/Decimal conversion.
-        return -_SQLITE_INT_MAX <= value <= _SQLITE_INT_MAX
+        return _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX
     return isinstance(value, float) and math.isfinite(value)
 
 
@@ -114,7 +116,11 @@ def _integral_value(value: Any, *, allow_negative: bool) -> Optional[int]:
     if not _finite_number(value):
         return None
     if isinstance(value, float):
-        if not value.is_integer() or abs(value) > _SQLITE_INT_MAX:
+        if (
+            not value.is_integer()
+            or value < _SQLITE_INT_MIN
+            or value > _SQLITE_INT_MAX
+        ):
             return None
     result = int(value)
     if result < 0 and not allow_negative:
@@ -276,6 +282,32 @@ def summarize_usage_events(events: Iterable[UsageEvent]) -> Summary:
     return accumulator.finish()
 
 
+def _json_dimension(value: Any) -> Optional[str]:
+    """Return a deterministic JSON-safe group identity.
+
+    Schema-conforming dimensions are strings or NULL. Malformed values remain
+    visible under explicit type/value markers instead of crashing hashing,
+    sorting, or JSON serialization.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"[invalid:bytes:{bytes(value).hex()}]"
+    if isinstance(value, bool):
+        return f"[invalid:bool:{str(value).lower()}]"
+    if isinstance(value, int):
+        if _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX:
+            return str(value)
+        return "[invalid:int:out-of-range]"
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "[invalid:float:nan]"
+        if math.isinf(value):
+            return f"[invalid:float:{'inf' if value > 0 else '-inf'}]"
+        return repr(value)
+    return f"[invalid:{type(value).__name__}]"
+
+
 def _sort_value(value: Any) -> tuple[bool, str]:
     """Order known dimensions lexically and keep NULL groups deterministic."""
     return value is None, "" if value is None else str(value)
@@ -286,7 +318,9 @@ def _group_usage_events(
 ) -> list[Summary]:
     grouped: dict[tuple[Any, ...], _SummaryAccumulator] = {}
     for event in events:
-        identity = tuple(event.get(dimension) for dimension in dimensions)
+        identity = tuple(
+            _json_dimension(event.get(dimension)) for dimension in dimensions
+        )
         accumulator = grouped.get(identity)
         if accumulator is None:
             accumulator = grouped[identity] = _SummaryAccumulator()

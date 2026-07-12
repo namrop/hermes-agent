@@ -1355,12 +1355,15 @@ class SessionDB:
         if cutoff is not None:
             if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
                 raise ValueError("cutoff must be a finite numeric Unix timestamp")
-            try:
+            if isinstance(cutoff, int):
+                # The ledger timestamp column has REAL affinity. Beyond 2**53
+                # integer cutoffs cannot be represented without changing the
+                # inclusive boundary, so reject rather than silently round.
+                if abs(cutoff) > (1 << 53):
+                    raise ValueError("cutoff must be a finite numeric Unix timestamp")
+                numeric_cutoff: int | float = cutoff
+            else:
                 numeric_cutoff = float(cutoff)
-            except (OverflowError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    "cutoff must be a finite numeric Unix timestamp"
-                ) from exc
             if not math.isfinite(numeric_cutoff):
                 raise ValueError("cutoff must be a finite numeric Unix timestamp")
             conditions.append(

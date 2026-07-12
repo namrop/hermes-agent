@@ -562,9 +562,56 @@ def test_invalid_cutoffs_raise_and_nonfinite_stored_timestamp_is_excluded(db):
     assert sum(row["event_count"] for row in rows) == 1
     assert all(row["date"] != "unknown" for row in rows)
 
-    for cutoff in (True, False, float("nan"), float("inf"), float("-inf"), "0"):
+    for cutoff in (
+        True,
+        False,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "0",
+        (1 << 53) + 1,
+    ):
         with pytest.raises(ValueError, match="cutoff must be a finite numeric"):
             db.summarize_usage_events(cutoff=cutoff)
+
+
+def test_sqlite_integer_minimum_is_valid_for_signed_corrections():
+    sqlite_min = -(1 << 63)
+    summary = summarize_usage_events(
+        [
+            {
+                "record_kind": "correction",
+                "input_tokens": sqlite_min,
+                "output_tokens": float(sqlite_min),
+            }
+        ]
+    )
+
+    assert summary["input_tokens"] == sqlite_min
+    assert summary["output_tokens"] == sqlite_min
+    assert summary["invalid_numeric_event_count"] == 0
+    assert summary["invalid_numeric_value_count"] == 0
+    json.dumps(summary, allow_nan=False)
+
+
+def test_malformed_group_dimensions_are_canonical_json_strings(db):
+    _record(db, "blob-route")
+    _update_event(db, "blob-route", provider=b"\xff\x00", model=b"model")
+
+    db_rows = db.summarize_usage_by_provider_model()
+    assert db_rows[0]["provider"] == "[invalid:bytes:ff00]"
+    assert db_rows[0]["model"] == "[invalid:bytes:6d6f64656c]"
+    json.dumps(db_rows, allow_nan=False)
+
+    pure_rows = summarize_usage_by_provider_model(
+        [
+            {"provider": ["unhashable"], "model": 10**5000},
+            {"provider": float("nan"), "model": {"unhashable": True}},
+        ]
+    )
+    assert all(isinstance(row["provider"], str) for row in pure_rows)
+    assert all(isinstance(row["model"], str) for row in pure_rows)
+    json.dumps(pure_rows, allow_nan=False)
 
 
 def test_malformed_nonfinite_and_out_of_range_timestamps_group_as_unknown():
