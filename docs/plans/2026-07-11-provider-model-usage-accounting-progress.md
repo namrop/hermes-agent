@@ -5,7 +5,7 @@
 ## Current status
 
 - State: implementation in progress
-- Active task: Task 4 — residual-only historical backfill
+- Active task: Task 5 — event-derived usage read models
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -30,8 +30,8 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 1. Plan + progress ledger | completed | `a3a8b38ce` | readback + diff checks PASS | Landed before production code |
 | 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
 | 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
-| 4. Residual-only historical backfill | completed | `fix: backfill only uncovered usage residuals` (this commit) | RED 9 failed/3 passed; GREEN 240 + 266 focused tests | Idempotent residuals with reconstructed provenance |
-| 5. Event-derived read models | active next | — | — | Central query semantics |
+| 4. Residual-only historical backfill | completed | `cc1b84d72` | implementation spec PASS; 240 state + 266 focused tests | Idempotent residuals with reconstructed provenance |
+| 5. Event-derived read models | in progress | — | RED pending | Central query semantics |
 | 6. Insights cutover | pending | — | — | Keep session activity metrics |
 | 7. Dashboard API cutover | pending | — | — | Event-time daily windows |
 | 8. CLI/gateway `/usage` cutover | pending | — | — | Full persisted mixed routes |
@@ -296,7 +296,8 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 3 purpose-aware background-review accounting is complete in
   `90b9be0ff` and transcript-isolation follow-up `773faee49`; spec PASS,
   quality APPROVED, focused suite `270 passed`.
-- Task 4 residual-only historical backfill is implemented and focused tests are
-  green (`240` state tests; `266` combined focused tests); pending scoped commit
-  and review.
-- Next action: commit/review Task 4, then begin Task 5 event-derived read models.
+- Task 4 residual-only historical backfill is committed at `cc1b84d72`;
+  implementation spec PASS, with `240` state tests and `266` combined focused
+  tests green. Code-quality review is the remaining gate.
+- Next action: complete Task 4 quality review, then execute Task 5 event-derived
+  read models using RED-GREEN-REFACTOR.
