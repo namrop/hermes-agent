@@ -5,7 +5,7 @@
 ## Current status
 
 - State: implementation in progress
-- Active task: Task 8 — CLI/gateway `/usage` persisted mixed-route cutover
+- Active task: Task 9 — cross-harness contract documentation
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -34,7 +34,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d`, `461ac1a33` | spec PASS; quality APPROVED; GREEN 272 + 298 | Streaming, strict-JSON-safe, exact-cost semantics |
 | 6. Insights cutover | completed | `96c7f193e` | RED/GREEN complete; quality APPROVED; 345 focused/combined | Event usage + session activity; three constant ledger scans |
 | 7. Dashboard API cutover | completed | `00ffd02ca` | RED/GREEN complete; quality APPROVED; 41 combined focused tests; web build PASS | Event-time daily windows and route truth |
-| 8. CLI/gateway `/usage` cutover | in progress | — | — | Full persisted mixed routes |
+| 8. CLI/gateway `/usage` cutover | completed | `9bb3c633a` | RED/GREEN complete; quality APPROVED; 429 combined focused tests | Atomic persisted report with full mixed routes |
 | 9. Cross-harness contract docs | pending | — | — | Quota and billing remain separate |
 | 10. Integration review/handoff | pending | — | — | No push/deploy without approval |
 
@@ -391,6 +391,36 @@ Append each RED and GREEN command here with exit code and concise result.
   scoped diff checks: PASS. Final quality review: APPROVED.
 - Unrelated baseline blockers remain explicit: the full web-server file has two
   PTY/WebSocket failures; repository-wide frontend lint has pre-existing errors.
+
+### Task 8
+
+- Added a shared persisted report formatter for CLI and gateway `/usage`.
+  Cumulative token, call, cost, provider, and model facts now come from one
+  atomic `llm_usage_events` report rather than resident-agent counters or
+  transcript estimates. Resident state is limited to live context pressure,
+  current rate limits, and account snapshots.
+- Mixed provider/model routes remain separate. Stored exact costs are rendered
+  without repricing; malformed/missing values degrade to explicit unknowns;
+  subscription-included coverage remains distinct from monetary zero; and
+  missing persisted data is named rather than reconstructed approximately.
+- The gateway ledger read runs through `asyncio.to_thread()`. Both CLI and
+  gateway work without a resident agent. Compression count was removed because
+  it is not durable ledger truth.
+- “API calls” was renamed to “Recorded calls.” The current event writer records
+  successful model responses, but failed provider dispatches and pre-fallback
+  retries are not yet comprehensively persisted.
+- Review follow-up RED: two regressions failed for overlapping unknown plus
+  subscription-included estimated-cost coverage and hard-coded English
+  unknown/unattributed fragments in localized gateway output. GREEN excluded
+  included events from estimated-cost unknown coverage and routed all formatter
+  status fragments through semantic locale keys in all 16 catalogs.
+- Final combined focused GREEN:
+  `.venv/bin/python -m pytest tests/agent/test_usage_analytics.py tests/agent/test_usage_reporting.py tests/agent/test_usage_pricing.py tests/gateway/test_usage_command.py tests/cli/test_cli_status_bar.py tests/test_hermes_state.py tests/test_account_usage.py tests/agent/test_insights.py tests/gateway/test_insights_unicode_flags.py tests/cli/test_cli_insights_command.py -o 'addopts=' -q`
+  → `429 passed in 32.39s`.
+- Locale YAML parsing, Python compilation, and scoped diff checks: PASS. Final
+  quality review: APPROVED. The full web-server file still has the same two
+  unrelated PTY/WebSocket baseline failures recorded under Task 7.
+- Commit: `9bb3c633a` (`feat: derive session usage from event ledger`).
 
 ## Decisions and deviations
 
