@@ -5,7 +5,7 @@
 ## Current status
 
 - State: implementation in progress
-- Active task: Task 5 — event-derived usage read models
+- Active task: Task 6 — Insights cutover to event-derived usage
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -30,9 +30,9 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 1. Plan + progress ledger | completed | `a3a8b38ce` | readback + diff checks PASS | Landed before production code |
 | 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
 | 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
-| 4. Residual-only historical backfill | completed | `cc1b84d72` | implementation spec PASS; 240 state + 266 focused tests | Idempotent residuals with reconstructed provenance |
-| 5. Event-derived read models | in progress | — | RED pending | Central query semantics |
-| 6. Insights cutover | pending | — | — | Keep session activity metrics |
+| 4. Residual-only historical backfill | completed | `cc1b84d72`, `26ff22a71` | spec PASS; quality APPROVED; 241 state + 267 focused tests | Idempotent residuals; ambiguous routes remain unattributed |
+| 5. Event-derived read models | completed | this commit | RED 13 failed/241 passed; GREEN 254 + 280 passed | Canonical event/token/cost/attempt/provenance semantics |
+| 6. Insights cutover | in progress | — | RED pending | Keep session activity metrics |
 | 7. Dashboard API cutover | pending | — | — | Event-time daily windows |
 | 8. CLI/gateway `/usage` cutover | pending | — | — | Full persisted mixed routes |
 | 9. Cross-harness contract docs | pending | — | — | Quota and billing remain separate |
@@ -212,7 +212,34 @@ Append each RED and GREEN command here with exit code and concise result.
 - Target GREEN: exit 0; `3 passed in 0.90s`.
 - Full state GREEN: exit 0; `241 passed in 10.43s`.
 - Combined focused GREEN: exit 0; `267 passed in 13.57s`.
-- Compilation and scoped diff checks: PASS. Quality re-review remains pending.
+- Compilation and scoped diff checks: PASS.
+- Follow-up commit: `26ff22a71` (`fix: keep ambiguous usage residuals unattributed`).
+- Final Task 4 quality review: APPROVED. Task 4 commits are `cc1b84d72`
+  and `26ff22a71`.
+
+### Task 5
+
+- RED command: `.venv/bin/python -m pytest tests/agent/test_usage_analytics.py tests/test_hermes_state.py -o 'addopts=' -q`
+- RED result: exit 1; `13 failed, 241 passed in 11.34s`. Twelve failures
+  exercised the absent canonical query/read-model surfaces; the uncapped-query
+  test also exposed and then corrected its disposable fixture's missing parent
+  session before implementation. No production behavior was changed before RED.
+- Focused test-file GREEN: exit 0; `13 passed in 1.56s`.
+- Required GREEN command: `.venv/bin/python -m pytest tests/agent/test_usage_analytics.py tests/test_hermes_state.py -o 'addopts=' -q`
+- Required GREEN result: exit 0; `254 passed in 11.40s`.
+- Combined accounting command: `.venv/bin/python -m pytest tests/agent/test_usage_analytics.py tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/run_agent/test_background_review.py tests/agent/test_usage_pricing.py -o 'addopts=' -q`
+- Combined accounting result: exit 0; `280 passed in 14.15s`.
+- Compilation: `.venv/bin/python -m py_compile agent/usage_analytics.py hermes_state.py tests/agent/test_usage_analytics.py` — PASS.
+- Scoped diff check over `agent/usage_analytics.py`, `hermes_state.py`,
+  `tests/agent/test_usage_analytics.py`, and this ledger — PASS.
+- Files changed: `agent/usage_analytics.py`, `hermes_state.py`,
+  `tests/agent/test_usage_analytics.py`, and this progress ledger.
+- Output contract: every summary exposes five disjoint token buckets plus
+  canonical prompt/total tokens; event, real-attempt, success, latency,
+  historical-aggregate, and reconstructed-call counts; independent actual and
+  estimated cost sums and known/unknown event-coverage counts. Grouped rows add
+  provider/model, date, or provider/model/purpose identity fields.
+- Task 5 is complete and Task 6 (Insights event cutover) is active next.
 
 ## Decisions and deviations
 
@@ -275,6 +302,23 @@ Append each RED and GREEN command here with exit code and concise result.
 - Schema version 13 declaratively adds provenance columns with ordinary-event
   defaults (`api_attempt`, `provider_reported`, `exact`) and idempotently
   classifies pre-field approximate rows on database open.
+- Event analytics are centralized in pure `agent/usage_analytics.py`
+  aggregators. `SessionDB` owns all SQLite access and exposes one uncapped,
+  oldest-first filtered event query plus thin summary wrappers; no raw
+  connection is shared with the analytics module.
+- Canonical summaries preserve uncached input, output, cache-read, cache-write,
+  and reasoning separately. Prompt is input + both cache buckets; total is
+  prompt + output, so reasoning is never double-counted.
+- NULL `record_kind` is a legacy API attempt. Only real attempts contribute
+  attempt/success/latency metrics. Historical aggregates contribute tokens and
+  known costs, while their count and summed `api_call_index` reconstructed-call
+  residual are reported separately.
+- Cost presence, not `cost_status`, controls independent estimated/actual
+  known/unknown event coverage. NULL provider/model routes remain explicit
+  groups, and route identity never drops provider or purpose dimensions.
+- Daily read models use event timestamps. `timezone_name=None` uses the local
+  process timezone; explicit IANA names use `zoneinfo.ZoneInfo` and invalid
+  names raise a clear `ValueError`. Core costs are not rounded.
 
 ## Known risks
 
@@ -290,6 +334,12 @@ Append each RED and GREEN command here with exit code and concise result.
 6. Backfill discrepancy reports are in-memory per run; durable reconciliation reporting still belongs in a later operator/reporting surface.
 7. Future SQLite schema additions must remain backward-compatible with fixture databases.
 8. The shared worktree already contains unrelated dirty model-picker changes.
+9. Canonical summaries currently materialize all matching event rows in memory;
+   this keeps one pure semantic implementation but may need streaming/chunked
+   aggregation if event volume grows substantially.
+10. Local-time daily grouping intentionally follows the process timezone when
+   no explicit IANA name is supplied, so deployments should pass a timezone
+   name when cross-host reproducibility matters.
 
 ## Resume instructions for another harness
 
@@ -314,9 +364,11 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 3 purpose-aware background-review accounting is complete in
   `90b9be0ff` and transcript-isolation follow-up `773faee49`; spec PASS,
   quality APPROVED, focused suite `270 passed`.
-- Task 4 residual-only historical backfill is committed at `cc1b84d72`, with
-  attribution hardening implemented and green (`241` state tests; `267`
-  combined focused tests). Quality re-review is the remaining gate.
-- Task 5 is the active implementation task. Before its first production-code
-  change, complete Task 4's quality re-review; then begin Task 5 RED tests for
-  event-derived read models.
+- Task 4 residual-only historical backfill and attribution hardening are
+  complete in `cc1b84d72` and `26ff22a71`; spec PASS, quality APPROVED,
+  `241` state tests and `267` combined focused tests.
+- Task 5 canonical event-derived read models are complete in the current task
+  commit; required GREEN is `254 passed` and combined accounting GREEN is
+  `280 passed`.
+- Task 6 is active next: cut Insights provider/model/token/cost sections over
+  to these read models while retaining session-derived activity metrics.

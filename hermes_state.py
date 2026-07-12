@@ -24,6 +24,12 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
+from agent.usage_analytics import (
+    summarize_session_routes as aggregate_session_routes,
+    summarize_usage_by_provider_model as aggregate_usage_by_provider_model,
+    summarize_usage_daily as aggregate_usage_daily,
+    summarize_usage_events as aggregate_usage_events,
+)
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
@@ -1318,6 +1324,103 @@ class SessionDB:
                     (limit,),
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    def query_llm_usage_events(
+        self,
+        *,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return every event matching accounting filters, oldest first.
+
+        Unlike :meth:`get_llm_usage_events`, this canonical analytics query has
+        no display-oriented row cap. ``cutoff`` is inclusive and applies to the
+        event occurrence timestamp, not the owning session's start time.
+        """
+        conditions: List[str] = []
+        params: List[Any] = []
+        if cutoff is not None:
+            conditions.append("timestamp >= ?")
+            params.append(float(cutoff))
+        if source is not None:
+            conditions.append("source = ?")
+            params.append(source)
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        if purpose is not None:
+            conditions.append("purpose = ?")
+            params.append(purpose)
+
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("SessionDB is closed")
+            rows = conn.execute(
+                f"""SELECT * FROM llm_usage_events{where}
+                    ORDER BY timestamp ASC, id ASC""",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def summarize_usage_events(
+        self,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return the canonical global summary for matching event rows."""
+        events = self.query_llm_usage_events(
+            cutoff=cutoff,
+            source=source,
+            session_id=session_id,
+            purpose=purpose,
+        )
+        return aggregate_usage_events(events)
+
+    def summarize_usage_by_provider_model(
+        self,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return canonical provider/model summaries for matching events."""
+        events = self.query_llm_usage_events(
+            cutoff=cutoff,
+            source=source,
+            session_id=session_id,
+            purpose=purpose,
+        )
+        return aggregate_usage_by_provider_model(events)
+
+    def summarize_usage_daily(
+        self,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+        timezone_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return canonical event-time daily summaries in the chosen timezone."""
+        events = self.query_llm_usage_events(
+            cutoff=cutoff,
+            source=source,
+            session_id=session_id,
+            purpose=purpose,
+        )
+        return aggregate_usage_daily(events, timezone_name=timezone_name)
+
+    def summarize_session_routes(
+        self, session_id: str
+    ) -> List[Dict[str, Any]]:
+        """Summarize one session by provider, model, and purpose route."""
+        events = self.query_llm_usage_events(session_id=session_id)
+        return aggregate_session_routes(events)
 
     @staticmethod
     def _empty_backfill_report() -> Dict[str, Any]:
