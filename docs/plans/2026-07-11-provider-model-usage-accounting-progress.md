@@ -196,6 +196,24 @@ Append each RED and GREEN command here with exit code and concise result.
 - Files changed: `hermes_state.py`, `tests/test_hermes_state.py`, and this
   progress ledger. Task 4 is complete; Task 5 is active next.
 
+#### Code-quality attribution follow-up
+
+- Findings: a single observed route was assigned to a residual even when scalar
+  session metadata contradicted it, and absent/incomplete cost dimensions were
+  labeled with reconstructed cost provenance.
+- RED command: targeted three-test run covering conflicting scalar/observed
+  route metadata, incomplete real-event cost coverage, and token residuals with
+  no session cost aggregate.
+- RED result: exit 1; `3 failed in 1.46s` for the expected attribution/provenance
+  reasons.
+- Fix: any non-NULL scalar/observed route conflict now leaves all residual route
+  dimensions unattributed; reconstructed cost status/source/version are emitted
+  only when both session cost dimensions exist and are safely subtractable.
+- Target GREEN: exit 0; `3 passed in 0.90s`.
+- Full state GREEN: exit 0; `241 passed in 10.43s`.
+- Combined focused GREEN: exit 0; `267 passed in 13.57s`.
+- Compilation and scoped diff checks: PASS. Quality re-review remains pending.
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -296,9 +314,9 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 3 purpose-aware background-review accounting is complete in
   `90b9be0ff` and transcript-isolation follow-up `773faee49`; spec PASS,
   quality APPROVED, focused suite `270 passed`.
-- Task 4 residual-only historical backfill is committed at `cc1b84d72`;
-  implementation spec PASS, with `240` state tests and `266` combined focused
-  tests green. Code-quality review is the remaining gate.
+- Task 4 residual-only historical backfill is committed at `cc1b84d72`, with
+  attribution hardening implemented and green (`241` state tests; `267`
+  combined focused tests). Quality re-review is the remaining gate.
 - Task 5 is the active implementation task. Before its first production-code
-  change, complete Task 4's code-quality gate; then begin Task 5 RED tests for
+  change, complete Task 4's quality re-review; then begin Task 5 RED tests for
   event-derived read models.

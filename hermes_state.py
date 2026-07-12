@@ -1468,22 +1468,41 @@ class SessionDB:
                     )
                     for event in real_events
                 }
+                scalar_route = (
+                    session["billing_provider"],
+                    session["model"],
+                    session["billing_base_url"],
+                    session["billing_mode"],
+                )
                 if not routes:
-                    route = (
-                        session["billing_provider"],
-                        session["model"],
-                        session["billing_base_url"],
-                        session["billing_mode"],
-                    )
+                    route = scalar_route
                 elif len(routes) == 1:
-                    route = next(iter(routes))
+                    observed_route = next(iter(routes))
+                    route_conflicts = any(
+                        scalar_value is not None
+                        and observed_value is not None
+                        and scalar_value != observed_value
+                        for scalar_value, observed_value in zip(
+                            scalar_route, observed_route
+                        )
+                    )
+                    # A conflicting scalar route is evidence that the missing
+                    # aggregate may belong to an unobserved provider/model.
+                    # Keep every route dimension unattributed rather than
+                    # projecting the sole observed route onto the residual.
+                    route = (
+                        (None, None, None, None)
+                        if route_conflicts
+                        else observed_route
+                    )
                 else:
                     # A scalar session route cannot identify which observed
                     # provider/model path owns the missing aggregate.
                     route = (None, None, None, None)
 
                 costs_complete = all(
-                    session[column] is None or cost_residuals[column] is not None
+                    session[column] is not None
+                    and cost_residuals[column] is not None
                     for column in cost_residuals
                 )
                 values = {
@@ -1501,8 +1520,12 @@ class SessionDB:
                     **{column: residuals[column] for column in token_columns},
                     **cost_residuals,
                     "cost_status": "reconstructed" if costs_complete else "unknown",
-                    "cost_source": "reconstructed_session_residual",
-                    "pricing_version": session["pricing_version"],
+                    "cost_source": (
+                        "reconstructed_session_residual" if costs_complete else None
+                    ),
+                    "pricing_version": (
+                        session["pricing_version"] if costs_complete else None
+                    ),
                     "latency_ms": None,
                     "request_status": "approximate_session_backfill",
                     "error_class": None,

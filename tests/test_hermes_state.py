@@ -721,8 +721,13 @@ class TestSessionLifecycle:
         assert event["measurement_confidence"] == "reconstructed"
         assert event["purpose"] == "historical_backfill"
         assert event["request_status"] == "approximate_session_backfill"
-        assert event["provider"] == "openrouter"
-        assert event["model"] == "actual-model"
+        # The scalar session says ``scalar-model`` while the only observed
+        # event says ``actual-model``. That conflict proves the missing
+        # residual cannot be assigned safely even though the provider matches.
+        assert event["provider"] is None
+        assert event["model"] is None
+        assert event["billing_base_url"] is None
+        assert event["billing_mode"] is None
         assert event["latency_ms"] is None
         assert event["error_class"] is None
         assert db.last_backfill_report["inserted_session_ids"] == ["partial"]
@@ -915,6 +920,27 @@ class TestSessionLifecycle:
         assert event["estimated_cost_usd"] is None
         assert event["actual_cost_usd"] is None
         assert event["cost_status"] == "unknown"
+        assert event["cost_source"] is None
+        assert event["pricing_version"] is None
+
+    def test_backfill_token_residual_without_session_cost_keeps_cost_unknown(self, db):
+        db.create_session(session_id="no-cost", source="cli", model="legacy-model")
+        self._set_session_usage(
+            db,
+            "no-cost",
+            input_tokens=10,
+            api_call_count=1,
+            pricing_version="must-not-leak",
+        )
+
+        assert db.backfill_llm_usage_events_from_sessions() == 1
+        event = self._synthetic_events(db, "no-cost")[0]
+        assert event["input_tokens"] == 10
+        assert event["estimated_cost_usd"] is None
+        assert event["actual_cost_usd"] is None
+        assert event["cost_status"] == "unknown"
+        assert event["cost_source"] is None
+        assert event["pricing_version"] is None
 
     def test_backfill_tolerates_tiny_negative_cost_noise(self, db):
         db.create_session(session_id="float-noise", source="cli")
