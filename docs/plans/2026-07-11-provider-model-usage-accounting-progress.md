@@ -33,7 +33,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 4. Residual-only historical backfill | completed | `cc1b84d72`, `26ff22a71` | spec PASS; quality APPROVED; 241 state + 267 focused tests | Idempotent residuals; ambiguous routes remain unattributed |
 | 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d`, `461ac1a33` | spec PASS; quality APPROVED; GREEN 272 + 298 | Streaming, strict-JSON-safe, exact-cost semantics |
 | 6. Insights cutover | completed | `96c7f193e` | RED/GREEN complete; quality APPROVED; 345 focused/combined | Event usage + session activity; three constant ledger scans |
-| 7. Dashboard API cutover | completed | pending commit | RED/GREEN complete; quality APPROVED; 41 combined focused tests; web build PASS | Event-time daily windows and route truth |
+| 7. Dashboard API cutover | completed | `00ffd02ca` | RED/GREEN complete; quality APPROVED; 41 combined focused tests; web build PASS | Event-time daily windows and route truth |
 | 8. CLI/gateway `/usage` cutover | in progress | — | — | Full persisted mixed routes |
 | 9. Cross-harness contract docs | pending | — | — | Quota and billing remain separate |
 | 10. Integration review/handoff | pending | — | — | No push/deploy without approval |
