@@ -31,9 +31,9 @@ fractional milliseconds) is accepted. Every inspected invalid value increments
 ``invalid_numeric_event_count`` once.
 
 Grouped rows add JSON-safe dimensions: schema-conforming provider/model rows add
-``provider`` and ``model``; session-route rows additionally add ``purpose``;
-malformed dimensions remain visible as content-addressed ``[invalid:...]``
-strings, and every grouped dimension includes a ``<dimension>_is_valid`` bit.
+``provider`` and ``model``; session-route rows additionally add ``purpose``.
+Malformed dimensions coalesce into one explicit invalid/unattributed NULL bucket,
+distinguished from legitimate NULL by each ``<dimension>_is_valid`` bit.
 Daily rows add a ``date`` that is either ISO-8601 or the explicit ``unknown``
 bucket. Malformed,
 non-finite, or platform-out-of-range timestamps use ``unknown``. Timestamp
@@ -50,9 +50,7 @@ metrics.
 
 from __future__ import annotations
 
-import hashlib
 import math
-import struct
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
@@ -286,77 +284,17 @@ def summarize_usage_events(events: Iterable[UsageEvent]) -> Summary:
     return accumulator.finish()
 
 
-def _frame_invalid(tag: bytes, parts: Iterable[bytes]) -> bytes:
-    framed = bytearray(tag)
-    for part in parts:
-        framed.extend(len(part).to_bytes(8, "big"))
-        framed.extend(part)
-    return bytes(framed)
-
-
-def _invalid_dimension_bytes(value: Any, seen: set[int]) -> bytes:
-    """Create deterministic structural bytes without calling arbitrary repr()."""
-    if value is None:
-        return b"none"
-    if isinstance(value, str):
-        return _frame_invalid(b"str", (value.encode("utf-8", "surrogatepass"),))
-    if isinstance(value, bytes):
-        return _frame_invalid(b"bytes", (value,))
-    if isinstance(value, (bytearray, memoryview)):
-        return _frame_invalid(type(value).__name__.encode(), (bytes(value),))
-    if isinstance(value, bool):
-        return b"bool:1" if value else b"bool:0"
-    if isinstance(value, int):
-        length = max(1, (value.bit_length() + 8) // 8)
-        return _frame_invalid(b"int", (value.to_bytes(length, "big", signed=True),))
-    if isinstance(value, float):
-        return _frame_invalid(b"float", (struct.pack("!d", value),))
-
-    value_id = id(value)
-    if value_id in seen:
-        return _frame_invalid(b"cycle", (type(value).__name__.encode(),))
-    if isinstance(value, (list, tuple, set, frozenset, dict)):
-        seen.add(value_id)
-        try:
-            if isinstance(value, dict):
-                pairs = [
-                    _frame_invalid(
-                        b"pair",
-                        (
-                            _invalid_dimension_bytes(key, seen),
-                            _invalid_dimension_bytes(item, seen),
-                        ),
-                    )
-                    for key, item in value.items()
-                ]
-                parts = sorted(pairs)
-            else:
-                parts = [_invalid_dimension_bytes(item, seen) for item in value]
-                if isinstance(value, (set, frozenset)):
-                    parts.sort()
-            return _frame_invalid(type(value).__name__.encode(), parts)
-        finally:
-            seen.remove(value_id)
-
-    type_name = f"{type(value).__module__}.{type(value).__qualname__}".encode(
-        "utf-8", "backslashreplace"
-    )
-    return _frame_invalid(b"object", (type_name,))
-
-
 def _json_dimension(value: Any) -> tuple[Optional[str], bool]:
-    """Return a deterministic JSON-safe value plus schema-validity bit.
+    """Return a conservative JSON-safe group value plus validity bit.
 
-    Schema-conforming dimensions are strings or NULL. Malformed values receive
-    content-addressed markers. The validity bit is part of the internal group
-    identity and output, so a legitimate string equal to a marker cannot merge
-    with the malformed value that produced it.
+    Schema-conforming strings and NULL retain their value. Every malformed
+    value is deliberately coalesced into the invalid/unattributed NULL bucket.
+    The validity bit keeps that bucket distinct from legitimate NULL, so no
+    malformed value can be mistaken for or merged with a valid route identity.
     """
     if value is None or isinstance(value, str):
         return value, True
-    payload = _invalid_dimension_bytes(value, set())
-    digest = hashlib.sha256(payload).hexdigest()[:24]
-    return f"[invalid:{type(value).__name__}:{digest}]", False
+    return None, False
 
 
 def _sort_value(value: Any) -> tuple[bool, str]:

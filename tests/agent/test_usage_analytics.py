@@ -18,6 +18,7 @@ from fractions import Fraction
 import pytest
 
 from agent.usage_analytics import (
+    summarize_session_routes,
     summarize_usage_by_provider_model,
     summarize_usage_daily,
     summarize_usage_events,
@@ -605,13 +606,13 @@ def test_sqlite_integer_minimum_is_valid_for_signed_corrections():
     json.dumps(summary, allow_nan=False)
 
 
-def test_malformed_group_dimensions_are_canonical_json_strings(db):
+def test_malformed_group_dimensions_use_invalid_unattributed_bucket(db):
     _record(db, "blob-route")
     _update_event(db, "blob-route", provider=b"\xff\x00", model=b"model")
 
     db_rows = db.summarize_usage_by_provider_model()
-    assert db_rows[0]["provider"].startswith("[invalid:bytes:")
-    assert db_rows[0]["model"].startswith("[invalid:bytes:")
+    assert db_rows[0]["provider"] is None
+    assert db_rows[0]["model"] is None
     assert db_rows[0]["provider_is_valid"] is False
     assert db_rows[0]["model_is_valid"] is False
     json.dumps(db_rows, allow_nan=False)
@@ -622,50 +623,71 @@ def test_malformed_group_dimensions_are_canonical_json_strings(db):
             {"provider": float("nan"), "model": {"unhashable": True}},
         ]
     )
-    assert all(isinstance(row["provider"], str) for row in pure_rows)
-    assert all(isinstance(row["model"], str) for row in pure_rows)
-    assert all(row["provider_is_valid"] is False for row in pure_rows)
-    assert all(row["model_is_valid"] is False for row in pure_rows)
+    assert len(pure_rows) == 1
+    assert pure_rows[0]["event_count"] == 2
+    assert pure_rows[0]["provider"] is None
+    assert pure_rows[0]["model"] is None
+    assert pure_rows[0]["provider_is_valid"] is False
+    assert pure_rows[0]["model_is_valid"] is False
     json.dumps(pure_rows, allow_nan=False)
 
 
-def test_malformed_dimensions_cannot_merge_with_valid_strings_or_each_other():
-    first = summarize_usage_by_provider_model(
-        [{"provider": b"\xff", "model": ["first"]}]
-    )[0]
-    marker_provider = first["provider"]
-    marker_model = first["model"]
-
+def test_malformed_dimensions_coalesce_only_with_invalid_unattributed_values():
     rows = summarize_usage_by_provider_model(
         [
             {"provider": b"\xff", "model": ["first"]},
-            {"provider": marker_provider, "model": marker_model},
-            {"provider": 7, "model": ["second"]},
-            {"provider": "7", "model": ["third"]},
+            {"provider": 7, "model": {"second": True}},
+            {"provider": None, "model": None},
+            {"provider": "[invalid:bytes:ff]", "model": "marker-like"},
+            {"provider": "7", "model": "numeric-like"},
         ]
     )
 
     assert len(rows) == 4
-    assert {
-        (row["provider"], row["provider_is_valid"])
-        for row in rows
-        if row["provider"] == marker_provider
-    } == {(marker_provider, False), (marker_provider, True)}
-    valid_seven = next(
-        row for row in rows if row["provider"] == "7" and row["provider_is_valid"]
-    )
-    invalid_integer = next(
+    invalid = next(
         row
         for row in rows
-        if row["provider_is_valid"] is False
-        and row["provider"].startswith("[invalid:int:")
+        if row["provider"] is None
+        and row["model"] is None
+        and row["provider_is_valid"] is False
+        and row["model_is_valid"] is False
     )
-    assert valid_seven["event_count"] == 1
-    assert invalid_integer["event_count"] == 1
-    invalid_models = {
-        row["model"] for row in rows if row["model_is_valid"] is False
-    }
-    assert len(invalid_models) == 3
+    valid_null = next(
+        row
+        for row in rows
+        if row["provider"] is None
+        and row["model"] is None
+        and row["provider_is_valid"] is True
+        and row["model_is_valid"] is True
+    )
+    assert invalid["event_count"] == 2
+    assert valid_null["event_count"] == 1
+    assert any(
+        row["provider"] == "[invalid:bytes:ff]" and row["provider_is_valid"]
+        for row in rows
+    )
+    assert any(row["provider"] == "7" and row["provider_is_valid"] for row in rows)
+    json.dumps(rows, allow_nan=False)
+
+
+def test_malformed_purpose_uses_invalid_unattributed_bucket_after_valid_null():
+    rows = summarize_session_routes(
+        [
+            {"provider": "openrouter", "model": "m", "purpose": ["bad"]},
+            {"provider": "openrouter", "model": "m", "purpose": {"bad": True}},
+            {"provider": "openrouter", "model": "m", "purpose": None},
+            {"provider": "openrouter", "model": "m", "purpose": "[invalid:list]"},
+        ]
+    )
+
+    assert [
+        (row["purpose"], row["purpose_is_valid"], row["event_count"])
+        for row in rows
+    ] == [
+        ("[invalid:list]", True, 1),
+        (None, True, 1),
+        (None, False, 2),
+    ]
     json.dumps(rows, allow_nan=False)
 
 
