@@ -31,7 +31,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
 | 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
 | 4. Residual-only historical backfill | completed | `cc1b84d72`, `26ff22a71` | spec PASS; quality APPROVED; 241 state + 267 focused tests | Idempotent residuals; ambiguous routes remain unattributed |
-| 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb` + identity follow-up (this commit) | spec PASS; quality re-review pending; GREEN 270 + 296 | Streaming, strict-JSON-safe, exact-cost semantics |
+| 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d` + collision follow-up (this commit) | spec PASS; quality re-review pending; GREEN 271 + 297 | Streaming, strict-JSON-safe, exact-cost semantics |
 | 6. Insights cutover | in progress | — | RED pending | Keep session activity metrics |
 | 7. Dashboard API cutover | pending | — | — | Event-time daily windows |
 | 8. CLI/gateway `/usage` cutover | pending | — | — | Full persisted mixed routes |
@@ -300,6 +300,22 @@ Append each RED and GREEN command here with exit code and concise result.
 - Combined accounting GREEN: exit 0; `296 passed in 15.43s`.
 - Compilation and scoped diff checks: PASS. Quality re-review remains pending.
 
+#### Task 5 collision-free dimension follow-up
+
+- Finding: malformed dimension markers still shared a namespace with legitimate
+  strings, and different malformed structures of one type could merge.
+- RED command: four focused grouped-output regressions, including normal route
+  contracts and malformed/valid marker collision cases.
+- RED result: exit 1; `4 failed, 26 deselected in 1.13s`.
+- Fix: malformed dimensions now receive content-addressed structural markers;
+  schema validity is part of both internal group identity and output via
+  `<dimension>_is_valid`. Legitimate strings equal to markers remain separate,
+  and distinct malformed list/dict/byte/numeric values do not collapse.
+- Target GREEN: exit 0; `4 passed, 26 deselected in 0.92s`.
+- Required GREEN: exit 0; `271 passed in 12.55s`.
+- Combined accounting GREEN: exit 0; `297 passed in 15.29s`.
+- Compilation and scoped diff checks: PASS. Quality re-review remains pending.
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -374,9 +390,10 @@ Append each RED and GREEN command here with exit code and concise result.
   residual are reported separately.
 - Cost presence after numeric validation, not `cost_status`, controls independent
   estimated/actual known/unknown event coverage. NULL provider/model routes remain
-  explicit groups; schema-invalid dimensions canonicalize to explicit JSON-safe
-  `[invalid:...]` markers rather than breaking or silently disappearing; route
-  identity never drops provider or purpose dimensions.
+  explicit groups; schema-invalid dimensions canonicalize to content-addressed
+  JSON-safe markers with explicit validity bits, preventing collisions with
+  legitimate strings or other malformed values; route identity never drops
+  provider or purpose dimensions.
 - Invalid numeric accounting fields are ignored rather than allowed to corrupt
   totals, counted explicitly at event/value granularity, and correction rows are
   the only record kind allowed to contribute signed token/cost adjustments.
@@ -435,11 +452,10 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 4 residual-only historical backfill and attribution hardening are
   complete in `cc1b84d72` and `26ff22a71`; spec PASS, quality APPROVED,
   `241` state tests and `267` combined focused tests.
-- Task 5 canonical event-derived read models are committed at `707a36416`,
-  streaming/numeric hardening at `a44d047a1`, and exact-cost/cutoff hardening at
-  `cda7204cb`; identity/boundary hardening is green in the current follow-up
-  (`270` required; `296` combined). Quality re-review is the remaining Task 5
-  gate.
+- Task 5 canonical event-derived read models are committed through boundary
+  hardening at `49847935d`; collision-free dimension hardening is green in the
+  current follow-up (`271` required; `297` combined). Quality re-review is the
+  remaining Task 5 gate.
 - Task 6 remains the active task. Before its first code change, complete Task 5's
   quality re-review; then cut Insights usage sections over while retaining
   session-derived activity metrics.

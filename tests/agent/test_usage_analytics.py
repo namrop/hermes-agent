@@ -1,9 +1,9 @@
 """Contract tests for canonical, event-derived usage read models.
 
 Every summary row has the keys in ``SUMMARY_KEYS``. Provider/model rows add
-``provider`` and ``model``; daily rows add ``date``; session-route rows add
-``provider``, ``model``, and ``purpose``. Daily ``date`` is ISO-8601 or the
-explicit ``unknown`` corruption bucket. Cost compatibility fields are floats (or
+``provider``/``model`` plus validity bits; session-route rows additionally add
+``purpose`` plus its validity bit. Daily rows add ``date``. Daily ``date`` is
+ISO-8601 or the explicit ``unknown`` corruption bucket. Cost compatibility fields are floats (or
 NULL only when a finite total is not representable); authoritative exact USD
 fields are decimal strings. NULL provider/model values remain NULL so
 unattributed usage is visible. Every result is strict-JSON safe (no NaN or
@@ -54,6 +54,16 @@ SUMMARY_KEYS = {
 }
 
 EXACT_COST_KEYS = {"estimated_cost_usd_exact", "actual_cost_usd_exact"}
+PROVIDER_MODEL_DIMENSION_KEYS = {
+    "provider",
+    "model",
+    "provider_is_valid",
+    "model_is_valid",
+}
+SESSION_ROUTE_DIMENSION_KEYS = PROVIDER_MODEL_DIMENSION_KEYS | {
+    "purpose",
+    "purpose_is_valid",
+}
 ADDITIVE_SUMMARY_KEYS = SUMMARY_KEYS - {"average_latency_ms"} - EXACT_COST_KEYS
 
 
@@ -126,7 +136,9 @@ def test_mixed_session_provider_model_rows_reconcile_to_global_totals(db):
         ("openrouter", "model-a"),
         ("deepseek", "model-b"),
     }
-    assert all(set(row) == SUMMARY_KEYS | {"provider", "model"} for row in rows)
+    assert all(
+        set(row) == SUMMARY_KEYS | PROVIDER_MODEL_DIMENSION_KEYS for row in rows
+    )
     for key in ADDITIVE_SUMMARY_KEYS:
         assert sum(row[key] for row in rows) == pytest.approx(total[key])
     assert total["average_latency_ms"] == pytest.approx(200.0)
@@ -382,8 +394,7 @@ def test_session_routes_group_by_provider_model_and_purpose(db):
         (None, None, "main"),
     }
     assert all(
-        set(row) == SUMMARY_KEYS | {"provider", "model", "purpose"}
-        for row in rows
+        set(row) == SUMMARY_KEYS | SESSION_ROUTE_DIMENSION_KEYS for row in rows
     )
     assert sum(row["event_count"] for row in rows) == 4
 
@@ -599,8 +610,10 @@ def test_malformed_group_dimensions_are_canonical_json_strings(db):
     _update_event(db, "blob-route", provider=b"\xff\x00", model=b"model")
 
     db_rows = db.summarize_usage_by_provider_model()
-    assert db_rows[0]["provider"] == "[invalid:bytes:ff00]"
-    assert db_rows[0]["model"] == "[invalid:bytes:6d6f64656c]"
+    assert db_rows[0]["provider"].startswith("[invalid:bytes:")
+    assert db_rows[0]["model"].startswith("[invalid:bytes:")
+    assert db_rows[0]["provider_is_valid"] is False
+    assert db_rows[0]["model_is_valid"] is False
     json.dumps(db_rows, allow_nan=False)
 
     pure_rows = summarize_usage_by_provider_model(
@@ -611,7 +624,49 @@ def test_malformed_group_dimensions_are_canonical_json_strings(db):
     )
     assert all(isinstance(row["provider"], str) for row in pure_rows)
     assert all(isinstance(row["model"], str) for row in pure_rows)
+    assert all(row["provider_is_valid"] is False for row in pure_rows)
+    assert all(row["model_is_valid"] is False for row in pure_rows)
     json.dumps(pure_rows, allow_nan=False)
+
+
+def test_malformed_dimensions_cannot_merge_with_valid_strings_or_each_other():
+    first = summarize_usage_by_provider_model(
+        [{"provider": b"\xff", "model": ["first"]}]
+    )[0]
+    marker_provider = first["provider"]
+    marker_model = first["model"]
+
+    rows = summarize_usage_by_provider_model(
+        [
+            {"provider": b"\xff", "model": ["first"]},
+            {"provider": marker_provider, "model": marker_model},
+            {"provider": 7, "model": ["second"]},
+            {"provider": "7", "model": ["third"]},
+        ]
+    )
+
+    assert len(rows) == 4
+    assert {
+        (row["provider"], row["provider_is_valid"])
+        for row in rows
+        if row["provider"] == marker_provider
+    } == {(marker_provider, False), (marker_provider, True)}
+    valid_seven = next(
+        row for row in rows if row["provider"] == "7" and row["provider_is_valid"]
+    )
+    invalid_integer = next(
+        row
+        for row in rows
+        if row["provider_is_valid"] is False
+        and row["provider"].startswith("[invalid:int:")
+    )
+    assert valid_seven["event_count"] == 1
+    assert invalid_integer["event_count"] == 1
+    invalid_models = {
+        row["model"] for row in rows if row["model_is_valid"] is False
+    }
+    assert len(invalid_models) == 3
+    json.dumps(rows, allow_nan=False)
 
 
 def test_malformed_nonfinite_and_out_of_range_timestamps_group_as_unknown():
