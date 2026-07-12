@@ -125,6 +125,71 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     ]
 
 
+def test_background_review_does_not_overwrite_parent_json_snapshot(monkeypatch, tmp_path):
+    """Review accounting must not give the fork parent-transcript ownership.
+
+    Even with ``session_db=None``, the optional JSON snapshot writer keys files
+    by ``session_id``.  Because the review intentionally reuses the parent's
+    logical session ID for accounting, it must explicitly disable that writer
+    or private review prompt/output can overwrite the foreground snapshot.
+    """
+    import json
+    import datetime as dt
+
+    parent_file = tmp_path / "session_test-session.json"
+    foreground_payload = {
+        "session_id": "test-session",
+        "message_count": 1,
+        "messages": [{"role": "user", "content": "foreground only"}],
+    }
+    parent_file.write_text(json.dumps(foreground_payload), encoding="utf-8")
+    observed = {}
+
+    class FakeReviewAgent:
+        _clean_session_content = staticmethod(AIAgent._clean_session_content)
+        _save_session_log = AIAgent._save_session_log
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._session_json_enabled = True
+            self.logs_dir = tmp_path
+            self.model = kwargs["model"]
+            self.base_url = kwargs.get("base_url") or ""
+            self.platform = kwargs.get("platform")
+            self.session_start = dt.datetime(2026, 1, 1, 12, 0, 0)
+            self._cached_system_prompt = "review system prompt"
+            self.tools = []
+            self.verbose_logging = False
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            observed["json_enabled_during_run"] = self._session_json_enabled
+            self._session_messages = [
+                {"role": "user", "content": "PRIVATE REVIEW PROMPT"},
+                {"role": "assistant", "content": "PRIVATE REVIEW OUTPUT"},
+            ]
+            self._save_session_log(self._session_messages)
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "foreground only"}],
+        review_memory=True,
+    )
+
+    assert observed["json_enabled_during_run"] is False
+    assert json.loads(parent_file.read_text(encoding="utf-8")) == foreground_payload
+
+
 def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
     """Regression guard for #15216.
 

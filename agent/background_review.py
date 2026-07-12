@@ -412,6 +412,12 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # The review reuses the parent's logical session ID for usage
+            # attribution.  Never let the optional JSON transcript writer use
+            # that ID: it would overwrite the parent's snapshot with the
+            # private review harness prompt/output even though session_db is
+            # intentionally absent.
+            setattr(review_agent, "_session_json_enabled", False)
             review_agent._memory_store = agent._memory_store
             review_agent._memory_enabled = agent._memory_enabled
             review_agent._user_profile_enabled = agent._user_profile_enabled

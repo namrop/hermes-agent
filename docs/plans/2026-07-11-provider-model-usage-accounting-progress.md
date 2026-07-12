@@ -157,7 +157,20 @@ Append each RED and GREEN command here with exit code and concise result.
   `tests/run_agent/test_background_review.py`, and this progress ledger.
 - Existing cleanup, summary, cache-parity, runtime-whitelist, pricing, and
   external-memory-plugin regressions remained green in the final focused run.
-- Task 3 is complete; Task 4 is active next.
+
+#### Spec-review transcript-boundary follow-up
+
+- Finding: `session_db=None` prevented SQLite message writes, but optional JSON
+  snapshots still keyed off the reused parent `session_id`; with snapshots
+  enabled, review prompt/output could overwrite the parent's JSON transcript.
+- RED command: `.venv/bin/python -m pytest tests/run_agent/test_background_review.py::test_background_review_does_not_overwrite_parent_json_snapshot -o 'addopts=' -q`
+- RED result: exit 1; `1 failed in 2.11s`, proving the review fork still had
+  `_session_json_enabled=True` during execution.
+- Fix: background review now explicitly disables its JSON snapshot writer after
+  construction and before `run_conversation()`, while retaining usage recording.
+- Target GREEN: exit 0; `1 passed in 2.59s`.
+- Full focused GREEN: exit 0; `270 passed in 17.19s`.
+- Task 3 is complete pending the follow-up review/commit; Task 4 follows next.
 
 ## Decisions and deviations
 
