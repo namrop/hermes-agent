@@ -31,11 +31,25 @@ from agent.usage_analytics import (
     summarize_usage_events as aggregate_usage_events,
 )
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+_LLM_USAGE_ACCOUNTING_COLUMNS = (
+    "record_kind",
+    "request_status",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "estimated_cost_usd",
+    "actual_cost_usd",
+    "latency_ms",
+    "api_call_index",
+)
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
@@ -1325,24 +1339,21 @@ class SessionDB:
                 ).fetchall()
         return [dict(row) for row in rows]
 
-    def query_llm_usage_events(
-        self,
+    @staticmethod
+    def _llm_usage_filter(
         *,
         cutoff: Optional[float] = None,
         source: Optional[str] = None,
         session_id: Optional[str] = None,
         purpose: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Return every event matching accounting filters, oldest first.
-
-        Unlike :meth:`get_llm_usage_events`, this canonical analytics query has
-        no display-oriented row cap. ``cutoff`` is inclusive and applies to the
-        event occurrence timestamp, not the owning session's start time.
-        """
+    ) -> Tuple[str, List[Any]]:
+        """Build the shared SQL predicate for raw and streaming usage reads."""
         conditions: List[str] = []
         params: List[Any] = []
         if cutoff is not None:
-            conditions.append("timestamp >= ?")
+            conditions.append(
+                "typeof(timestamp) IN ('integer', 'real') AND timestamp >= ?"
+            )
             params.append(float(cutoff))
         if source is not None:
             conditions.append("source = ?")
@@ -1353,17 +1364,103 @@ class SessionDB:
         if purpose is not None:
             conditions.append("purpose = ?")
             params.append(purpose)
-
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        return where, params
+
+    def _filtered_llm_usage_cursor(
+        self,
+        conn: sqlite3.Connection,
+        columns: Sequence[str],
+        *,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> sqlite3.Cursor:
+        """Open an oldest-first filtered cursor with an internal projection."""
+        where, params = self._llm_usage_filter(
+            cutoff=cutoff,
+            source=source,
+            session_id=session_id,
+            purpose=purpose,
+        )
+        projection = ", ".join(columns)
+        return conn.execute(
+            f"""SELECT {projection} FROM llm_usage_events{where}
+                ORDER BY timestamp ASC, id ASC""",
+            params,
+        )
+
+    @staticmethod
+    def _iter_usage_cursor(
+        cursor: sqlite3.Cursor, *, batch_size: int = 1000
+    ) -> Iterable[Dict[str, Any]]:
+        """Yield projected rows in bounded batches without ledger materialization."""
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                return
+            for row in rows:
+                yield dict(row)
+
+    def _aggregate_filtered_llm_usage(
+        self,
+        aggregate: Callable[[Iterable[Dict[str, Any]]], T],
+        columns: Sequence[str],
+        *,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> T:
+        """Stream a projected ledger through ``aggregate`` under the read lock."""
         with self._lock:
             conn = self._conn
             if conn is None:
                 raise RuntimeError("SessionDB is closed")
-            rows = conn.execute(
-                f"""SELECT * FROM llm_usage_events{where}
-                    ORDER BY timestamp ASC, id ASC""",
-                params,
-            ).fetchall()
+            cursor = self._filtered_llm_usage_cursor(
+                conn,
+                columns,
+                cutoff=cutoff,
+                source=source,
+                session_id=session_id,
+                purpose=purpose,
+            )
+            try:
+                return aggregate(self._iter_usage_cursor(cursor))
+            finally:
+                cursor.close()
+
+    def query_llm_usage_events(
+        self,
+        *,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return every event matching accounting filters, oldest first.
+
+        Unlike :meth:`get_llm_usage_events`, this explicit raw-list API has no
+        display-oriented row cap. ``cutoff`` is inclusive and applies to the
+        event occurrence timestamp, not the owning session's start time.
+        """
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("SessionDB is closed")
+            cursor = self._filtered_llm_usage_cursor(
+                conn,
+                ("*",),
+                cutoff=cutoff,
+                source=source,
+                session_id=session_id,
+                purpose=purpose,
+            )
+            try:
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
         return [dict(row) for row in rows]
 
     def summarize_usage_events(
@@ -1374,13 +1471,14 @@ class SessionDB:
         purpose: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return the canonical global summary for matching event rows."""
-        events = self.query_llm_usage_events(
+        return self._aggregate_filtered_llm_usage(
+            aggregate_usage_events,
+            _LLM_USAGE_ACCOUNTING_COLUMNS,
             cutoff=cutoff,
             source=source,
             session_id=session_id,
             purpose=purpose,
         )
-        return aggregate_usage_events(events)
 
     def summarize_usage_by_provider_model(
         self,
@@ -1390,13 +1488,14 @@ class SessionDB:
         purpose: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Return canonical provider/model summaries for matching events."""
-        events = self.query_llm_usage_events(
+        return self._aggregate_filtered_llm_usage(
+            aggregate_usage_by_provider_model,
+            _LLM_USAGE_ACCOUNTING_COLUMNS + ("provider", "model"),
             cutoff=cutoff,
             source=source,
             session_id=session_id,
             purpose=purpose,
         )
-        return aggregate_usage_by_provider_model(events)
 
     def summarize_usage_daily(
         self,
@@ -1406,21 +1505,32 @@ class SessionDB:
         purpose: Optional[str] = None,
         timezone_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Return canonical event-time daily summaries in the chosen timezone."""
-        events = self.query_llm_usage_events(
+        """Return event-date summaries, using ``unknown`` for bad timestamps.
+
+        With no cutoff malformed timestamps remain visible in ``unknown``. A
+        SQL cutoff cannot include such rows because they cannot satisfy its
+        numeric timestamp comparison.
+        """
+        return self._aggregate_filtered_llm_usage(
+            lambda events: aggregate_usage_daily(
+                events, timezone_name=timezone_name
+            ),
+            _LLM_USAGE_ACCOUNTING_COLUMNS + ("timestamp",),
             cutoff=cutoff,
             source=source,
             session_id=session_id,
             purpose=purpose,
         )
-        return aggregate_usage_daily(events, timezone_name=timezone_name)
 
     def summarize_session_routes(
         self, session_id: str
     ) -> List[Dict[str, Any]]:
         """Summarize one session by provider, model, and purpose route."""
-        events = self.query_llm_usage_events(session_id=session_id)
-        return aggregate_session_routes(events)
+        return self._aggregate_filtered_llm_usage(
+            aggregate_session_routes,
+            _LLM_USAGE_ACCOUNTING_COLUMNS + ("provider", "model", "purpose"),
+            session_id=session_id,
+        )
 
     @staticmethod
     def _empty_backfill_report() -> Dict[str, Any]:
