@@ -128,6 +128,8 @@ def init_agent(
     load_soul_identity: bool = False,
     skip_memory: bool = False,
     session_db=None,
+    usage_recorder=None,
+    usage_purpose: str = "main",
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
@@ -940,8 +942,14 @@ def init_agent(
         max_file_size_mb=checkpoint_max_file_size_mb,
     )
     
-    # SQLite session store (optional -- provided by CLI or gateway)
+    # Transcript/session ownership is separate from the narrow accounting sink.
+    # Parent agents normally use their SessionDB for both; auxiliary agents may
+    # record usage through it without receiving transcript persistence methods.
     agent._session_db = session_db
+    agent._usage_recorder = (
+        usage_recorder if usage_recorder is not None else session_db
+    )
+    agent.usage_purpose = usage_purpose or "main"
     agent._parent_session_id = parent_session_id
     agent._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
     agent._session_db_created = False  # DB row deferred to run_conversation()

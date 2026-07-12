@@ -375,6 +375,9 @@ def _run_review_in_thread(
             # owns the loop and the agent-loop tools dispatch.
             if _parent_api_mode == "codex_app_server":
                 _parent_api_mode = "codex_responses"
+            _parent_usage_recorder = getattr(agent, "_usage_recorder", None)
+            if _parent_usage_recorder is None:
+                _parent_usage_recorder = getattr(agent, "_session_db", None)
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -400,6 +403,10 @@ def _run_review_in_thread(
                 base_url=_parent_runtime.get("base_url") or None,
                 api_key=_parent_runtime.get("api_key") or None,
                 credential_pool=getattr(agent, "_credential_pool", None),
+                session_id=agent.session_id,
+                session_db=None,
+                usage_recorder=_parent_usage_recorder,
+                usage_purpose="background_review",
                 parent_session_id=agent.session_id,
                 skip_memory=True,
             )

@@ -222,6 +222,7 @@ class TestSessionLifecycle:
         assert event["latency_ms"] == 1234
         assert event["request_status"] == "ok"
         assert event["api_call_index"] == 3
+        assert event["purpose"] == "main"
 
     def test_record_llm_usage_event_backfills_source_from_session(self, db):
         db.create_session(session_id="s1", source="telegram", model="deepseek-v4-pro")
@@ -261,6 +262,7 @@ class TestSessionLifecycle:
         assert result["inserted"] is True
         assert result["event_uid"] == "hermes:test-call:1"
         assert result["provider"] == "openai-codex"
+        assert result["purpose"] == "main"
         session = db.get_session("s1")
         assert session["input_tokens"] == 120
         assert session["output_tokens"] == 30
@@ -430,6 +432,55 @@ class TestSessionLifecycle:
             assert session["input_tokens"] == 8
             assert session["output_tokens"] == 2
             assert session["api_call_count"] == 1
+        finally:
+            migrated_db.close()
+
+    def test_pre_purpose_database_migrates_existing_events_to_main(self, tmp_path):
+        db_path = tmp_path / "legacy_purpose_state.db"
+        legacy_db = SessionDB(db_path=db_path)
+        legacy_db.create_session(session_id="legacy-session", source="discord")
+        legacy_event_id = legacy_db.record_llm_usage_event(
+            session_id="legacy-session",
+            provider="openrouter",
+            model="legacy/model",
+            input_tokens=12,
+            output_tokens=3,
+        )
+        legacy_db.close()
+
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("ALTER TABLE llm_usage_events DROP COLUMN purpose")
+            legacy_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(llm_usage_events)")
+            }
+            assert "purpose" not in legacy_columns
+
+        migrated_db = SessionDB(db_path=db_path)
+        try:
+            columns = {
+                row[1]: row
+                for row in migrated_db._conn.execute(
+                    "PRAGMA table_info(llm_usage_events)"
+                )
+            }
+            assert columns["purpose"][4] == "'main'"
+            legacy_event = migrated_db.get_llm_usage_events(
+                session_id="legacy-session"
+            )[0]
+            assert legacy_event["id"] == legacy_event_id
+            assert legacy_event["purpose"] == "main"
+
+            background_event = migrated_db.record_usage_and_rollup(
+                event_uid="hermes:background-review",
+                session_id="legacy-session",
+                purpose="background_review",
+                provider="openrouter",
+                model="review/model",
+                input_tokens=8,
+                output_tokens=2,
+            )
+            assert background_event["purpose"] == "background_review"
         finally:
             migrated_db.close()
 

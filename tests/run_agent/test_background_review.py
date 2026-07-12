@@ -17,6 +17,8 @@ def _bare_agent() -> AIAgent:
     agent.session_id = "test-session"
     agent._parent_session_id = ""
     agent._credential_pool = None
+    agent._session_db = object()
+    agent._usage_recorder = object()
     agent._memory_store = object()
     agent._memory_enabled = True
     agent._user_profile_enabled = False
@@ -38,6 +40,53 @@ class ImmediateThread:
 
     def start(self):
         self._target()
+
+
+def test_background_review_gets_accounting_sink_without_transcript_ownership(monkeypatch):
+    captured_kwargs = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    agent = _bare_agent()
+    transcript_owner = agent._session_db
+    recorder = agent._usage_recorder
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert captured_kwargs["usage_recorder"] is recorder
+    assert captured_kwargs["usage_purpose"] == "background_review"
+    assert captured_kwargs["session_id"] == agent.session_id
+    assert captured_kwargs["parent_session_id"] == agent.session_id
+    assert captured_kwargs.get("session_db") is None
+    assert captured_kwargs["usage_recorder"] is not transcript_owner
+
+    captured_kwargs.clear()
+    delattr(agent, "_usage_recorder")
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[],
+        review_memory=True,
+    )
+    assert captured_kwargs["usage_recorder"] is transcript_owner
+    assert captured_kwargs.get("session_db") is None
 
 
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):

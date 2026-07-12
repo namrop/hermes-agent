@@ -403,6 +403,8 @@ class AIAgent:
         load_soul_identity: bool = False,
         skip_memory: bool = False,
         session_db=None,
+        usage_recorder=None,
+        usage_purpose: str = "main",
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
@@ -472,6 +474,8 @@ class AIAgent:
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
             session_db=session_db,
+            usage_recorder=usage_recorder,
+            usage_purpose=usage_purpose,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
@@ -497,6 +501,8 @@ class AIAgent:
             from hermes_state import SessionDB
 
             self._session_db = SessionDB()
+            if getattr(self, "_usage_recorder", None) is None:
+                self._usage_recorder = self._session_db
             return self._session_db
         except Exception as exc:
             logger.debug("SessionDB unavailable for recall", exc_info=True)

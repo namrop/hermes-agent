@@ -227,6 +227,7 @@ CREATE TABLE IF NOT EXISTS llm_usage_events (
     timestamp REAL NOT NULL,
     session_id TEXT REFERENCES sessions(id),
     source TEXT,
+    purpose TEXT DEFAULT 'main',
     provider TEXT,
     model TEXT,
     api_mode TEXT,
@@ -1025,6 +1026,7 @@ class SessionDB:
         *,
         timestamp: Optional[float] = None,
         source: Optional[str] = None,
+        purpose: str = "main",
         provider: Optional[str] = None,
         model: Optional[str] = None,
         api_mode: Optional[str] = None,
@@ -1057,6 +1059,7 @@ class SessionDB:
 
         now = time.time()
         event_ts = float(timestamp if timestamp is not None else now)
+        event_purpose = purpose or "main"
 
         def _to_int(value: Any) -> int:
             try:
@@ -1222,18 +1225,19 @@ class SessionDB:
 
             cursor = conn.execute(
                 """INSERT INTO llm_usage_events (
-                       event_uid, timestamp, session_id, source, provider, model,
-                       api_mode, billing_base_url, billing_mode, input_tokens,
+                       event_uid, timestamp, session_id, source, purpose, provider,
+                       model, api_mode, billing_base_url, billing_mode, input_tokens,
                        output_tokens, cache_read_tokens, cache_write_tokens,
                        reasoning_tokens, estimated_cost_usd, actual_cost_usd,
                        cost_status, cost_source, pricing_version, latency_ms,
                        request_status, error_class, api_call_index, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     event_uid,
                     event_ts,
                     session_id,
                     event_source,
+                    event_purpose,
                     provider,
                     model,
                     api_mode,

@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -17,22 +18,34 @@ def _mock_response(*, usage: dict, content: str = "done"):
     )
 
 
-def _make_agent(session_db, *, platform: str):
+def _make_agent(
+    session_db,
+    *,
+    platform: str,
+    usage_recorder=None,
+    usage_purpose: str = "main",
+    session_id: str | None = None,
+):
+    agent_kwargs = {
+        "api_key": "test-key",
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "quiet_mode": True,
+        "skip_context_files": True,
+        "skip_memory": True,
+        "session_db": session_db,
+        "session_id": session_id or f"{platform}-session",
+        "platform": platform,
+    }
+    if usage_recorder is not None or usage_purpose != "main":
+        agent_kwargs["usage_recorder"] = usage_recorder
+        agent_kwargs["usage_purpose"] = usage_purpose
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            session_db=session_db,
-            session_id=f"{platform}-session",
-            platform=platform,
-        )
+        agent = AIAgent(**agent_kwargs)
     agent.client = MagicMock()
     agent.client.chat.completions.create.return_value = _mock_response(
         usage={
@@ -42,6 +55,95 @@ def _make_agent(session_db, *, platform: str):
         }
     )
     return agent
+
+
+def test_agent_defaults_usage_recorder_to_session_db_and_purpose_to_main():
+    session_db = MagicMock()
+
+    agent = _make_agent(session_db, platform="discord")
+
+    assert agent._usage_recorder is session_db
+    assert agent.usage_purpose == "main"
+
+
+def test_agent_without_session_db_records_through_narrow_usage_recorder():
+    class NarrowUsageRecorder:
+        def __init__(self):
+            self.calls = []
+
+        def record_usage_and_rollup(self, **kwargs):
+            self.calls.append(kwargs)
+
+    recorder = NarrowUsageRecorder()
+    agent = _make_agent(
+        None,
+        platform="discord",
+        usage_recorder=recorder,
+        usage_purpose="background_review",
+        session_id="parent-session",
+    )
+
+    result = agent.run_conversation("review this")
+
+    assert result["final_response"] == "done"
+    assert agent._session_db is None
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["session_id"] == "parent-session"
+    assert recorder.calls[0]["purpose"] == "background_review"
+
+
+def test_background_usage_persists_without_mutating_parent_counters(tmp_path):
+    recorder = SessionDB(db_path=tmp_path / "usage.db")
+    try:
+        parent = _make_agent(
+            recorder,
+            platform="discord",
+            session_id="shared-session",
+        )
+        parent_counters = {
+            "input": parent.session_input_tokens,
+            "output": parent.session_output_tokens,
+            "calls": parent.session_api_calls,
+            "cost": parent.session_estimated_cost_usd,
+        }
+        review = _make_agent(
+            None,
+            platform="discord",
+            usage_recorder=recorder,
+            usage_purpose="background_review",
+            session_id=parent.session_id,
+        )
+
+        result = review.run_conversation("review this")
+
+        assert result["final_response"] == "done"
+        assert review.session_input_tokens == 11
+        assert review.session_output_tokens == 7
+        assert review.session_api_calls == 1
+        assert {
+            "input": parent.session_input_tokens,
+            "output": parent.session_output_tokens,
+            "calls": parent.session_api_calls,
+            "cost": parent.session_estimated_cost_usd,
+        } == parent_counters
+
+        session_events = recorder.get_llm_usage_events(session_id="shared-session")
+        global_events = recorder.get_llm_usage_events()
+        provider_events = [
+            event for event in global_events if event["provider"] == "openrouter"
+        ]
+        assert len(session_events) == len(global_events) == len(provider_events) == 1
+        event = session_events[0]
+        assert event["purpose"] == "background_review"
+        assert event["input_tokens"] == 11
+        assert event["output_tokens"] == 7
+
+        session = recorder.get_session("shared-session")
+        assert session["input_tokens"] == 11
+        assert session["output_tokens"] == 7
+        assert session["api_call_count"] == 1
+    finally:
+        recorder.close()
 
 
 def test_run_conversation_persists_tokens_for_telegram_sessions():
@@ -223,3 +325,4 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     assert captured["db"] is sentinel_db
     assert captured["query"] == "Hermes"
     assert agent._session_db is sentinel_db
+    assert agent._usage_recorder is sentinel_db

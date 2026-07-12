@@ -5,7 +5,7 @@
 ## Current status
 
 - State: implementation in progress
-- Active task: Task 3 — background-review accounting
+- Active task: Task 4 — residual-only historical backfill
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -28,9 +28,9 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | Task | State | Commit | Verification | Notes |
 |---|---|---|---|---|
 | 1. Plan + progress ledger | completed | `a3a8b38ce` | readback + diff checks PASS | Landed before production code |
-| 2. Atomic event + rollup | completed | `dbd307323`; `43e4e4093`; `fix: harden atomic usage accounting semantics` (this commit) | quality RED 7 failed/229 passed; final 247 PASS | Atomic, replay-safe, enriched, route-stable, and non-lossy |
-| 3. Background-review accounting | active | — | RED pending | Preserve transcript boundary |
-| 4. Residual-only historical backfill | pending | — | — | No overlap with real events |
+| 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
+| 3. Background-review accounting | completed | `fix: account for background review LLM usage` (this commit) | RED 13 failed/256 passed; GREEN 269 passed | Purpose-aware accounting without transcript ownership |
+| 4. Residual-only historical backfill | active next | — | RED pending | No overlap with real events |
 | 5. Event-derived read models | pending | — | — | Central query semantics |
 | 6. Insights cutover | pending | — | — | Keep session activity metrics |
 | 7. Dashboard API cutover | pending | — | — | Event-time daily windows |
@@ -131,6 +131,34 @@ Append each RED and GREEN command here with exit code and concise result.
   `tests/run_agent/test_token_persistence_non_cli.py`, and this ledger.
 - Task 2 remains completed after this quality pass; Task 3 is active next.
 
+### Task 3
+
+- RED command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/run_agent/test_background_review.py tests/run_agent/test_background_review_summary.py tests/run_agent/test_background_review_cache_parity.py tests/run_agent/test_background_review_toolset_restriction.py tests/agent/test_usage_pricing.py -o 'addopts=' -q`
+- RED result: exit 1; `13 failed, 256 passed in 11.18s`.
+- Expected failures covered the missing constructor dependencies/defaults, the
+  conversation loop's SessionDB-only accounting gate, missing background-fork
+  recorder/purpose/session wiring, and the absent event-purpose schema/API.
+- First GREEN result: exit 1; `1 failed, 268 passed in 15.09s`. The remaining
+  failure was a test-fixture attribution error: the fixture had not explicitly
+  selected OpenRouter while asserting an OpenRouter provider subtotal.
+- Final GREEN command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/run_agent/test_background_review.py tests/run_agent/test_background_review_summary.py tests/run_agent/test_background_review_cache_parity.py tests/run_agent/test_background_review_toolset_restriction.py tests/agent/test_usage_pricing.py -o 'addopts=' -q`
+- Lazy-recorder follow-up RED command:
+  `.venv/bin/python -m pytest tests/run_agent/test_token_persistence_non_cli.py::test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one -o 'addopts=' -q`.
+- Lazy-recorder follow-up RED result: exit 1; `1 failed in 3.90s`. A parent
+  agent that lazily opened SessionDB for recall did not update its default
+  recorder, regressing the old post-recall accounting path.
+- Lazy-recorder follow-up GREEN result: exit 0; `1 passed in 3.85s`.
+- Final GREEN result after the follow-up: exit 0; `269 passed in 17.85s`.
+- Compilation: `.venv/bin/python -m py_compile run_agent.py agent/agent_init.py agent/conversation_loop.py agent/background_review.py hermes_state.py tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/run_agent/test_background_review.py` — PASS.
+- Files changed: `run_agent.py`, `agent/agent_init.py`,
+  `agent/conversation_loop.py`, `agent/background_review.py`, `hermes_state.py`,
+  `tests/test_hermes_state.py`,
+  `tests/run_agent/test_token_persistence_non_cli.py`,
+  `tests/run_agent/test_background_review.py`, and this progress ledger.
+- Existing cleanup, summary, cache-parity, runtime-whitelist, pricing, and
+  external-memory-plugin regressions remained green in the final focused run.
+- Task 3 is complete; Task 4 is active next.
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -157,15 +185,30 @@ Append each RED and GREEN command here with exit code and concise result.
 - Legacy `update_token_counts()` cost semantics are intentionally deferred and
   unchanged: no focused regression showed that compatibility API was required
   for the atomic writer quality fix.
+- `AIAgent` now has a narrow `_usage_recorder` dependency, defaulting to its
+  `session_db`, and a `usage_purpose` default of `main`. Transcript ownership
+  remains exclusively on `_session_db`. A SessionDB opened lazily for recall
+  becomes the default recorder only when no explicit recorder exists.
+- Background review receives the parent's recorder (falling back to the parent
+  SessionDB as an accounting sink), the parent's logical session ID, and
+  `usage_purpose=background_review`, while explicitly retaining
+  `session_db=None`. The fork owns its in-memory counters and never closes the
+  parent's recorder.
+- The conversation loop records through `_usage_recorder` and sends `purpose`
+  to the atomic event API. `llm_usage_events.purpose` is nullable and added by
+  declarative reconciliation with `DEFAULT 'main'`; legacy rows and ordinary
+  writers therefore read as `main`, while review events persist explicitly as
+  `background_review`.
 
 ## Known risks
 
-1. `SessionDB` serves both transcript and accounting state; background forks need accounting without transcript ownership.
+1. The parent owns the recorder lifetime; background review deliberately shares
+   it and must never close it. Existing SessionDB locking provides thread safety.
 2. Gateway agent recreation resets in-memory counters, so `/usage` cannot trust the resident object for full-session totals.
 3. `api_call_index` resets per agent instance and is not a unique key.
 4. Usage persistence currently occurs after response-control branches, so usage-bearing truncated/invalid responses may be missed.
-5. Existing historical backfill can overlap real events.
-6. SQLite schema changes must remain backward-compatible with fixture databases.
+5. Existing historical backfill can overlap real events; Task 4 remains active.
+6. Future SQLite schema additions must remain backward-compatible with fixture databases.
 7. The shared worktree already contains unrelated dirty model-picker changes.
 
 ## Resume instructions for another harness
@@ -186,5 +229,10 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 1 documentation is committed at `a3a8b38ce`.
 - Task 2 implementation, spec-review coverage, and code-quality blocker fixes
   are complete; commits are `dbd307323`, `43e4e4093`, and
-  `fix: harden atomic usage accounting semantics` (this commit).
-- Next action: begin Task 3 by writing failing background-review accounting tests before changing production code.
+  `3d03ea32e` (`fix: harden atomic usage accounting semantics`).
+- Task 2 final review: spec PASS; code quality APPROVED; focused suite `247 passed`.
+- Task 3 purpose-aware background-review accounting is complete in
+  `fix: account for background review LLM usage` (this commit); focused suite
+  `269 passed` and compilation PASS.
+- Next action: begin Task 4 with RED tests for residual-only historical
+  backfill; do not implement analytics consumers yet.

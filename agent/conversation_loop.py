@@ -1612,13 +1612,14 @@ def run_conversation(
 
                     # Persist each successful call as one idempotent event and
                     # update the compatibility session rollup in the same DB
-                    # transaction. Do this for every platform with a session_id
-                    # so non-CLI sessions (gateway, cron, delegated runs) cannot
-                    # lose accounting if a higher-level persistence path is
-                    # skipped or fails. Gateway/session-store writes use
+                    # transaction. Do this through the narrow accounting sink
+                    # for every platform with a session_id so auxiliary runs
+                    # without transcript ownership cannot lose accounting.
+                    # Gateway/session-store writes use
                     # absolute totals, so they safely overwrite these per-call
                     # deltas instead of double-counting them.
-                    if agent._session_db and agent.session_id:
+                    usage_recorder = getattr(agent, "_usage_recorder", None)
+                    if usage_recorder is not None and agent.session_id:
                         event_uid = f"hermes:{uuid.uuid4()}"
                         try:
                             estimated_cost = (
@@ -1629,10 +1630,11 @@ def run_conversation(
                                 "subscription_included"
                                 if cost_result.status == "included" else None
                             )
-                            agent._session_db.record_usage_and_rollup(
+                            usage_recorder.record_usage_and_rollup(
                                 event_uid=event_uid,
                                 session_id=agent.session_id,
                                 source=getattr(agent, "platform", None),
+                                purpose=getattr(agent, "usage_purpose", "main"),
                                 provider=dispatch_route.provider,
                                 model=dispatch_route.model,
                                 api_mode=dispatch_route.api_mode,
