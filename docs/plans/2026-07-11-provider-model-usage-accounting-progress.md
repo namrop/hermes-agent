@@ -29,9 +29,9 @@ These existed before this work and must remain unstaged/unmodified by this imple
 |---|---|---|---|---|
 | 1. Plan + progress ledger | completed | `a3a8b38ce` | readback + diff checks PASS | Landed before production code |
 | 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
-| 3. Background-review accounting | completed | `fix: account for background review LLM usage` (this commit) | RED 13 failed/256 passed; GREEN 269 passed | Purpose-aware accounting without transcript ownership |
-| 4. Residual-only historical backfill | active next | — | RED pending | No overlap with real events |
-| 5. Event-derived read models | pending | — | — | Central query semantics |
+| 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
+| 4. Residual-only historical backfill | completed | `fix: backfill only uncovered usage residuals` (this commit) | RED 9 failed/3 passed; GREEN 240 + 266 focused tests | Idempotent residuals with reconstructed provenance |
+| 5. Event-derived read models | active next | — | — | Central query semantics |
 | 6. Insights cutover | pending | — | — | Keep session activity metrics |
 | 7. Dashboard API cutover | pending | — | — | Event-time daily windows |
 | 8. CLI/gateway `/usage` cutover | pending | — | — | Full persisted mixed routes |
@@ -172,6 +172,30 @@ Append each RED and GREEN command here with exit code and concise result.
 - Full focused GREEN: exit 0; `270 passed in 17.19s`.
 - Task 3 is complete pending the follow-up review/commit; Task 4 follows next.
 
+### Task 4
+
+- Initial RED command: `.venv/bin/python -m pytest tests/test_hermes_state.py -k 'backfill or provenance_fields' -o 'addopts=' -q`
+- Initial RED result: exit 1; `9 failed, 3 passed, 227 deselected in 4.46s`.
+  Expected failures covered complete real-event overlap, residual subtraction,
+  negative-discrepancy cleanup/reporting, synthetic update/removal, mixed-route
+  attribution, legacy-row normalization/deduplication, incomplete cost coverage,
+  float tolerance, and pre-provenance schema migration.
+- Zero-aggregate follow-up RED command: `.venv/bin/python -m pytest tests/test_hermes_state.py::TestSessionLifecycle::test_backfill_reports_real_usage_against_zero_session_aggregate -o 'addopts=' -q`
+- Zero-aggregate follow-up RED result: exit 1; `1 failed in 1.91s`. The first
+  implementation skipped a session whose aggregate was entirely zero even
+  though a real event exceeded it; the candidate-session query was widened to
+  include every session with an event row.
+- Zero-aggregate target GREEN: exit 0; `1 passed in 0.82s`.
+- Required GREEN command: `.venv/bin/python -m pytest tests/test_hermes_state.py -o 'addopts=' -q`
+- Required GREEN result: exit 0; `240 passed in 10.10s`.
+- Relevant focused GREEN command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/run_agent/test_background_review.py tests/agent/test_usage_pricing.py -o 'addopts=' -q`
+- Relevant focused GREEN result: exit 0; `266 passed in 13.27s`.
+- Compilation: `.venv/bin/python -m py_compile hermes_state.py tests/test_hermes_state.py` — PASS.
+- Scoped diff check over `hermes_state.py`, `tests/test_hermes_state.py`, and
+  this ledger — PASS.
+- Files changed: `hermes_state.py`, `tests/test_hermes_state.py`, and this
+  progress ledger. Task 4 is complete; Task 5 is active next.
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -212,17 +236,42 @@ Append each RED and GREEN command here with exit code and concise result.
   declarative reconciliation with `DEFAULT 'main'`; legacy rows and ordinary
   writers therefore read as `main`, while review events persist explicitly as
   `background_review`.
+- Historical backfill now reconciles one residual synthetic row per session.
+  It subtracts all non-synthetic token/cost facts, derives call residual from
+  `COUNT(record_kind='api_attempt')`, and returns only the count of newly
+  inserted rows for compatibility. `last_backfill_report` exposes inserted,
+  updated, deleted, and discrepancy session IDs plus negative bucket details.
+- Negative token/call or safely comparable cost residuals remove stale
+  synthetic rows and emit a WARNING rather than fabricating negative usage.
+  Costs remain NULL when the session cost is NULL or any real event lacks that
+  cost dimension; a `1e-9` tolerance suppresses floating-point noise.
+- Legacy `request_status='approximate_session_backfill'` rows are normalized
+  after declarative reconciliation and excluded from real-event sums. One row
+  is updated in place, extras are deleted, and a fully covered row is removed.
+- Synthetic rows use `record_kind='historical_aggregate'`,
+  `usage_source='reconstructed'`, `measurement_confidence='reconstructed'`,
+  and `purpose='historical_backfill'`. Mixed observed routes leave provider,
+  model, billing base URL, and billing mode NULL; scalar session route is used
+  only when no real route exists. `api_mode` and latency/error attempt fields
+  remain NULL.
+- Schema version 13 declaratively adds provenance columns with ordinary-event
+  defaults (`api_attempt`, `provider_reported`, `exact`) and idempotently
+  classifies pre-field approximate rows on database open.
 
 ## Known risks
 
 1. The parent owns the recorder lifetime; background review deliberately shares
    it and must never close it. Existing SessionDB locking provides thread safety.
-2. Gateway agent recreation resets in-memory counters, so `/usage` cannot trust the resident object for full-session totals.
-3. `api_call_index` resets per agent instance and is not a unique key.
-4. Usage persistence currently occurs after response-control branches, so usage-bearing truncated/invalid responses may be missed.
-5. Existing historical backfill can overlap real events; Task 4 remains active.
-6. Future SQLite schema additions must remain backward-compatible with fixture databases.
-7. The shared worktree already contains unrelated dirty model-picker changes.
+2. Background review still reuses the parent session ID for non-accounting
+   resource cleanup; full `AIAgent.close()` can target ProcessRegistry/sandbox/
+   browser resources under that ID. This predates Task 3 and needs a later
+   resource-namespace or lighter-teardown fix.
+3. Gateway agent recreation resets in-memory counters, so `/usage` cannot trust the resident object for full-session totals.
+4. `api_call_index` resets per agent instance and is not a unique key.
+5. Usage persistence currently occurs after response-control branches, so usage-bearing truncated/invalid responses may be missed.
+6. Backfill discrepancy reports are in-memory per run; durable reconciliation reporting still belongs in a later operator/reporting surface.
+7. Future SQLite schema additions must remain backward-compatible with fixture databases.
+8. The shared worktree already contains unrelated dirty model-picker changes.
 
 ## Resume instructions for another harness
 
@@ -245,7 +294,9 @@ Append each RED and GREEN command here with exit code and concise result.
   `3d03ea32e` (`fix: harden atomic usage accounting semantics`).
 - Task 2 final review: spec PASS; code quality APPROVED; focused suite `247 passed`.
 - Task 3 purpose-aware background-review accounting is complete in
-  `fix: account for background review LLM usage` (this commit); focused suite
-  `269 passed` and compilation PASS.
-- Next action: begin Task 4 with RED tests for residual-only historical
-  backfill; do not implement analytics consumers yet.
+  `90b9be0ff` and transcript-isolation follow-up `773faee49`; spec PASS,
+  quality APPROVED, focused suite `270 passed`.
+- Task 4 residual-only historical backfill is implemented and focused tests are
+  green (`240` state tests; `266` combined focused tests); pending scoped commit
+  and review.
+- Next action: commit/review Task 4, then begin Task 5 event-derived read models.

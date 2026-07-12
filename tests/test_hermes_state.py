@@ -615,41 +615,366 @@ class TestSessionLifecycle:
         assert session["actual_cost_usd"] == pytest.approx(0.20)
         assert session["api_call_count"] == 2
 
-    def test_backfill_llm_usage_events_from_session_totals_is_approximate_and_idempotent(self, db):
-        db.create_session(session_id="s1", source="discord", model="gpt-5.5")
-        db.update_token_counts(
-            "s1",
+    @staticmethod
+    def _set_session_usage(db, session_id, **values):
+        assignments = ", ".join(f"{column} = ?" for column in values)
+        db._conn.execute(
+            f"UPDATE sessions SET {assignments} WHERE id = ?",
+            (*values.values(), session_id),
+        )
+
+    @staticmethod
+    def _synthetic_events(db, session_id):
+        return [
+            event
+            for event in db.get_llm_usage_events(session_id=session_id)
+            if event["request_status"] == "approximate_session_backfill"
+        ]
+
+    def test_backfill_complete_real_coverage_creates_no_synthetic_event(self, db):
+        db.create_session(session_id="complete", source="discord", model="scalar-model")
+        self._set_session_usage(
+            db,
+            "complete",
             input_tokens=100,
             output_tokens=25,
             cache_read_tokens=400,
+            cache_write_tokens=10,
             reasoning_tokens=3,
-            estimated_cost_usd=0.0,
-            cost_status="included",
-            cost_source="none",
-            pricing_version="included-route",
-            billing_provider="openai-codex",
-            billing_mode="subscription_included",
-            api_call_count=4,
+            estimated_cost_usd=0.5,
+            actual_cost_usd=0.4,
+            api_call_count=1,
         )
-        db.create_session(session_id="empty", source="cli", model="unused")
+        db.record_llm_usage_event(
+            session_id="complete",
+            provider="openrouter",
+            model="actual-model",
+            input_tokens=100,
+            output_tokens=25,
+            cache_read_tokens=400,
+            cache_write_tokens=10,
+            reasoning_tokens=3,
+            estimated_cost_usd=0.5,
+            actual_cost_usd=0.4,
+            api_call_index=99,
+        )
 
-        inserted = db.backfill_llm_usage_events_from_sessions()
-        inserted_again = db.backfill_llm_usage_events_from_sessions()
+        assert db.backfill_llm_usage_events_from_sessions() == 0
+        assert self._synthetic_events(db, "complete") == []
+        assert db.last_backfill_report == {
+            "inserted_session_ids": [],
+            "updated_session_ids": [],
+            "deleted_session_ids": [],
+            "discrepancy_session_ids": [],
+            "discrepancies": [],
+        }
 
-        assert inserted == 1
-        assert inserted_again == 0
-        events = db.get_llm_usage_events(session_id="s1")
-        assert len(events) == 1
-        event = events[0]
+    def test_backfill_writes_one_residual_with_reconstructed_provenance(self, db):
+        db.create_session(session_id="partial", source="discord", model="scalar-model")
+        self._set_session_usage(
+            db,
+            "partial",
+            input_tokens=100,
+            output_tokens=25,
+            cache_read_tokens=400,
+            cache_write_tokens=10,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.8,
+            actual_cost_usd=0.6,
+            api_call_count=3,
+            billing_provider="openrouter",
+            billing_base_url="https://openrouter.ai/api/v1",
+            billing_mode="api",
+        )
+        db.record_llm_usage_event(
+            session_id="partial",
+            provider="openrouter",
+            model="actual-model",
+            billing_base_url="https://openrouter.ai/api/v1",
+            billing_mode="api",
+            input_tokens=40,
+            output_tokens=10,
+            cache_read_tokens=150,
+            cache_write_tokens=4,
+            reasoning_tokens=2,
+            estimated_cost_usd=0.3,
+            actual_cost_usd=0.2,
+            api_call_index=27,
+        )
+
+        assert db.backfill_llm_usage_events_from_sessions() == 1
+        synthetic = self._synthetic_events(db, "partial")
+        assert len(synthetic) == 1
+        event = synthetic[0]
+        assert event["input_tokens"] == 60
+        assert event["output_tokens"] == 15
+        assert event["cache_read_tokens"] == 250
+        assert event["cache_write_tokens"] == 6
+        assert event["reasoning_tokens"] == 5
+        assert event["estimated_cost_usd"] == pytest.approx(0.5)
+        assert event["actual_cost_usd"] == pytest.approx(0.4)
+        # The residual is a count of uncovered attempts, never a sum of the
+        # arbitrary per-process api_call_index values on real events.
+        assert event["api_call_index"] == 2
+        assert event["record_kind"] == "historical_aggregate"
+        assert event["usage_source"] == "reconstructed"
+        assert event["measurement_confidence"] == "reconstructed"
+        assert event["purpose"] == "historical_backfill"
         assert event["request_status"] == "approximate_session_backfill"
-        assert event["source"] == "discord"
-        assert event["provider"] == "openai-codex"
-        assert event["model"] == "gpt-5.5"
+        assert event["provider"] == "openrouter"
+        assert event["model"] == "actual-model"
+        assert event["latency_ms"] is None
+        assert event["error_class"] is None
+        assert db.last_backfill_report["inserted_session_ids"] == ["partial"]
+
+    def test_backfill_negative_residual_removes_synthetic_and_reports_warning(
+        self, db, caplog
+    ):
+        db.create_session(session_id="overlap", source="cli")
+        self._set_session_usage(db, "overlap", input_tokens=5, api_call_count=0)
+        db._conn.execute(
+            """INSERT INTO llm_usage_events (
+                   timestamp, session_id, input_tokens, request_status, created_at)
+               VALUES (?, ?, ?, 'approximate_session_backfill', ?)""",
+            (1.0, "overlap", 5, 1.0),
+        )
+        db.record_llm_usage_event(
+            session_id="overlap",
+            input_tokens=6,
+            api_call_index=999,
+        )
+
+        with caplog.at_level("WARNING"):
+            assert db.backfill_llm_usage_events_from_sessions() == 0
+
+        assert self._synthetic_events(db, "overlap") == []
+        report = db.last_backfill_report
+        assert report["deleted_session_ids"] == ["overlap"]
+        assert report["discrepancy_session_ids"] == ["overlap"]
+        assert report["discrepancies"] == [
+            {
+                "session_id": "overlap",
+                "negative_buckets": {
+                    "input_tokens": -1,
+                    "api_call_count": -1,
+                },
+            }
+        ]
+        assert "overlap" in caplog.text
+        assert "input_tokens=-1" in caplog.text
+        assert "api_call_count=-1" in caplog.text
+
+    def test_backfill_reports_real_usage_against_zero_session_aggregate(
+        self, db, caplog
+    ):
+        db.create_session(session_id="zero-aggregate", source="cli")
+        db.record_llm_usage_event(session_id="zero-aggregate", output_tokens=1)
+
+        with caplog.at_level("WARNING"):
+            assert db.backfill_llm_usage_events_from_sessions() == 0
+
+        assert db.last_backfill_report["discrepancy_session_ids"] == [
+            "zero-aggregate"
+        ]
+        assert db.last_backfill_report["discrepancies"][0]["negative_buckets"] == {
+            "output_tokens": -1,
+            "api_call_count": -1,
+        }
+        assert "zero-aggregate" in caplog.text
+
+    def test_backfill_rerun_is_idempotent_and_updates_then_removes_residual(self, db):
+        db.create_session(session_id="changing", source="cli", model="legacy-model")
+        self._set_session_usage(
+            db,
+            "changing",
+            input_tokens=100,
+            output_tokens=20,
+            api_call_count=2,
+        )
+
+        assert db.backfill_llm_usage_events_from_sessions() == 1
+        assert db.backfill_llm_usage_events_from_sessions() == 0
+        assert len(self._synthetic_events(db, "changing")) == 1
+
+        db.record_llm_usage_event(
+            session_id="changing", input_tokens=40, output_tokens=5, api_call_index=41
+        )
+        assert db.backfill_llm_usage_events_from_sessions() == 0
+        synthetic = self._synthetic_events(db, "changing")
+        assert len(synthetic) == 1
+        assert synthetic[0]["input_tokens"] == 60
+        assert synthetic[0]["output_tokens"] == 15
+        assert synthetic[0]["api_call_index"] == 1
+        assert db.last_backfill_report["updated_session_ids"] == ["changing"]
+
+        db.record_llm_usage_event(
+            session_id="changing", input_tokens=60, output_tokens=15, api_call_index=1
+        )
+        assert db.backfill_llm_usage_events_from_sessions() == 0
+        assert self._synthetic_events(db, "changing") == []
+        assert db.last_backfill_report["deleted_session_ids"] == ["changing"]
+
+    def test_backfill_mixed_real_routes_leaves_residual_route_unattributed(self, db):
+        db.create_session(session_id="mixed", source="discord", model="scalar-model")
+        self._set_session_usage(
+            db,
+            "mixed",
+            input_tokens=100,
+            api_call_count=3,
+            billing_provider="scalar-provider",
+            billing_base_url="https://scalar.invalid/v1",
+            billing_mode="scalar-mode",
+        )
+        db.record_llm_usage_event(
+            session_id="mixed",
+            provider="provider-a",
+            model="model-a",
+            billing_base_url="https://a.invalid/v1",
+            billing_mode="api-a",
+            input_tokens=20,
+        )
+        db.record_llm_usage_event(
+            session_id="mixed",
+            provider="provider-b",
+            model="model-b",
+            billing_base_url="https://b.invalid/v1",
+            billing_mode="api-b",
+            input_tokens=30,
+        )
+
+        assert db.backfill_llm_usage_events_from_sessions() == 1
+        event = self._synthetic_events(db, "mixed")[0]
+        assert event["input_tokens"] == 50
+        assert event["api_call_index"] == 1
+        assert event["provider"] is None
+        assert event["model"] is None
+        assert event["billing_base_url"] is None
+        assert event["billing_mode"] is None
+
+    def test_backfill_normalizes_legacy_approximate_rows_without_counting_them(self, db):
+        db.create_session(session_id="legacy", source="discord", model="legacy-model")
+        self._set_session_usage(
+            db,
+            "legacy",
+            input_tokens=100,
+            output_tokens=25,
+            api_call_count=4,
+            billing_provider="legacy-provider",
+        )
+        for tokens in (100, 999):
+            db._conn.execute(
+                """INSERT INTO llm_usage_events (
+                       timestamp, session_id, provider, model, input_tokens,
+                       output_tokens, request_status, api_call_index, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'approximate_session_backfill', ?, ?)""",
+                (1.0, "legacy", "wrong-provider", "wrong-model", tokens, 1, 99, 1.0),
+            )
+
+        assert db.backfill_llm_usage_events_from_sessions() == 0
+        synthetic = self._synthetic_events(db, "legacy")
+        assert len(synthetic) == 1
+        event = synthetic[0]
         assert event["input_tokens"] == 100
         assert event["output_tokens"] == 25
-        assert event["cache_read_tokens"] == 400
-        assert event["reasoning_tokens"] == 3
         assert event["api_call_index"] == 4
+        assert event["record_kind"] == "historical_aggregate"
+        assert event["usage_source"] == "reconstructed"
+        assert event["measurement_confidence"] == "reconstructed"
+        assert event["purpose"] == "historical_backfill"
+        assert event["provider"] == "legacy-provider"
+        assert event["model"] == "legacy-model"
+        assert db.last_backfill_report["updated_session_ids"] == ["legacy"]
+        assert db.last_backfill_report["deleted_session_ids"] == ["legacy"]
+
+    def test_backfill_does_not_invent_cost_when_real_cost_coverage_is_incomplete(self, db):
+        db.create_session(session_id="unknown-cost", source="cli")
+        self._set_session_usage(
+            db,
+            "unknown-cost",
+            input_tokens=10,
+            estimated_cost_usd=1.0,
+            actual_cost_usd=0.8,
+            api_call_count=2,
+        )
+        db.record_llm_usage_event(
+            session_id="unknown-cost",
+            input_tokens=5,
+            estimated_cost_usd=0.25,
+            actual_cost_usd=None,
+        )
+        db.record_llm_usage_event(
+            session_id="unknown-cost",
+            input_tokens=0,
+            estimated_cost_usd=None,
+            actual_cost_usd=0.1,
+        )
+
+        assert db.backfill_llm_usage_events_from_sessions() == 1
+        event = self._synthetic_events(db, "unknown-cost")[0]
+        assert event["input_tokens"] == 5
+        assert event["estimated_cost_usd"] is None
+        assert event["actual_cost_usd"] is None
+        assert event["cost_status"] == "unknown"
+
+    def test_backfill_tolerates_tiny_negative_cost_noise(self, db):
+        db.create_session(session_id="float-noise", source="cli")
+        self._set_session_usage(
+            db,
+            "float-noise",
+            estimated_cost_usd=0.3,
+            api_call_count=1,
+        )
+        db.record_llm_usage_event(
+            session_id="float-noise",
+            estimated_cost_usd=0.30000000000000004,
+        )
+
+        assert db.backfill_llm_usage_events_from_sessions() == 0
+        assert db.last_backfill_report["discrepancies"] == []
+
+    def test_pre_provenance_fields_database_migrates_and_classifies_rows(self, tmp_path):
+        db_path = tmp_path / "pre_provenance.db"
+        legacy_db = SessionDB(db_path=db_path)
+        legacy_db.create_session(session_id="ordinary", source="cli")
+        legacy_db.create_session(session_id="approximate", source="cli")
+        legacy_db.record_llm_usage_event(session_id="ordinary", input_tokens=1)
+        legacy_db.record_llm_usage_event(
+            session_id="approximate",
+            input_tokens=2,
+            request_status="approximate_session_backfill",
+        )
+        legacy_db.close()
+
+        raw = sqlite3.connect(db_path)
+        for column in ("record_kind", "usage_source", "measurement_confidence"):
+            raw.execute(f"ALTER TABLE llm_usage_events DROP COLUMN {column}")
+        raw.commit()
+        raw.close()
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            columns = {
+                row["name"]
+                for row in migrated._conn.execute(
+                    "PRAGMA table_info(llm_usage_events)"
+                ).fetchall()
+            }
+            assert {
+                "record_kind",
+                "usage_source",
+                "measurement_confidence",
+            }.issubset(columns)
+            ordinary = migrated.get_llm_usage_events(session_id="ordinary")[0]
+            assert ordinary["record_kind"] == "api_attempt"
+            assert ordinary["usage_source"] == "provider_reported"
+            assert ordinary["measurement_confidence"] == "exact"
+            approximate = migrated.get_llm_usage_events(session_id="approximate")[0]
+            assert approximate["record_kind"] == "historical_aggregate"
+            assert approximate["usage_source"] == "reconstructed"
+            assert approximate["measurement_confidence"] == "reconstructed"
+            assert approximate["purpose"] == "historical_backfill"
+        finally:
+            migrated.close()
 
     def test_update_token_counts_preserves_existing_model(self, db):
         db.create_session(session_id="s1", source="cli", model="anthropic/claude-opus-4.6")

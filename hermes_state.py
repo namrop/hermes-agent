@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -228,6 +228,9 @@ CREATE TABLE IF NOT EXISTS llm_usage_events (
     session_id TEXT REFERENCES sessions(id),
     source TEXT,
     purpose TEXT DEFAULT 'main',
+    record_kind TEXT DEFAULT 'api_attempt',
+    usage_source TEXT DEFAULT 'provider_reported',
+    measurement_confidence TEXT DEFAULT 'exact',
     provider TEXT,
     model TEXT,
     api_mode TEXT,
@@ -368,6 +371,7 @@ class SessionDB:
 
         self._lock = threading.Lock()
         self._write_count = 0
+        self.last_backfill_report: Dict[str, Any] = self._empty_backfill_report()
         try:
             self._conn = sqlite3.connect(
                 str(self.db_path),
@@ -603,6 +607,25 @@ class SessionDB:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Legacy synthetic rows predate explicit provenance columns. The
+        # request-status marker remains the compatibility discriminator, so
+        # classify them after declarative reconciliation on every open. This
+        # also repairs databases whose version advanced before these columns.
+        cursor.execute(
+            """UPDATE llm_usage_events
+               SET record_kind = 'historical_aggregate',
+                   usage_source = 'reconstructed',
+                   measurement_confidence = 'reconstructed',
+                   purpose = 'historical_backfill'
+               WHERE request_status = 'approximate_session_backfill'
+                 AND (
+                     record_kind IS NOT 'historical_aggregate'
+                     OR usage_source IS NOT 'reconstructed'
+                     OR measurement_confidence IS NOT 'reconstructed'
+                     OR purpose IS NOT 'historical_backfill'
+                 )"""
+        )
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -1296,73 +1319,231 @@ class SessionDB:
                 ).fetchall()
         return [dict(row) for row in rows]
 
-    def backfill_llm_usage_events_from_sessions(self) -> int:
-        """Create one approximate LLM usage event for each historical session.
+    @staticmethod
+    def _empty_backfill_report() -> Dict[str, Any]:
+        """Return a fresh structured report for one historical backfill run."""
+        return {
+            "inserted_session_ids": [],
+            "updated_session_ids": [],
+            "deleted_session_ids": [],
+            "discrepancy_session_ids": [],
+            "discrepancies": [],
+        }
 
-        This is a lossy migration path for sessions that predate
-        ``llm_usage_events``.  It preserves cumulative session token/cost
-        buckets as a single synthetic event, marked by request_status so
-        analytics can distinguish it from true per-call rows.
+    def backfill_llm_usage_events_from_sessions(self) -> int:
+        """Reconcile one synthetic *residual* event per historical session.
+
+        Real event facts are never rewritten. Their sums are subtracted from
+        compatibility session aggregates and only the uncovered remainder is
+        represented. The integer return value remains the number of newly
+        inserted rows; update/removal/discrepancy details are exposed through
+        :attr:`last_backfill_report`.
         """
         now = time.time()
+        cost_tolerance = 1e-9
+        token_columns = (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+        )
 
         def _do(conn):
-            rows = conn.execute(
+            report = self._empty_backfill_report()
+            sessions = conn.execute(
                 """SELECT * FROM sessions s
-                   WHERE (
-                       COALESCE(s.input_tokens, 0) > 0
-                       OR COALESCE(s.output_tokens, 0) > 0
-                       OR COALESCE(s.cache_read_tokens, 0) > 0
-                       OR COALESCE(s.cache_write_tokens, 0) > 0
-                       OR COALESCE(s.reasoning_tokens, 0) > 0
-                       OR COALESCE(s.api_call_count, 0) > 0
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM llm_usage_events e
-                       WHERE e.session_id = s.id
-                         AND e.request_status = 'approximate_session_backfill'
-                   )"""
+                   WHERE COALESCE(s.input_tokens, 0) != 0
+                      OR COALESCE(s.output_tokens, 0) != 0
+                      OR COALESCE(s.cache_read_tokens, 0) != 0
+                      OR COALESCE(s.cache_write_tokens, 0) != 0
+                      OR COALESCE(s.reasoning_tokens, 0) != 0
+                      OR COALESCE(s.api_call_count, 0) != 0
+                      OR s.estimated_cost_usd IS NOT NULL
+                      OR s.actual_cost_usd IS NOT NULL
+                      OR EXISTS (
+                          SELECT 1 FROM llm_usage_events e
+                          WHERE e.session_id = s.id
+                      )
+                   ORDER BY s.id"""
             ).fetchall()
             inserted = 0
-            for row in rows:
-                provider = row["billing_provider"] or "unknown"
-                event_ts = row["ended_at"] or row["started_at"] or now
-                conn.execute(
-                    """INSERT INTO llm_usage_events (
-                           timestamp, session_id, source, provider, model, api_mode,
-                           billing_base_url, billing_mode, input_tokens, output_tokens,
-                           cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                           estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, request_status, api_call_index, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        event_ts,
-                        row["id"],
-                        row["source"],
-                        provider,
-                        row["model"],
-                        None,
-                        row["billing_base_url"],
-                        row["billing_mode"],
-                        row["input_tokens"] or 0,
-                        row["output_tokens"] or 0,
-                        row["cache_read_tokens"] or 0,
-                        row["cache_write_tokens"] or 0,
-                        row["reasoning_tokens"] or 0,
-                        row["estimated_cost_usd"],
-                        row["actual_cost_usd"],
-                        row["cost_status"],
-                        row["cost_source"],
-                        row["pricing_version"],
-                        "approximate_session_backfill",
-                        row["api_call_count"] or None,
-                        now,
-                    ),
-                )
-                inserted += 1
-            return inserted
 
-        return int(self._execute_write(_do) or 0)
+            for session in sessions:
+                session_id = session["id"]
+                all_events = conn.execute(
+                    """SELECT * FROM llm_usage_events
+                       WHERE session_id = ? ORDER BY id""",
+                    (session_id,),
+                ).fetchall()
+                synthetic = [
+                    event
+                    for event in all_events
+                    if event["request_status"] == "approximate_session_backfill"
+                    or event["record_kind"] == "historical_aggregate"
+                ]
+                synthetic_ids = {event["id"] for event in synthetic}
+                real_events = [
+                    event for event in all_events if event["id"] not in synthetic_ids
+                ]
+
+                residuals = {
+                    column: int(session[column] or 0)
+                    - sum(int(event[column] or 0) for event in real_events)
+                    for column in token_columns
+                }
+                real_attempt_count = sum(
+                    1
+                    for event in real_events
+                    if (event["record_kind"] or "api_attempt") == "api_attempt"
+                )
+                residuals["api_call_count"] = (
+                    int(session["api_call_count"] or 0) - real_attempt_count
+                )
+                negative: Dict[str, Any] = {
+                    name: value for name, value in residuals.items() if value < 0
+                }
+
+                cost_residuals: Dict[str, Optional[float]] = {}
+                for cost_column in ("estimated_cost_usd", "actual_cost_usd"):
+                    session_cost = session[cost_column]
+                    real_costs = [event[cost_column] for event in real_events]
+                    # A scalar cost can be retained when there are no real
+                    # events. With real events, subtraction is safe only when
+                    # every event reports that cost dimension.
+                    if session_cost is None:
+                        cost_residuals[cost_column] = None
+                    elif real_costs and any(value is None for value in real_costs):
+                        cost_residuals[cost_column] = None
+                    else:
+                        value = float(session_cost) - sum(
+                            float(event_cost or 0.0) for event_cost in real_costs
+                        )
+                        if value < -cost_tolerance:
+                            negative[cost_column] = value
+                        cost_residuals[cost_column] = (
+                            0.0 if abs(value) <= cost_tolerance else value
+                        )
+
+                def _delete_synthetic_rows() -> None:
+                    if not synthetic:
+                        return
+                    conn.executemany(
+                        "DELETE FROM llm_usage_events WHERE id = ?",
+                        [(event["id"],) for event in synthetic],
+                    )
+                    report["deleted_session_ids"].append(session_id)
+
+                if negative:
+                    _delete_synthetic_rows()
+                    report["discrepancy_session_ids"].append(session_id)
+                    report["discrepancies"].append(
+                        {"session_id": session_id, "negative_buckets": negative}
+                    )
+                    bucket_summary = ", ".join(
+                        f"{name}={value}" for name, value in negative.items()
+                    )
+                    logger.warning(
+                        "Historical usage backfill discrepancy for session %s: "
+                        "negative residual buckets (%s); synthetic row removed",
+                        session_id,
+                        bucket_summary,
+                    )
+                    continue
+
+                has_residual = any(value > 0 for value in residuals.values()) or any(
+                    value is not None and value > cost_tolerance
+                    for value in cost_residuals.values()
+                )
+                if not has_residual:
+                    _delete_synthetic_rows()
+                    continue
+
+                routes = {
+                    (
+                        event["provider"],
+                        event["model"],
+                        event["billing_base_url"],
+                        event["billing_mode"],
+                    )
+                    for event in real_events
+                }
+                if not routes:
+                    route = (
+                        session["billing_provider"],
+                        session["model"],
+                        session["billing_base_url"],
+                        session["billing_mode"],
+                    )
+                elif len(routes) == 1:
+                    route = next(iter(routes))
+                else:
+                    # A scalar session route cannot identify which observed
+                    # provider/model path owns the missing aggregate.
+                    route = (None, None, None, None)
+
+                costs_complete = all(
+                    session[column] is None or cost_residuals[column] is not None
+                    for column in cost_residuals
+                )
+                values = {
+                    "timestamp": session["ended_at"] or session["started_at"] or now,
+                    "source": session["source"],
+                    "purpose": "historical_backfill",
+                    "record_kind": "historical_aggregate",
+                    "usage_source": "reconstructed",
+                    "measurement_confidence": "reconstructed",
+                    "provider": route[0],
+                    "model": route[1],
+                    "api_mode": None,
+                    "billing_base_url": route[2],
+                    "billing_mode": route[3],
+                    **{column: residuals[column] for column in token_columns},
+                    **cost_residuals,
+                    "cost_status": "reconstructed" if costs_complete else "unknown",
+                    "cost_source": "reconstructed_session_residual",
+                    "pricing_version": session["pricing_version"],
+                    "latency_ms": None,
+                    "request_status": "approximate_session_backfill",
+                    "error_class": None,
+                    # Compatibility storage for the historical aggregate's
+                    # uncovered call count. record_kind prevents this from
+                    # being counted as one API attempt by event analytics.
+                    "api_call_index": residuals["api_call_count"] or None,
+                }
+
+                if synthetic:
+                    keeper = synthetic[0]
+                    extras = synthetic[1:]
+                    if extras:
+                        conn.executemany(
+                            "DELETE FROM llm_usage_events WHERE id = ?",
+                            [(event["id"],) for event in extras],
+                        )
+                        report["deleted_session_ids"].append(session_id)
+                    if any(keeper[name] != value for name, value in values.items()):
+                        assignments = ", ".join(f"{name} = ?" for name in values)
+                        conn.execute(
+                            f"UPDATE llm_usage_events SET {assignments} WHERE id = ?",
+                            (*values.values(), keeper["id"]),
+                        )
+                        report["updated_session_ids"].append(session_id)
+                else:
+                    columns = ("session_id", *values.keys(), "created_at")
+                    placeholders = ", ".join("?" for _ in columns)
+                    conn.execute(
+                        f"INSERT INTO llm_usage_events ({', '.join(columns)}) "
+                        f"VALUES ({placeholders})",
+                        (session_id, *values.values(), now),
+                    )
+                    inserted += 1
+                    report["inserted_session_ids"].append(session_id)
+
+            return inserted, report
+
+        inserted, report = self._execute_write(_do)
+        self.last_backfill_report = report
+        return int(inserted or 0)
 
     def ensure_session(
         self,
