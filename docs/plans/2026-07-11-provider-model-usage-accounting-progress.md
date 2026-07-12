@@ -4,8 +4,8 @@
 
 ## Current status
 
-- State: implementation in progress
-- Active task: Task 10 — final integration review and handoff
+- State: implementation complete
+- Active task: none — Task 10 handoff complete
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -36,7 +36,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 7. Dashboard API cutover | completed | `00ffd02ca` | RED/GREEN complete; quality APPROVED; 41 combined focused tests; web build PASS | Event-time daily windows and route truth |
 | 8. CLI/gateway `/usage` cutover | completed | `9bb3c633a` | RED/GREEN complete; quality APPROVED; 429 combined focused tests | Atomic persisted report with full mixed routes |
 | 9. Cross-harness contract docs | completed | `1b78f7637` | six JSON examples parse; AI-writing residue LOW; spec review APPROVED | Quota and billing remain separate |
-| 10. Integration review/handoff | pending | — | — | No push/deploy without approval |
+| 10. Integration review/handoff | completed | `16944f86c` | 1,396 run-agent PASS; 244 state PASS; adapter regressions PASS; final blocker review APPROVED | Every harness-visible transport attempt accounted; no push/deploy |
 
 ## Evidence captured before implementation
 
@@ -446,6 +446,32 @@ Append each RED and GREEN command here with exit code and concise result.
   LOW (`0.81 / 1000 words`); final specification review APPROVED.
 - Commit: `1b78f7637` (`docs: define cross-harness usage accounting contract`).
 
+### Task 10
+
+- Main-loop accounting now persists every outer retry and every inner streaming
+  transport attempt with a frozen provider/model/API-mode/base-URL route,
+  per-attempt latency, terminal request status, error class, and unique event ID.
+- Streaming receipts are created when transport starts, so interruption during a
+  later inner retry cannot erase the active attempt. Stale-detector terminations
+  remain timeouts, partial recovery stubs are not counted as new transports, and
+  returned usage is persisted before local finish-reason processing.
+- OpenAI, Anthropic, AnthropicBedrock, and boto3 Bedrock runtime clients disable
+  opaque SDK retries. Retry ownership therefore stays in Hermes, where each
+  physical request has an observable accounting boundary.
+- Process-local counters advance only after the corresponding durable event
+  succeeds; recorder failures remain non-blocking and emit WARNING evidence.
+  Usage normalization is attempted once and cannot trigger another billable
+  provider request when a provider returns an unfamiliar usage shape.
+- Historical residual migration now performs marker check, reconciliation, and
+  marker insertion in one `BEGIN IMMEDIATE` transaction. Concurrent initializers
+  serialize before checking the marker, and event rows are iterated in bounded
+  per-session groups rather than loaded into one unbounded Python ledger list.
+- Regression verification: `tests/run_agent/` — `1396 passed, 3 skipped`;
+  `tests/test_hermes_state.py` — `244 passed`; focused Anthropic, Bedrock,
+  streaming, persistence, and client-retry tests PASS; Python compilation and
+  `git diff --check` PASS. Final blocking review found no HIGH/MEDIUM issues.
+- Commit: `16944f86c` (`feat: persist every provider transport attempt`).
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -575,7 +601,10 @@ Append each RED and GREEN command here with exit code and concise result.
    resource-namespace or lighter-teardown fix.
 3. Gateway agent recreation resets in-memory counters, so `/usage` cannot trust the resident object for full-session totals.
 4. `api_call_index` resets per agent instance and is not a unique key.
-5. Usage persistence currently occurs after response-control branches, so usage-bearing truncated/invalid responses may be missed.
+5. A usage-recorder failure deliberately does not block model-response recovery;
+   the missing durable event is warned with identifiers and process-local
+   counters do not advance, but automatic replay of that accounting write is
+   deferred to a later durable outbox design.
 6. Backfill discrepancy reports are in-memory per run; durable reconciliation reporting still belongs in a later operator/reporting surface.
 7. Future SQLite schema additions must remain backward-compatible with fixture databases.
 8. The shared worktree already contains unrelated dirty model-picker changes.
@@ -615,7 +644,15 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 5 canonical event-derived read models and conservative
   invalid/unattributed dimension policy are complete through `461ac1a33`;
   quality APPROVED.
-- Task 6 Insights cutover is green and quality APPROVED in the current commit:
-  event-derived provider/model/token/cost and source rows, session-derived
-  activity only, constant three ledger scans, and explicit historical/invalid/
-  unknown coverage. Task 7 dashboard analytics is active next.
+- Task 6 Insights cutover is complete in `96c7f193e`; Task 7 dashboard API
+  cutover is complete in `00ffd02ca`; Task 8 persisted `/usage` cutover is
+  complete in `9bb3c633a`; and Task 9's cross-harness contract is complete in
+  `1b78f7637`.
+- Task 10 integration closure is complete in `16944f86c`: every Hermes-owned
+  transport retry has a durable attempt boundary, opaque SDK retries are
+  disabled, process counters follow successful ledger writes, and the one-time
+  historical migration is atomic under concurrent initialization.
+- Final verification: `1396 passed, 3 skipped` for `tests/run_agent/`; `244
+  passed` for `tests/test_hermes_state.py`; focused adapter/client regressions,
+  Python compilation, and diff checks PASS; final blocker review APPROVED.
+- No push, deployment, gateway restart, or live database mutation was performed.
