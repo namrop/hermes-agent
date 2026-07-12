@@ -619,6 +619,7 @@ def _build_anthropic_client_with_bearer_hook(
     kwargs = {
         "timeout": timeout_obj,
         "http_client": http_client,
+        "max_retries": 0,
         # The SDK requires *something* for api_key/auth_token. Our
         # event hook overrides Authorization per request so this value
         # is never sent. The sentinel string makes accidental leaks
@@ -700,6 +701,7 @@ def build_anthropic_client(
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
     kwargs = {
         "timeout": Timeout(timeout=float(_read_timeout), connect=10.0),
+        "max_retries": 0,
     }
     if normalized_base_url:
         # Azure Anthropic endpoints require an ``api-version`` query parameter.
@@ -795,6 +797,7 @@ def build_anthropic_bedrock_client(region: str):
     return _anthropic_sdk.AnthropicBedrock(
         aws_region=region,
         timeout=Timeout(timeout=900.0, connect=10.0),
+        max_retries=0,
         default_headers={"anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])},
     )
 

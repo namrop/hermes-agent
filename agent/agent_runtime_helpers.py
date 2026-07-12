@@ -1291,6 +1291,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         keepalive_http = agent._build_keepalive_http_client(client_kwargs.get("base_url", ""))
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
+    # Hermes owns retry accounting. SDK-level retries are opaque and would
+    # collapse multiple physical transports into one usage event.
+    client_kwargs.setdefault("max_retries", 0)
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)

@@ -943,8 +943,138 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        def _persist_provider_attempt(
+            *,
+            response_obj,
+            route,
+            duration_s: float,
+            request_status: str,
+            error_class: str | None = None,
+        ):
+            """Persist one observable transport attempt without blocking recovery."""
+            next_api_call_index = agent.session_api_calls + 1
+            canonical = None
+            cost = None
+            usage_obj = getattr(response_obj, "usage", None) if response_obj else None
+            if usage_obj is not None:
+                try:
+                    canonical = normalize_usage(
+                        usage_obj,
+                        provider=route.provider,
+                        api_mode=route.api_mode,
+                    )
+                    cost = estimate_usage_cost(
+                        route.model,
+                        canonical,
+                        provider=route.provider,
+                        base_url=route.base_url,
+                        api_key=getattr(agent, "api_key", ""),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Usage normalization failed for provider attempt "
+                        "(session=%s provider=%s model=%s): %s",
+                        agent.session_id,
+                        route.provider,
+                        route.model,
+                        exc,
+                        exc_info=True,
+                    )
+
+            def _apply_in_memory_counters() -> None:
+                agent.session_api_calls = next_api_call_index
+                if canonical is not None:
+                    agent.session_prompt_tokens += canonical.prompt_tokens
+                    agent.session_completion_tokens += canonical.output_tokens
+                    agent.session_total_tokens += canonical.total_tokens
+                    agent.session_input_tokens += canonical.input_tokens
+                    agent.session_output_tokens += canonical.output_tokens
+                    agent.session_cache_read_tokens += canonical.cache_read_tokens
+                    agent.session_cache_write_tokens += canonical.cache_write_tokens
+                    agent.session_reasoning_tokens += canonical.reasoning_tokens
+                if cost is not None:
+                    if cost.amount_usd is not None:
+                        agent.session_estimated_cost_usd += float(cost.amount_usd)
+                    agent.session_cost_status = cost.status
+                    agent.session_cost_source = cost.source
+
+            usage_recorder = getattr(agent, "_usage_recorder", None)
+            if usage_recorder is None or not agent.session_id:
+                _apply_in_memory_counters()
+                return canonical, cost
+
+            event_uid = f"hermes:{uuid.uuid4()}"
+            input_tokens = canonical.input_tokens if canonical is not None else 0
+            output_tokens = canonical.output_tokens if canonical is not None else 0
+            cache_read_tokens = (
+                canonical.cache_read_tokens if canonical is not None else 0
+            )
+            cache_write_tokens = (
+                canonical.cache_write_tokens if canonical is not None else 0
+            )
+            reasoning_tokens = canonical.reasoning_tokens if canonical is not None else 0
+            estimated_cost = (
+                float(cost.amount_usd)
+                if cost is not None and cost.amount_usd is not None
+                else None
+            )
+            cost_status = cost.status if cost is not None else "unknown"
+            billing_mode = (
+                "subscription_included" if cost_status == "included" else None
+            )
+            total_tokens = (
+                canonical.total_tokens if canonical is not None else 0
+            )
+            try:
+                usage_recorder.record_usage_and_rollup(
+                    event_uid=event_uid,
+                    session_id=agent.session_id,
+                    source=getattr(agent, "platform", None),
+                    purpose=getattr(agent, "usage_purpose", "main"),
+                    provider=route.provider,
+                    model=route.model,
+                    api_mode=route.api_mode,
+                    billing_base_url=route.base_url,
+                    billing_mode=billing_mode,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    estimated_cost_usd=estimated_cost,
+                    cost_status=cost_status,
+                    cost_source=cost.source if cost is not None else None,
+                    pricing_version=(
+                        cost.pricing_version if cost is not None else None
+                    ),
+                    latency_ms=max(0, int(duration_s * 1000)),
+                    request_status=request_status,
+                    error_class=error_class,
+                    api_call_index=next_api_call_index,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Usage accounting persistence failed "
+                    "(session=%s, event_uid=%s, tokens=%d): %s",
+                    agent.session_id,
+                    event_uid,
+                    total_tokens,
+                    exc,
+                    exc_info=True,
+                )
+            else:
+                _apply_in_memory_counters()
+            return canonical, cost
 
         while retry_count < max_retries:
+            dispatch_route = None
+            dispatch_transport = None
+            attempt_started = False
+            attempt_persisted = False
+            attempt_start_time = None
+            attempt_canonical_usage = None
+            stream_success_receipt = None
+            response = None
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -1092,14 +1222,62 @@ def run_conversation(
                     api_mode=agent.api_mode,
                     base_url=agent.base_url,
                 )
+                dispatch_transport = agent._get_transport()
+                attempt_start_time = time.time()
+                attempt_started = True
                 if _use_streaming:
-                    response = agent._interruptible_streaming_api_call(
-                        api_kwargs, on_first_delta=_stop_spinner
-                    )
+                    stream_attempt_receipts = []
+                    try:
+                        response = agent._interruptible_streaming_api_call(
+                            api_kwargs,
+                            on_first_delta=_stop_spinner,
+                            attempt_receipts=stream_attempt_receipts,
+                        )
+                    finally:
+                        # The streaming helper may perform multiple physical
+                        # transports inside one outer retry iteration. Persist
+                        # failed inner attempts here; defer the final successful
+                        # receipt until response validation determines its true
+                        # terminal status.
+                        for receipt in list(stream_attempt_receipts):
+                            receipt_status = (
+                                receipt.get("request_status")
+                                or receipt.get("forced_status")
+                                or "error"
+                            )
+                            receipt_duration = receipt.get("duration_s") or max(
+                                0.0, time.time() - receipt.get("started_at", time.time())
+                            )
+                            if receipt_status == "ok":
+                                stream_success_receipt = receipt
+                                continue
+                            _persist_provider_attempt(
+                                response_obj=receipt["response_obj"],
+                                route=dispatch_route,
+                                duration_s=receipt_duration,
+                                request_status=receipt_status,
+                                error_class=(
+                                    receipt.get("error_class")
+                                    or (
+                                        "InterruptedError"
+                                        if receipt_status == "cancelled"
+                                        else "stream_transport_error"
+                                    )
+                                ),
+                            )
+                        if stream_attempt_receipts and stream_success_receipt is None:
+                            # A partial-stream recovery stub is not another
+                            # provider transport. Its failed transport receipt
+                            # above is the complete accounting record.
+                            attempt_persisted = True
                 else:
                     response = agent._interruptible_api_call(api_kwargs)
-                
-                api_duration = time.time() - api_start_time
+
+                api_duration = (
+                    stream_success_receipt["duration_s"]
+                    if stream_success_receipt is not None
+                    else time.time() - attempt_start_time
+                )
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
@@ -1120,8 +1298,8 @@ def run_conversation(
                 # Validate response shape before proceeding
                 response_invalid = False
                 error_details = []
-                if agent.api_mode == "codex_responses":
-                    _ct_v = agent._get_transport()
+                if dispatch_route.api_mode == "codex_responses":
+                    _ct_v = dispatch_transport
                     if not _ct_v.validate_response(response):
                         if response is None:
                             response_invalid = True
@@ -1168,16 +1346,16 @@ def run_conversation(
                                     )
                                     response_invalid = True
                                     error_details.append("response.output is empty")
-                elif agent.api_mode == "anthropic_messages":
-                    _tv = agent._get_transport()
+                elif dispatch_route.api_mode == "anthropic_messages":
+                    _tv = dispatch_transport
                     if not _tv.validate_response(response):
                         response_invalid = True
                         if response is None:
                             error_details.append("response is None")
                         else:
                             error_details.append("response.content invalid (not a non-empty list)")
-                elif agent.api_mode == "bedrock_converse":
-                    _btv = agent._get_transport()
+                elif dispatch_route.api_mode == "bedrock_converse":
+                    _btv = dispatch_transport
                     if not _btv.validate_response(response):
                         response_invalid = True
                         if response is None:
@@ -1185,7 +1363,7 @@ def run_conversation(
                         else:
                             error_details.append("Bedrock response invalid (no output or choices)")
                 else:
-                    _ctv = agent._get_transport()
+                    _ctv = dispatch_transport
                     if not _ctv.validate_response(response):
                         response_invalid = True
                         if response is None:
@@ -1198,6 +1376,36 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    _response_status = str(
+                        getattr(response, "status", "") or ""
+                    ).strip().lower()
+                    _response_error = str(
+                        getattr(response, "error", "") or ""
+                    ).lower()
+                    _invalid_detail_text = " ".join(error_details).lower()
+                    if _response_status in {"cancelled", "canceled"}:
+                        _invalid_request_status = "cancelled"
+                        _invalid_error_class = "response_cancelled"
+                    elif (
+                        _response_status in {"timeout", "timed_out"}
+                        or "timeout" in _response_error
+                        or "timed out" in _response_error
+                        or "timeout" in _invalid_detail_text
+                        or "timed out" in _invalid_detail_text
+                    ):
+                        _invalid_request_status = "timeout"
+                        _invalid_error_class = "response_timeout"
+                    else:
+                        _invalid_request_status = "error"
+                        _invalid_error_class = "invalid_response"
+                    _persist_provider_attempt(
+                        response_obj=response,
+                        route=dispatch_route,
+                        duration_s=api_duration,
+                        request_status=_invalid_request_status,
+                        error_class=_invalid_error_class,
+                    )
+                    attempt_persisted = True
                     # Stop spinner before printing error messages
                     if thinking_spinner:
                         thinking_spinner.stop("(´;ω;`) oops, retrying...")
@@ -1331,8 +1539,21 @@ def run_conversation(
                             )
                     continue  # Retry the API call
 
+                # Persist the validated provider response before any local
+                # finish-reason mapping or normalization can fail. A local
+                # post-processing error must not erase returned usage or turn
+                # a successful transport into another billable retry.
+                if not attempt_persisted:
+                    attempt_canonical_usage, _ = _persist_provider_attempt(
+                        response_obj=response,
+                        route=dispatch_route,
+                        duration_s=api_duration,
+                        request_status="ok",
+                    )
+                    attempt_persisted = True
+
                 # Check finish_reason before proceeding
-                if agent.api_mode == "codex_responses":
+                if dispatch_route.api_mode == "codex_responses":
                     status = getattr(response, "status", None)
                     incomplete_details = getattr(response, "incomplete_details", None)
                     incomplete_reason = None
@@ -1344,17 +1565,16 @@ def run_conversation(
                         finish_reason = "length"
                     else:
                         finish_reason = "stop"
-                elif agent.api_mode == "anthropic_messages":
-                    _tfr = agent._get_transport()
-                    finish_reason = _tfr.map_finish_reason(response.stop_reason)
-                elif agent.api_mode == "bedrock_converse":
+                elif dispatch_route.api_mode == "anthropic_messages":
+                    finish_reason = dispatch_transport.map_finish_reason(
+                        response.stop_reason
+                    )
+                elif dispatch_route.api_mode == "bedrock_converse":
                     # Bedrock response already normalized at dispatch — use transport
-                    _bt_fr = agent._get_transport()
-                    _bedrock_result = _bt_fr.normalize_response(response)
+                    _bedrock_result = dispatch_transport.normalize_response(response)
                     finish_reason = _bedrock_result.finish_reason
                 else:
-                    _cc_fr = agent._get_transport()
-                    _finish_result = _cc_fr.normalize_response(response)
+                    _finish_result = dispatch_transport.normalize_response(response)
                     finish_reason = _finish_result.finish_reason
                     assistant_message = _finish_result
                     if agent._should_treat_stop_as_truncated(
@@ -1379,8 +1599,8 @@ def run_conversation(
                     # interim assistant message is byte-identical to what
                     # would have been appended in the non-truncated path.
                     _trunc_msg = None
-                    _trunc_transport = agent._get_transport()
-                    if agent.api_mode == "anthropic_messages":
+                    _trunc_transport = dispatch_transport
+                    if dispatch_route.api_mode == "anthropic_messages":
                         _trunc_result = _trunc_transport.normalize_response(
                             response, strip_tool_prefix=agent._is_anthropic_oauth
                         )
@@ -1452,7 +1672,7 @@ def run_conversation(
                             "error": _exhaust_error,
                         }
 
-                    if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
+                    if dispatch_route.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
@@ -1491,7 +1711,7 @@ def run_conversation(
                                 "error": "Response remained truncated after 3 continuation attempts",
                             }
 
-                    if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
+                    if dispatch_route.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
                         if assistant_message is not None and _trunc_has_tool_calls:
                             if truncated_tool_call_retries < 1:
@@ -1548,13 +1768,16 @@ def run_conversation(
                             "error": "First response truncated due to output length limit"
                         }
                 
-                # Track actual token usage from response for context management
-                if hasattr(response, 'usage') and response.usage:
-                    canonical_usage = normalize_usage(
-                        response.usage,
-                        provider=dispatch_route.provider,
-                        api_mode=dispatch_route.api_mode,
-                    )
+                # Track actual token usage from response for context management.
+                # Normalization already ran inside the non-blocking accounting
+                # boundary; do not repeat it here or turn a local parsing
+                # failure into another provider request.
+                if (
+                    hasattr(response, "usage")
+                    and response.usage
+                    and attempt_canonical_usage is not None
+                ):
+                    canonical_usage = attempt_canonical_usage
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
@@ -1576,15 +1799,9 @@ def run_conversation(
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False
 
-                    agent.session_prompt_tokens += prompt_tokens
-                    agent.session_completion_tokens += completion_tokens
-                    agent.session_total_tokens += total_tokens
-                    agent.session_api_calls += 1
-                    agent.session_input_tokens += canonical_usage.input_tokens
-                    agent.session_output_tokens += canonical_usage.output_tokens
-                    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-                    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
-                    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    # Process-local cumulative counters were updated at the
+                    # same boundary as the durable per-attempt event, before
+                    # any truncation or continuation early return.
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
@@ -1598,74 +1815,9 @@ def run_conversation(
                         api_duration, _cache_pct,
                     )
 
-                    cost_result = estimate_usage_cost(
-                        dispatch_route.model,
-                        canonical_usage,
-                        provider=dispatch_route.provider,
-                        base_url=dispatch_route.base_url,
-                        api_key=getattr(agent, "api_key", ""),
-                    )
-                    if cost_result.amount_usd is not None:
-                        agent.session_estimated_cost_usd += float(cost_result.amount_usd)
-                    agent.session_cost_status = cost_result.status
-                    agent.session_cost_source = cost_result.source
-
-                    # Persist each successful call as one idempotent event and
-                    # update the compatibility session rollup in the same DB
-                    # transaction. Do this through the narrow accounting sink
-                    # for every platform with a session_id so auxiliary runs
-                    # without transcript ownership cannot lose accounting.
-                    # Gateway/session-store writes use
-                    # absolute totals, so they safely overwrite these per-call
-                    # deltas instead of double-counting them.
-                    usage_recorder = getattr(agent, "_usage_recorder", None)
-                    if usage_recorder is not None and agent.session_id:
-                        event_uid = f"hermes:{uuid.uuid4()}"
-                        try:
-                            estimated_cost = (
-                                float(cost_result.amount_usd)
-                                if cost_result.amount_usd is not None else None
-                            )
-                            billing_mode = (
-                                "subscription_included"
-                                if cost_result.status == "included" else None
-                            )
-                            usage_recorder.record_usage_and_rollup(
-                                event_uid=event_uid,
-                                session_id=agent.session_id,
-                                source=getattr(agent, "platform", None),
-                                purpose=getattr(agent, "usage_purpose", "main"),
-                                provider=dispatch_route.provider,
-                                model=dispatch_route.model,
-                                api_mode=dispatch_route.api_mode,
-                                billing_base_url=dispatch_route.base_url,
-                                billing_mode=billing_mode,
-                                input_tokens=canonical_usage.input_tokens,
-                                output_tokens=canonical_usage.output_tokens,
-                                cache_read_tokens=canonical_usage.cache_read_tokens,
-                                cache_write_tokens=canonical_usage.cache_write_tokens,
-                                reasoning_tokens=canonical_usage.reasoning_tokens,
-                                estimated_cost_usd=estimated_cost,
-                                cost_status=cost_result.status,
-                                cost_source=cost_result.source,
-                                pricing_version=cost_result.pricing_version,
-                                latency_ms=int(api_duration * 1000),
-                                request_status="ok",
-                                api_call_index=agent.session_api_calls,
-                            )
-                        except Exception as e:
-                            # Accounting loss must be visible while preserving
-                            # the successful model response for the caller.
-                            logger.warning(
-                                "Usage accounting persistence failed "
-                                "(session=%s, event_uid=%s, tokens=%d): %s",
-                                agent.session_id,
-                                event_uid,
-                                total_tokens,
-                                e,
-                                exc_info=True,
-                            )
-                    
+                    # The provider attempt was persisted immediately after
+                    # response validation, before any early return or
+                    # continuation branch.
                     if agent.verbose_logging:
                         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                     
@@ -1705,6 +1857,15 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                if attempt_started and not attempt_persisted and dispatch_route is not None:
+                    _persist_provider_attempt(
+                        response_obj=None,
+                        route=dispatch_route,
+                        duration_s=time.time() - attempt_start_time,
+                        request_status="cancelled",
+                        error_class="InterruptedError",
+                    )
+                    attempt_persisted = True
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -1718,6 +1879,22 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if attempt_started and not attempt_persisted and dispatch_route is not None:
+                    error_name = type(api_error).__name__
+                    request_status = (
+                        "timeout"
+                        if "timeout" in error_name.lower()
+                        or "timeout" in str(api_error).lower()
+                        else "error"
+                    )
+                    _persist_provider_attempt(
+                        response_obj=None,
+                        route=dispatch_route,
+                        duration_s=time.time() - attempt_start_time,
+                        request_status=request_status,
+                        error_class=error_name,
+                    )
+                    attempt_persisted = True
                 # Stop spinner before printing error messages
                 if thinking_spinner:
                     thinking_spinner.stop("(╥_╥) error, retrying...")

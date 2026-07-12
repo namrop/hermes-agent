@@ -4977,6 +4977,36 @@ class TestStreamingApiCall:
             with pytest.raises(ConnectionError, match="fail"):
                 agent._interruptible_streaming_api_call({"messages": []})
 
+    def test_inner_retries_emit_one_receipt_per_transport_attempt(
+        self, agent, monkeypatch
+    ):
+        chunks = [
+            _make_chunk(content="Recovered"),
+            _make_chunk(finish_reason="stop"),
+        ]
+        agent.client.chat.completions.create.side_effect = [
+            ConnectionError("first stream failed"),
+            iter(chunks),
+        ]
+        receipts = []
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+
+        with patch.object(agent, "_replace_primary_openai_client", return_value=False):
+            response = agent._interruptible_streaming_api_call(
+                {"messages": []}, attempt_receipts=receipts
+            )
+
+        assert response.choices[0].message.content == "Recovered"
+        assert len(receipts) == 2
+        assert receipts[0]["request_status"] == "error"
+        assert receipts[0]["error_class"] == "ConnectionError"
+        assert receipts[0]["response_obj"] is None
+        assert receipts[0]["duration_s"] >= 0
+        assert receipts[1]["request_status"] == "ok"
+        assert receipts[1]["error_class"] is None
+        assert receipts[1]["response_obj"] is response
+        assert receipts[1]["duration_s"] >= 0
+
     def test_response_has_uuid_id(self, agent):
         chunks = [_make_chunk(content="x"), _make_chunk(finish_reason="stop")]
         agent.client.chat.completions.create.return_value = iter(chunks)

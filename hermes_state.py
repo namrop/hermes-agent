@@ -415,6 +415,7 @@ class SessionDB:
             self._conn.execute("PRAGMA foreign_keys=ON")
 
             self._init_schema()
+            self._run_usage_backfill_migration()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -483,6 +484,48 @@ class SessionDB:
         # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
+        )
+
+    def _run_usage_backfill_migration(self) -> None:
+        """Populate event-ledger residuals once for pre-ledger session totals.
+
+        The marker check, idempotent residual reconciliation, and marker write
+        share one ``BEGIN IMMEDIATE`` transaction. Concurrent initializers
+        therefore serialize before checking the marker, and a crash rolls back
+        both reconciliation and marker insertion together.
+        """
+        marker_key = "llm_usage_event_backfill_v1"
+
+        def _migrate(conn: sqlite3.Connection):
+            marker = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone()
+            if marker is not None:
+                return None
+
+            inserted = self.backfill_llm_usage_events_from_sessions(
+                _connection=conn
+            )
+            discrepancies = self.last_backfill_report.get(
+                "discrepancy_session_ids", []
+            )
+            marker_value = (
+                "complete_with_discrepancies" if discrepancies else "complete"
+            )
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (marker_key, marker_value),
+            )
+            return inserted, len(discrepancies)
+
+        result = self._execute_write(_migrate)
+        if result is None:
+            return
+        inserted, discrepancy_count = result
+        logger.info(
+            "Historical usage event migration complete: inserted=%d discrepancies=%d",
+            inserted,
+            discrepancy_count,
         )
 
     def _try_wal_checkpoint(self) -> None:
@@ -1587,7 +1630,9 @@ class SessionDB:
             "discrepancies": [],
         }
 
-    def backfill_llm_usage_events_from_sessions(self) -> int:
+    def backfill_llm_usage_events_from_sessions(
+        self, *, _connection: Optional[sqlite3.Connection] = None
+    ) -> int:
         """Reconcile one synthetic *residual* event per historical session.
 
         Real event facts are never rewritten. Their sums are subtracted from
@@ -1624,15 +1669,28 @@ class SessionDB:
                       )
                    ORDER BY s.id"""
             ).fetchall()
+            event_rows = iter(
+                conn.execute(
+                    "SELECT * FROM llm_usage_events ORDER BY session_id, id"
+                )
+            )
+            current_event = next(event_rows, None)
             inserted = 0
 
             for session in sessions:
                 session_id = session["id"]
-                all_events = conn.execute(
-                    """SELECT * FROM llm_usage_events
-                       WHERE session_id = ? ORDER BY id""",
-                    (session_id,),
-                ).fetchall()
+                while (
+                    current_event is not None
+                    and current_event["session_id"] < session_id
+                ):
+                    current_event = next(event_rows, None)
+                all_events = []
+                while (
+                    current_event is not None
+                    and current_event["session_id"] == session_id
+                ):
+                    all_events.append(current_event)
+                    current_event = next(event_rows, None)
                 synthetic = [
                     event
                     for event in all_events
@@ -1821,7 +1879,10 @@ class SessionDB:
 
             return inserted, report
 
-        inserted, report = self._execute_write(_do)
+        if _connection is None:
+            inserted, report = self._execute_write(_do)
+        else:
+            inserted, report = _do(_connection)
         self.last_backfill_report = report
         return int(inserted or 0)
 

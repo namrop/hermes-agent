@@ -4,13 +4,17 @@ import json
 import logging
 import sys
 
+import pytest
+
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _mock_response(*, usage: dict, content: str = "done"):
+def _mock_response(
+    *, usage: dict, content: str = "done", finish_reason: str = "stop"
+):
     msg = SimpleNamespace(content=content, tool_calls=None)
-    choice = SimpleNamespace(message=msg, finish_reason="stop")
+    choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
     return SimpleNamespace(
         choices=[choice],
         model="test/model",
@@ -295,6 +299,172 @@ def test_run_conversation_warns_when_usage_accounting_fails_but_returns_response
     assert "tokens=18" in warning.getMessage()
     assert "database unavailable" in warning.getMessage()
     assert warning.exc_info is not None
+    assert agent.session_api_calls == 0
+    assert agent.session_input_tokens == 0
+    assert agent.session_output_tokens == 0
+    assert agent.session_estimated_cost_usd == 0
+
+
+def test_usage_normalization_failure_does_not_retry_provider(caplog):
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="discord")
+
+    with (
+        patch(
+            "agent.conversation_loop.normalize_usage",
+            side_effect=ValueError("unsupported usage shape"),
+        ) as normalize,
+        caplog.at_level(logging.WARNING, logger="agent.conversation_loop"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "done"
+    assert agent.client.chat.completions.create.call_count == 1
+    assert normalize.call_count == 1
+    session_db.record_usage_and_rollup.assert_called_once()
+    persisted = session_db.record_usage_and_rollup.call_args.kwargs
+    assert persisted["request_status"] == "ok"
+    assert persisted["input_tokens"] == 0
+    assert persisted["output_tokens"] == 0
+    assert agent.session_api_calls == 1
+    assert agent.session_input_tokens == 0
+    assert any(
+        "Usage normalization failed for provider attempt" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_truncated_usage_is_persisted_before_thinking_exhaustion_return():
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="discord")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        usage={
+            "prompt_tokens": 21,
+            "completion_tokens": 9,
+            "total_tokens": 30,
+        },
+        content="<think>reasoning only</think>",
+        finish_reason="length",
+    )
+
+    result = agent.run_conversation("hello")
+
+    assert result["partial"] is True
+    session_db.record_usage_and_rollup.assert_called_once()
+    persisted = session_db.record_usage_and_rollup.call_args.kwargs
+    assert persisted["input_tokens"] == 21
+    assert persisted["output_tokens"] == 9
+    assert persisted["request_status"] == "ok"
+    assert agent.session_api_calls == 1
+    assert agent.session_prompt_tokens == 21
+    assert agent.session_completion_tokens == 9
+    assert agent.session_total_tokens == 30
+    assert agent.session_input_tokens == 21
+    assert agent.session_output_tokens == 9
+
+
+def test_failed_retry_and_success_are_persisted_as_distinct_attempts(monkeypatch):
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="discord")
+    success = _mock_response(
+        usage={
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18,
+        }
+    )
+    agent._interruptible_api_call = MagicMock(
+        side_effect=[RuntimeError("provider unavailable"), success]
+    )
+    agent._api_max_retries = 2
+    monkeypatch.setattr(
+        "agent.conversation_loop.jittered_backoff", lambda *args, **kwargs: 0.0
+    )
+
+    result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "done"
+    calls = session_db.record_usage_and_rollup.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["request_status"] == "error"
+    assert calls[0].kwargs["error_class"] == "RuntimeError"
+    assert calls[0].kwargs["provider"] == "openrouter"
+    assert calls[1].kwargs["request_status"] == "ok"
+    assert calls[1].kwargs["input_tokens"] == 11
+    assert calls[0].kwargs["event_uid"] != calls[1].kwargs["event_uid"]
+
+
+@pytest.mark.parametrize(
+    ("response_status", "response_error", "expected_status", "expected_class"),
+    [
+        ("cancelled", None, "cancelled", "response_cancelled"),
+        ("failed", "upstream timed out", "timeout", "response_timeout"),
+    ],
+)
+def test_invalid_terminal_response_preserves_specific_status(
+    response_status, response_error, expected_status, expected_class
+):
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="discord")
+    agent._api_max_retries = 1
+    agent._interruptible_api_call = MagicMock(
+        return_value=SimpleNamespace(
+            choices=[],
+            usage=None,
+            status=response_status,
+            error=response_error,
+            model="test/model",
+        )
+    )
+
+    agent.run_conversation("hello")
+
+    persisted = session_db.record_usage_and_rollup.call_args.kwargs
+    assert persisted["request_status"] == expected_status
+    assert persisted["error_class"] == expected_class
+
+
+def test_interrupt_during_inner_retry_persists_active_attempt_as_cancelled():
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="discord")
+    agent.stream_delta_callback = lambda _delta: None
+
+    def interrupt_on_second_attempt(
+        api_kwargs, *, on_first_delta=None, attempt_receipts=None
+    ):
+        attempt_receipts.append(
+            {
+                "response_obj": None,
+                "duration_s": 0.01,
+                "request_status": "error",
+                "error_class": "ConnectionError",
+                "started_at": 1.0,
+            }
+        )
+        attempt_receipts.append(
+            {
+                "response_obj": None,
+                "duration_s": 0.0,
+                "request_status": None,
+                "error_class": None,
+                "forced_status": "cancelled",
+                "started_at": 1.0,
+            }
+        )
+        raise InterruptedError("stopped during retry")
+
+    agent._interruptible_streaming_api_call = interrupt_on_second_attempt
+
+    result = agent.run_conversation("hello")
+
+    assert result["interrupted"] is True
+    calls = session_db.record_usage_and_rollup.call_args_list
+    assert [call.kwargs["request_status"] for call in calls] == [
+        "error",
+        "cancelled",
+    ]
+    assert calls[1].kwargs["error_class"] == "InterruptedError"
+    assert agent.session_api_calls == 2
 
 
 def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):

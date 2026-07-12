@@ -1172,7 +1172,13 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+    attempt_receipts=None,
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -1689,12 +1695,30 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # causing multi-minute delays between /stop and response.
                 if agent._interrupt_requested:
                     raise InterruptedError("Agent interrupted before stream retry")
+                _stream_attempt_started_at = time.time()
+                _attempt_receipt = None
+                if attempt_receipts is not None:
+                    _attempt_receipt = {
+                        "response_obj": None,
+                        "duration_s": 0.0,
+                        "request_status": None,
+                        "error_class": None,
+                        "started_at": _stream_attempt_started_at,
+                    }
+                    attempt_receipts.append(_attempt_receipt)
                 try:
                     if agent.api_mode == "anthropic_messages":
                         agent._try_refresh_anthropic_client_credentials()
                         result["response"] = _call_anthropic()
                     else:
                         result["response"] = _call_chat_completions()
+                    if _attempt_receipt is not None:
+                        _attempt_receipt.update({
+                            "response_obj": result["response"],
+                            "duration_s": time.time() - _stream_attempt_started_at,
+                            "request_status": "ok",
+                            "error_class": None,
+                        })
                     return  # success
                 except Exception as e:
                     _is_timeout = isinstance(
@@ -1704,6 +1728,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                     )
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
+                    if _attempt_receipt is not None:
+                        _forced_status = _attempt_receipt.get("forced_status")
+                        _attempt_receipt.update({
+                            "response_obj": None,
+                            "duration_s": time.time() - _stream_attempt_started_at,
+                            "request_status": (
+                                _forced_status
+                                or ("timeout" if _is_timeout else "error")
+                            ),
+                            "error_class": type(e).__name__,
+                        })
 
                     # If the stream died AFTER some tokens were delivered:
                     # normally we don't retry (the user already saw text,
@@ -1988,6 +2023,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 f"context: ~{_est_ctx:,} tokens). "
                 f"Reconnecting..."
             )
+            if attempt_receipts:
+                active_receipt = attempt_receipts[-1]
+                if active_receipt.get("request_status") is None:
+                    active_receipt["forced_status"] = "timeout"
             try:
                 _close_request_client_once("stale_stream_kill")
             except Exception:
@@ -2006,6 +2045,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
         if agent._interrupt_requested:
+            if attempt_receipts:
+                active_receipt = attempt_receipts[-1]
+                if active_receipt.get("request_status") is None:
+                    active_receipt["forced_status"] = "cancelled"
             try:
                 if agent.api_mode == "anthropic_messages":
                     agent._anthropic_client.close()

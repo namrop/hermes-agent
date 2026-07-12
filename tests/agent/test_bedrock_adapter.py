@@ -890,6 +890,26 @@ class TestClientCache:
         assert len(_bedrock_runtime_client_cache) == 0
         assert len(_bedrock_control_client_cache) == 0
 
+    def test_runtime_client_disables_opaque_sdk_retries(self):
+        from agent.bedrock_adapter import (
+            _get_bedrock_runtime_client,
+            reset_client_cache,
+        )
+
+        fake_boto3 = MagicMock()
+        fake_boto3.client.return_value = object()
+        reset_client_cache()
+        with patch(
+            "agent.bedrock_adapter._require_boto3", return_value=fake_boto3
+        ):
+            _get_bedrock_runtime_client("us-east-1")
+
+        kwargs = fake_boto3.client.call_args.kwargs
+        assert kwargs["config"].retries == {
+            "total_max_attempts": 1,
+            "mode": "standard",
+        }
+
 
 # ---------------------------------------------------------------------------
 # Streaming with callbacks

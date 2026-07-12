@@ -474,6 +474,114 @@ class TestSessionLifecycle:
         finally:
             migrated_db.close()
 
+    def test_open_runs_one_time_historical_usage_backfill(self, tmp_path):
+        db_path = tmp_path / "historical_usage_state.db"
+        legacy_db = SessionDB(db_path=db_path)
+        legacy_db.create_session(
+            session_id="historical-session",
+            source="discord",
+            model="legacy/model",
+        )
+
+        def seed_historical_rollup(connection):
+            connection.execute(
+                """UPDATE sessions
+                   SET input_tokens = 100,
+                       output_tokens = 20,
+                       api_call_count = 2,
+                       billing_provider = 'openrouter'
+                   WHERE id = 'historical-session'"""
+            )
+            connection.execute(
+                "DELETE FROM state_meta WHERE key = 'llm_usage_event_backfill_v1'"
+            )
+
+        legacy_db._execute_write(seed_historical_rollup)
+        legacy_db.close()
+
+        migrated_db = SessionDB(db_path=db_path)
+        try:
+            report = migrated_db.summarize_usage_events(
+                session_id="historical-session"
+            )
+            assert report["input_tokens"] == 100
+            assert report["output_tokens"] == 20
+            assert report["reconstructed_call_count"] == 2
+            marker = migrated_db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                ("llm_usage_event_backfill_v1",),
+            ).fetchone()
+            assert marker is not None
+            assert marker["value"] == "complete"
+        finally:
+            migrated_db.close()
+
+    def test_concurrent_open_runs_large_backfill_once(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "concurrent_historical_usage_state.db"
+        legacy_db = SessionDB(db_path=db_path)
+        session_count = 100
+        for index in range(session_count):
+            legacy_db.create_session(
+                session_id=f"historical-{index:03d}",
+                source="discord",
+                model="legacy/model",
+            )
+
+        def seed_historical_rollups(connection):
+            connection.execute(
+                """UPDATE sessions
+                   SET input_tokens = 10,
+                       output_tokens = 2,
+                       api_call_count = 1,
+                       billing_provider = 'openrouter'"""
+            )
+            connection.execute(
+                "DELETE FROM state_meta WHERE key = 'llm_usage_event_backfill_v1'"
+            )
+
+        legacy_db._execute_write(seed_historical_rollups)
+        legacy_db.close()
+
+        original_backfill = SessionDB.backfill_llm_usage_events_from_sessions
+        call_count = 0
+        call_lock = threading.Lock()
+
+        def slow_counted_backfill(self, *args, **kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+            time.sleep(0.05)
+            return original_backfill(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            SessionDB,
+            "backfill_llm_usage_events_from_sessions",
+            slow_counted_backfill,
+        )
+        start = threading.Barrier(2)
+
+        def open_and_inspect():
+            start.wait()
+            opened = SessionDB(db_path=db_path)
+            try:
+                marker = opened._conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    ("llm_usage_event_backfill_v1",),
+                ).fetchone()
+                event_count = opened._conn.execute(
+                    """SELECT COUNT(*) AS count FROM llm_usage_events
+                       WHERE record_kind = 'historical_aggregate'"""
+                ).fetchone()["count"]
+                return marker["value"], event_count
+            finally:
+                opened.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: open_and_inspect(), range(2)))
+
+        assert call_count == 1
+        assert results == [("complete", session_count)] * 2
+
     def test_pre_purpose_database_migrates_existing_events_to_main(self, tmp_path):
         db_path = tmp_path / "legacy_purpose_state.db"
         legacy_db = SessionDB(db_path=db_path)

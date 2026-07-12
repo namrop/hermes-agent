@@ -101,6 +101,8 @@ def test_second_create_does_not_wrap_closed_transport_from_first():
     assert len(constructed) == 2, f"expected 2 OpenAI constructions, got {len(constructed)}"
     assert constructed[0] is client_a
     assert constructed[1] is client_b
+    assert constructed[0]._kwargs["max_retries"] == 0
+    assert constructed[1]._kwargs["max_retries"] == 0
 
     hc_a = constructed[0]._http_client
     hc_b = constructed[1]._http_client

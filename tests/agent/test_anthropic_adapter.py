@@ -95,6 +95,7 @@ class TestBuildAnthropicClient:
             build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["api_key"] == "sk-ant-api03-something"
+            assert kwargs["max_retries"] == 0
             assert "auth_token" not in kwargs
             # API key auth should still get common betas
             betas = kwargs["default_headers"]["anthropic-beta"]
@@ -141,6 +142,7 @@ class TestBuildAnthropicClient:
             mock_sdk.AnthropicBedrock = MagicMock()
             build_anthropic_bedrock_client("us-east-1")
             kwargs = mock_sdk.AnthropicBedrock.call_args[1]
+            assert kwargs["max_retries"] == 0
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
