@@ -29,6 +29,7 @@ from agent.memory_manager import sanitize_context
 from agent.usage_analytics import (
     summarize_session_routes as aggregate_session_routes,
     summarize_usage_by_provider_model as aggregate_usage_by_provider_model,
+    summarize_usage_by_source as aggregate_usage_by_source,
     summarize_usage_daily as aggregate_usage_daily,
     summarize_usage_events as aggregate_usage_events,
 )
@@ -1507,6 +1508,23 @@ class SessionDB:
         return self._aggregate_filtered_llm_usage(
             aggregate_usage_by_provider_model,
             _LLM_USAGE_ACCOUNTING_COLUMNS + ("provider", "model"),
+            cutoff=cutoff,
+            source=source,
+            session_id=session_id,
+            purpose=purpose,
+        )
+
+    def summarize_usage_by_source(
+        self,
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return canonical source summaries for matching events."""
+        return self._aggregate_filtered_llm_usage(
+            aggregate_usage_by_source,
+            _LLM_USAGE_ACCOUNTING_COLUMNS + ("source",),
             cutoff=cutoff,
             source=source,
             session_id=session_id,

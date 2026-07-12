@@ -9,9 +9,10 @@ summary dictionary has these stable keys:
 ``total_tokens``, ``event_count``, ``api_attempt_count``,
 ``successful_call_count``, ``latency_sample_count``, ``latency_total_ms``,
 ``average_latency_ms``, ``historical_aggregate_count``,
-``reconstructed_call_count``, compatibility ``estimated_cost_usd`` and
-``actual_cost_usd`` floats, authoritative ``estimated_cost_usd_exact`` and
-``actual_cost_usd_exact`` decimal strings,
+``reconstructed_call_count``, ``reconstructed_call_known_aggregate_count``,
+``reconstructed_call_unknown_aggregate_count``, compatibility
+``estimated_cost_usd`` and ``actual_cost_usd`` floats, authoritative
+``estimated_cost_usd_exact`` and ``actual_cost_usd_exact`` decimal strings,
 ``estimated_cost_known_event_count``, ``estimated_cost_unknown_event_count``,
 ``actual_cost_known_event_count``, ``actual_cost_unknown_event_count``,
 ``invalid_numeric_event_count``, and ``invalid_numeric_value_count``.
@@ -91,6 +92,8 @@ def _empty_summary() -> Summary:
         "average_latency_ms": None,
         "historical_aggregate_count": 0,
         "reconstructed_call_count": 0,
+        "reconstructed_call_known_aggregate_count": 0,
+        "reconstructed_call_unknown_aggregate_count": 0,
         "estimated_cost_usd": 0.0,
         "actual_cost_usd": 0.0,
         "estimated_cost_usd_exact": "0",
@@ -225,11 +228,15 @@ class _SummaryAccumulator:
         if is_historical:
             summary["historical_aggregate_count"] += 1
             raw_call_count = event.get("api_call_index")
-            if raw_call_count is not None:
+            if raw_call_count is None:
+                summary["reconstructed_call_unknown_aggregate_count"] += 1
+            else:
                 call_count = _integral_value(raw_call_count, allow_negative=False)
                 if call_count is None:
+                    summary["reconstructed_call_unknown_aggregate_count"] += 1
                     invalid_values += 1
                 else:
+                    summary["reconstructed_call_known_aggregate_count"] += 1
                     summary["reconstructed_call_count"] += call_count
 
         for dimension in ("estimated", "actual"):
@@ -339,6 +346,11 @@ def summarize_usage_by_provider_model(
 ) -> list[Summary]:
     """Group events by billing provider and model without collapsing either."""
     return _group_usage_events(events, ("provider", "model"))
+
+
+def summarize_usage_by_source(events: Iterable[UsageEvent]) -> list[Summary]:
+    """Group events by source while preserving validity and NULL attribution."""
+    return _group_usage_events(events, ("source",))
 
 
 def summarize_session_routes(events: Iterable[UsageEvent]) -> list[Summary]:

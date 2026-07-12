@@ -40,6 +40,11 @@ def populated_db(db):
     db.end_session("s1", end_reason="user_exit")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's1'", (now - 2 * day + 3600,))
     db.update_token_counts("s1", input_tokens=50000, output_tokens=15000)
+    _record_usage(
+        db, "s1", timestamp=now - 2 * day, source="cli",
+        provider="anthropic", model="anthropic/claude-sonnet-4-20250514",
+        input_tokens=50000, output_tokens=15000, estimated_cost_usd=0.50,
+    )
     db.append_message("s1", role="user", content="Hello, help me fix a bug")
     db.append_message("s1", role="assistant", content="Sure, let me look into that.")
     db.append_message("s1", role="assistant", content="Let me search the files.",
@@ -69,6 +74,11 @@ def populated_db(db):
     db.end_session("s2", end_reason="timeout")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's2'", (now - 5 * day + 1800,))
     db.update_token_counts("s2", input_tokens=20000, output_tokens=8000)
+    _record_usage(
+        db, "s2", timestamp=now - 5 * day, source="telegram",
+        provider="openai", model="gpt-4o",
+        input_tokens=20000, output_tokens=8000, estimated_cost_usd=0.20,
+    )
     db.append_message("s2", role="user", content="Search the web for something")
     db.append_message("s2", role="assistant", content="Searching...",
                       tool_calls=[{"function": {"name": "web_search"}}])
@@ -84,6 +94,11 @@ def populated_db(db):
     db.end_session("s3", end_reason="user_exit")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's3'", (now - 10 * day + 7200,))
     db.update_token_counts("s3", input_tokens=100000, output_tokens=40000)
+    _record_usage(
+        db, "s3", timestamp=now - 10 * day, source="cli",
+        provider="deepseek", model="deepseek-chat",
+        input_tokens=100000, output_tokens=40000, estimated_cost_usd=0.10,
+    )
     db.append_message("s3", role="user", content="Run this terminal command")
     db.append_message("s3", role="assistant", content="Running...",
                       tool_calls=[{"function": {"name": "terminal"}}])
@@ -110,6 +125,11 @@ def populated_db(db):
     db.end_session("s4", end_reason="user_exit")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's4'", (now - 1 * day + 900,))
     db.update_token_counts("s4", input_tokens=10000, output_tokens=5000)
+    _record_usage(
+        db, "s4", timestamp=now - day, source="discord",
+        provider="anthropic", model="anthropic/claude-sonnet-4-20250514",
+        input_tokens=10000, output_tokens=5000, estimated_cost_usd=0.10,
+    )
     db.append_message("s4", role="user", content="Quick question")
     db.append_message("s4", role="assistant", content="Sure, go ahead")
     db.append_message(
@@ -131,11 +151,31 @@ def populated_db(db):
     db.end_session("s_old", end_reason="user_exit")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's_old'", (now - 45 * day + 600,))
     db.update_token_counts("s_old", input_tokens=5000, output_tokens=2000)
+    _record_usage(
+        db, "s_old", timestamp=now - 45 * day, source="cli",
+        provider="openai", model="gpt-4o-mini",
+        input_tokens=5000, output_tokens=2000, estimated_cost_usd=0.01,
+    )
     db.append_message("s_old", role="user", content="old message")
     db.append_message("s_old", role="assistant", content="old reply")
 
     db._conn.commit()
     return db
+
+
+def _record_usage(db, session_id, *, timestamp=None, source=None, **overrides):
+    values = {
+        "timestamp": timestamp if timestamp is not None else time.time(),
+        "source": source,
+        "provider": "openrouter",
+        "model": "test-model",
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "estimated_cost_usd": 0.10,
+        "request_status": "ok",
+    }
+    values.update(overrides)
+    return db.record_llm_usage_event(session_id, **values)
 
 
 class TestHasKnownPricing:
@@ -310,15 +350,15 @@ class TestInsightsPopulated:
         report = engine.generate(days=30)
         models = report["models"]
 
-        # Should have 3 distinct models (claude-sonnet x2, gpt-4o, deepseek-chat)
+        # Three actual provider/model routes; the Anthropic route has two calls.
         model_names = [m["model"] for m in models]
-        assert "claude-sonnet-4-20250514" in model_names
+        assert "anthropic/claude-sonnet-4-20250514" in model_names
         assert "gpt-4o" in model_names
         assert "deepseek-chat" in model_names
 
-        # Claude-sonnet has 2 sessions (s1 + s4)
         claude = next(m for m in models if "claude-sonnet" in m["model"])
-        assert claude["sessions"] == 2
+        assert claude["provider"] == "anthropic"
+        assert claude["calls"] == 2
 
     def test_platform_breakdown(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -401,7 +441,7 @@ class TestInsightsPopulated:
         labels = [t["label"] for t in top]
         assert "Longest session" in labels
         assert "Most messages" in labels
-        assert "Most tokens" in labels
+        assert "Most tokens" not in labels
         assert "Most tool calls" in labels
 
     def test_source_filter_cli(self, populated_db):
@@ -435,6 +475,329 @@ class TestInsightsPopulated:
 
         # All 5 sessions should be included
         assert report["overview"]["total_sessions"] == 5
+
+
+class TestEventDerivedInsights:
+    def test_mixed_session_uses_each_actual_route_and_stored_event_cost(self, db):
+        db.create_session(
+            session_id="mixed",
+            source="discord",
+            model="scalar-wrong-model",
+        )
+        db.update_token_counts("mixed", input_tokens=9_999, output_tokens=8_888)
+        db._conn.execute(
+            "UPDATE sessions SET estimated_cost_usd = 77.0 WHERE id = 'mixed'"
+        )
+        _record_usage(
+            db,
+            "mixed",
+            source="discord",
+            provider="openrouter",
+            model="shared-model",
+            input_tokens=100,
+            output_tokens=10,
+            estimated_cost_usd=0.11,
+        )
+        _record_usage(
+            db,
+            "mixed",
+            source="discord",
+            provider="anthropic",
+            model="shared-model",
+            input_tokens=200,
+            output_tokens=20,
+            estimated_cost_usd=0.22,
+        )
+
+        report = InsightsEngine(db).generate(days=30)
+
+        assert report["overview"]["total_input_tokens"] == 300
+        assert report["overview"]["total_output_tokens"] == 30
+        assert report["overview"]["estimated_cost"] == pytest.approx(0.33)
+        assert {
+            (row["provider"], row["model"]): row["total_tokens"]
+            for row in report["models"]
+        } == {
+            ("openrouter", "shared-model"): 110,
+            ("anthropic", "shared-model"): 220,
+        }
+
+    def test_session_activity_metrics_remain_session_derived(self, db):
+        now = time.time()
+        db.create_session(session_id="activity", source="cli", model="scalar")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ?, "
+            "message_count = 7, tool_call_count = 3 WHERE id = 'activity'",
+            (now - 600, now),
+        )
+        _record_usage(db, "activity", source="cli", input_tokens=40, output_tokens=2)
+
+        overview = InsightsEngine(db).generate(days=30)["overview"]
+
+        assert overview["total_sessions"] == 1
+        assert overview["total_messages"] == 7
+        assert overview["total_tool_calls"] == 3
+        assert overview["total_hours"] == pytest.approx(1 / 6)
+        assert overview["total_tokens"] == 42
+
+    def test_source_filter_applies_to_event_derived_usage(self, db):
+        for session_id, source in (
+            ("cli-session", "cli"),
+            ("discord-session", "discord"),
+        ):
+            db.create_session(session_id=session_id, source=source, model="scalar")
+        _record_usage(
+            db,
+            "cli-session",
+            source="cli",
+            provider="openai",
+            model="gpt-cli",
+            input_tokens=30,
+            output_tokens=3,
+            estimated_cost_usd=0.03,
+        )
+        _record_usage(
+            db,
+            "discord-session",
+            source="discord",
+            provider="anthropic",
+            model="claude-discord",
+            input_tokens=70,
+            output_tokens=7,
+            estimated_cost_usd=0.07,
+        )
+
+        report = InsightsEngine(db).generate(days=30, source="cli")
+
+        assert report["overview"]["total_sessions"] == 1
+        assert report["overview"]["total_tokens"] == 33
+        assert report["overview"]["estimated_cost"] == pytest.approx(0.03)
+        assert [(row["provider"], row["model"]) for row in report["models"]] == [
+            ("openai", "gpt-cli")
+        ]
+
+    def test_historical_aggregate_coverage_is_visible(self, db):
+        db.create_session(session_id="legacy", source="cli", model="legacy-scalar")
+        event_id = _record_usage(
+            db,
+            "legacy",
+            source="cli",
+            provider=None,
+            model=None,
+            input_tokens=1_000,
+            output_tokens=100,
+            estimated_cost_usd=0.50,
+            api_call_index=4,
+        )
+        db._conn.execute(
+            "UPDATE llm_usage_events SET record_kind = 'historical_aggregate', "
+            "usage_source = 'reconstructed', measurement_confidence = 'reconstructed' "
+            "WHERE id = ?",
+            (event_id,),
+        )
+
+        report = InsightsEngine(db).generate(days=30)
+
+        assert report["overview"]["historical_aggregate_count"] == 1
+        assert report["overview"]["reconstructed_call_count"] == 4
+        assert report["overview"]["api_attempt_count"] == 0
+        assert report["models"][0]["historical_aggregate_count"] == 1
+        assert report["models"][0]["reconstructed_call_count"] == 4
+        terminal_text = InsightsEngine(db).format_terminal(report)
+        gateway_text = InsightsEngine(db).format_gateway(report)
+        assert "reconstructed" in terminal_text.lower()
+        assert "reconstructed" in gateway_text.lower()
+
+    def test_recent_event_from_older_session_is_reported_without_session_activity(self, db):
+        now = time.time()
+        db.create_session(session_id="old-active", source="cli", model="old-scalar")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, input_tokens = 999999 "
+            "WHERE id = 'old-active'",
+            (now - 40 * 86400,),
+        )
+        _record_usage(
+            db,
+            "old-active",
+            timestamp=now,
+            source="cli",
+            provider="openrouter",
+            model="current-route",
+            input_tokens=12,
+            output_tokens=3,
+        )
+
+        report = InsightsEngine(db).generate(days=30)
+
+        assert report["empty"] is False
+        assert report["overview"]["total_sessions"] == 0
+        assert report["overview"]["total_tokens"] == 15
+        assert report["overview"]["avg_tokens_per_session"] is None
+        assert report["overview"]["unknown_cost_sessions"] is None
+        assert report["overview"]["included_cost_sessions"] is None
+        assert report["overview"]["unknown_estimated_cost_events"] == 0
+        assert report["overview"]["known_actual_cost_events"] == 0
+        assert [(row["provider"], row["model"]) for row in report["models"]] == [
+            ("openrouter", "current-route")
+        ]
+        assert report["platforms"] == [
+            {
+                "platform": "cli",
+                "source": "cli",
+                "source_is_valid": True,
+                "sessions": 0,
+                "messages": 0,
+                "tool_calls": 0,
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": 15,
+            }
+        ]
+        assert report["activity"]["by_day"] == []
+        assert report["activity"]["by_hour"] == []
+        assert report["activity"]["busiest_day"] is None
+        assert report["activity"]["busiest_hour"] is None
+        assert report["top_sessions"] == []
+
+    def test_usage_ledger_is_scanned_once_per_canonical_summary(self, db, monkeypatch):
+        for index, source in enumerate(("cli", "discord", "telegram")):
+            session_id = f"session-{index}"
+            db.create_session(session_id=session_id, source=source, model="scalar")
+            _record_usage(db, session_id, source=source, input_tokens=index + 1)
+
+        calls = {"global": 0, "routes": 0, "sources": 0}
+        original_global = db.summarize_usage_events
+        original_routes = db.summarize_usage_by_provider_model
+        original_sources = db.summarize_usage_by_source
+
+        def counted_global(*args, **kwargs):
+            calls["global"] += 1
+            return original_global(*args, **kwargs)
+
+        def counted_routes(*args, **kwargs):
+            calls["routes"] += 1
+            return original_routes(*args, **kwargs)
+
+        def counted_sources(*args, **kwargs):
+            calls["sources"] += 1
+            return original_sources(*args, **kwargs)
+
+        monkeypatch.setattr(db, "summarize_usage_events", counted_global)
+        monkeypatch.setattr(db, "summarize_usage_by_provider_model", counted_routes)
+        monkeypatch.setattr(db, "summarize_usage_by_source", counted_sources)
+
+        InsightsEngine(db).generate(days=30)
+
+        assert calls == {"global": 1, "routes": 1, "sources": 1}
+
+    def test_empty_string_source_filter_applies_to_activity_and_usage(self, db):
+        db.create_session(session_id="empty", source="", model="scalar")
+        db.create_session(session_id="cli", source="cli", model="scalar")
+        db.append_message("empty", role="user", content="empty source")
+        db.append_message("cli", role="user", content="cli source")
+        _record_usage(db, "empty", source="", input_tokens=2, output_tokens=1)
+        _record_usage(db, "cli", source="cli", input_tokens=20, output_tokens=10)
+
+        report = InsightsEngine(db).generate(days=30, source="")
+
+        assert report["overview"]["total_sessions"] == 1
+        assert report["overview"]["total_messages"] == 1
+        assert report["overview"]["total_tokens"] == 3
+        assert [(row["source"], row["sessions"]) for row in report["platforms"]] == [
+            ("", 1)
+        ]
+        assert "Last 30 days ((empty))" in InsightsEngine(db).format_terminal(report)
+
+    def test_failed_api_attempt_is_displayed_as_an_attempt_not_zero_calls(self, db):
+        db.create_session(session_id="failed", source="cli", model="scalar")
+        _record_usage(
+            db,
+            "failed",
+            source="cli",
+            provider="openrouter",
+            model="failed-route",
+            request_status="error",
+        )
+
+        report = InsightsEngine(db).generate(days=30)
+        route = report["models"][0]
+
+        assert route["api_attempt_count"] == 1
+        assert route["successful_call_count"] == 0
+        assert route["calls"] == 1
+        assert route["call_label"] == "1"
+        assert " 1 " in InsightsEngine(db).format_terminal(report)
+
+    def test_null_and_malformed_sources_have_distinct_platform_labels(self, db):
+        old_started_at = time.time() - 40 * 86400
+        for session_id in ("null-source", "bad-source"):
+            db.create_session(session_id=session_id, source="cli", model="scalar")
+            _record_usage(db, session_id, source="cli")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (old_started_at, session_id),
+            )
+        db._conn.execute(
+            "UPDATE llm_usage_events SET source = NULL WHERE session_id = 'null-source'"
+        )
+        db._conn.execute(
+            "UPDATE llm_usage_events SET source = ? WHERE session_id = 'bad-source'",
+            (b"bad",),
+        )
+
+        report = InsightsEngine(db).generate(days=30)
+
+        assert {
+            (row["platform"], row["source"], row["source_is_valid"])
+            for row in report["platforms"]
+        } == {
+            ("unattributed", None, True),
+            ("invalid/unattributed", None, False),
+        }
+        terminal_text = InsightsEngine(db).format_terminal(report)
+        assert "invalid/unattributed" in terminal_text
+
+    def test_model_identity_is_preserved_separately_from_display_label(self, db):
+        for session_id, model in (("empty-model", ""), ("null-model", None)):
+            db.create_session(session_id=session_id, source="cli", model="scalar")
+            _record_usage(db, session_id, source="cli", model=model)
+        db.create_session(session_id="bad-model", source="cli", model="scalar")
+        bad_event_id = _record_usage(db, "bad-model", source="cli", model="temporary")
+        db._conn.execute(
+            "UPDATE llm_usage_events SET model = ? WHERE id = ?", (b"bad", bad_event_id)
+        )
+
+        rows = InsightsEngine(db).generate(days=30)["models"]
+
+        assert {
+            (row["model"], row["model_is_valid"], row["display_model"])
+            for row in rows
+        } == {
+            (None, False, "invalid/unattributed"),
+            (None, True, "unattributed"),
+            ("", True, "(empty)"),
+        }
+
+    def test_missing_historical_call_coverage_stays_unknown_in_report_and_format(self, db):
+        db.create_session(session_id="legacy-unknown", source="cli", model="legacy")
+        event_id = _record_usage(
+            db, "legacy-unknown", source="cli", input_tokens=100, api_call_index=None
+        )
+        db._conn.execute(
+            "UPDATE llm_usage_events SET record_kind = 'historical_aggregate' "
+            "WHERE id = ?",
+            (event_id,),
+        )
+
+        report = InsightsEngine(db).generate(days=30)
+        route = report["models"][0]
+
+        assert report["overview"]["reconstructed_call_unknown_aggregate_count"] == 1
+        assert route["calls"] is None
+        assert route["call_label"] == "unknown"
+        assert "call coverage unknown" in InsightsEngine(db).format_terminal(report).lower()
 
 
 # =========================================================================
@@ -530,7 +893,7 @@ class TestGatewayFormatting:
         text = engine.format_gateway(report)
 
         assert "Models" in text
-        assert "sessions" in text
+        assert "calls" in text
 
 
 # =========================================================================
@@ -553,6 +916,10 @@ class TestEdgeCases:
         """Active (non-ended) sessions should be included but duration = 0."""
         db.create_session(session_id="s1", source="cli", model="test-model")
         db.update_token_counts("s1", input_tokens=1000, output_tokens=500)
+        _record_usage(
+            db, "s1", source="cli", model="test-model",
+            input_tokens=1000, output_tokens=500, estimated_cost_usd=None,
+        )
         db._conn.commit()
 
         engine = InsightsEngine(db)
@@ -567,6 +934,10 @@ class TestEdgeCases:
         """Sessions with NULL model should not crash."""
         db.create_session(session_id="s1", source="cli")
         db.update_token_counts("s1", input_tokens=1000, output_tokens=500)
+        _record_usage(
+            db, "s1", source="cli", provider=None, model=None,
+            input_tokens=1000, output_tokens=500, estimated_cost_usd=None,
+        )
         db._conn.commit()
 
         engine = InsightsEngine(db)
@@ -575,24 +946,35 @@ class TestEdgeCases:
 
         models = report["models"]
         assert len(models) == 1
-        assert models[0]["model"] == "unknown"
-        assert models[0]["has_pricing"] is False
+        assert models[0]["model"] is None
+        assert models[0]["display_model"] == "unattributed"
+        assert models[0]["model_is_valid"] is True
+        assert models[0]["has_pricing"] is None
+        assert models[0]["has_estimated_cost_coverage"] is False
 
     def test_custom_model_shows_zero_cost(self, db):
         """Custom/self-hosted models should show $0 cost, not fake estimates."""
         db.create_session(session_id="s1", source="cli", model="FP16_Hermes_4.5")
         db.update_token_counts("s1", input_tokens=100000, output_tokens=50000)
+        _record_usage(
+            db, "s1", source="cli", provider="local", model="FP16_Hermes_4.5",
+            input_tokens=100000, output_tokens=50000, estimated_cost_usd=None,
+        )
         db._conn.commit()
 
         engine = InsightsEngine(db)
         report = engine.generate(days=30)
         assert report["overview"]["estimated_cost"] == 0.0
-        assert "FP16_Hermes_4.5" in report["overview"]["models_without_pricing"]
+        assert "FP16_Hermes_4.5" in report["overview"][
+            "models_with_unknown_estimated_cost"
+        ]
+        assert report["overview"]["models_without_pricing"] is None
 
         models = report["models"]
         custom = next(m for m in models if m["model"] == "FP16_Hermes_4.5")
         assert custom["cost"] == 0.0
-        assert custom["has_pricing"] is False
+        assert custom["has_pricing"] is None
+        assert custom["has_estimated_cost_coverage"] is False
 
     def test_tool_usage_from_tool_calls_json(self, db):
         """Tool usage should be extracted from tool_calls JSON when tool_name is NULL."""
@@ -630,21 +1012,28 @@ class TestEdgeCases:
         sf = next(t for t in tools if t["tool"] == "search_files")
         assert sf["count"] == 2
 
-    def test_overview_pricing_sets_are_lists(self, db):
-        """models_with/without_pricing should be JSON-serializable lists."""
+    def test_overview_cost_coverage_lists_are_json_safe(self, db):
+        """Stored estimated-cost coverage is explicit and JSON serializable."""
         import json as _json
         db.create_session(session_id="s1", source="cli", model="gpt-4o")
         db.create_session(session_id="s2", source="cli", model="my-custom")
+        _record_usage(
+            db, "s1", source="cli", provider="openai", model="gpt-4o",
+            estimated_cost_usd=0.01,
+        )
+        _record_usage(
+            db, "s2", source="cli", provider="local", model="my-custom",
+            estimated_cost_usd=None,
+        )
         db._conn.commit()
 
-        engine = InsightsEngine(db)
-        report = engine.generate(days=30)
-        overview = report["overview"]
+        overview = InsightsEngine(db).generate(days=30)["overview"]
 
-        assert isinstance(overview["models_with_pricing"], list)
-        assert isinstance(overview["models_without_pricing"], list)
-        # Should be JSON-serializable
-        _json.dumps(report["overview"])  # would raise if sets present
+        assert overview["models_with_estimated_cost"] == ["gpt-4o"]
+        assert overview["models_with_unknown_estimated_cost"] == ["my-custom"]
+        assert overview["models_with_pricing"] is None
+        assert overview["models_without_pricing"] is None
+        _json.dumps(overview)
 
     def test_mixed_commercial_and_custom_models(self, db):
         """Mix of commercial and custom models: only commercial ones get costs."""
@@ -655,8 +1044,17 @@ class TestEdgeCases:
             output_tokens=5000,
             billing_provider="anthropic",
         )
+        _record_usage(
+            db, "s1", source="cli", provider="anthropic",
+            model="anthropic/claude-sonnet-4-20250514",
+            input_tokens=10000, output_tokens=5000, estimated_cost_usd=0.18,
+        )
         db.create_session(session_id="s2", source="cli", model="my-local-llama")
         db.update_token_counts("s2", input_tokens=10000, output_tokens=5000)
+        _record_usage(
+            db, "s2", source="cli", provider="local", model="my-local-llama",
+            input_tokens=10000, output_tokens=5000, estimated_cost_usd=None,
+        )
         db._conn.commit()
 
         engine = InsightsEngine(db)
@@ -665,16 +1063,23 @@ class TestEdgeCases:
         # Cost should only come from gpt-4o, not from the custom model
         overview = report["overview"]
         assert overview["estimated_cost"] > 0
-        assert "claude-sonnet-4-20250514" in overview["models_with_pricing"]  # list now, not set
-        assert "my-local-llama" in overview["models_without_pricing"]
+        assert "anthropic/claude-sonnet-4-20250514" in overview[
+            "models_with_estimated_cost"
+        ]
+        assert "my-local-llama" in overview["models_with_unknown_estimated_cost"]
 
         # Verify individual model entries
-        claude = next(m for m in report["models"] if m["model"] == "claude-sonnet-4-20250514")
-        assert claude["has_pricing"] is True
+        claude = next(
+            m for m in report["models"]
+            if m["model"] == "anthropic/claude-sonnet-4-20250514"
+        )
+        assert claude["has_pricing"] is None
+        assert claude["has_estimated_cost_coverage"] is True
         assert claude["cost"] > 0
 
         llama = next(m for m in report["models"] if m["model"] == "my-local-llama")
-        assert llama["has_pricing"] is False
+        assert llama["has_pricing"] is None
+        assert llama["has_estimated_cost_coverage"] is False
         assert llama["cost"] == 0.0
 
     def test_single_session_streak(self, db):

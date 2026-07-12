@@ -20,6 +20,7 @@ import pytest
 from agent.usage_analytics import (
     summarize_session_routes,
     summarize_usage_by_provider_model,
+    summarize_usage_by_source,
     summarize_usage_daily,
     summarize_usage_events,
 )
@@ -42,6 +43,8 @@ SUMMARY_KEYS = {
     "average_latency_ms",
     "historical_aggregate_count",
     "reconstructed_call_count",
+    "reconstructed_call_known_aggregate_count",
+    "reconstructed_call_unknown_aggregate_count",
     "estimated_cost_usd",
     "actual_cost_usd",
     "estimated_cost_usd_exact",
@@ -500,9 +503,24 @@ def test_invalid_historical_reconstructed_call_counts_are_ignored_and_flagged():
 
     assert summary["historical_aggregate_count"] == 5
     assert summary["reconstructed_call_count"] == 3
+    assert summary["reconstructed_call_known_aggregate_count"] == 1
+    assert summary["reconstructed_call_unknown_aggregate_count"] == 4
     assert summary["invalid_numeric_event_count"] == 4
     assert summary["invalid_numeric_value_count"] == 4
     json.dumps(summary, allow_nan=False)
+
+
+def test_missing_historical_reconstructed_call_count_remains_unknown_not_zero():
+    summary = summarize_usage_events(
+        [{"record_kind": "historical_aggregate", "api_call_index": None}]
+    )
+
+    assert summary["historical_aggregate_count"] == 1
+    assert summary["reconstructed_call_count"] == 0
+    assert summary["reconstructed_call_known_aggregate_count"] == 0
+    assert summary["reconstructed_call_unknown_aggregate_count"] == 1
+    assert summary["invalid_numeric_event_count"] == 0
+    assert summary["invalid_numeric_value_count"] == 0
 
 
 def test_exact_cost_strings_preserve_extreme_cancellation_across_groups():
@@ -691,6 +709,27 @@ def test_malformed_purpose_uses_invalid_unattributed_bucket_after_valid_null():
     json.dumps(rows, allow_nan=False)
 
 
+def test_source_grouping_preserves_validity_and_unattributed_buckets():
+    rows = summarize_usage_by_source(
+        [
+            {"source": "discord", "input_tokens": 3},
+            {"source": None, "input_tokens": 5},
+            {"source": ["bad"], "input_tokens": 7},
+            {"source": {"also": "bad"}, "input_tokens": 11},
+        ]
+    )
+
+    assert [
+        (row["source"], row["source_is_valid"], row["input_tokens"])
+        for row in rows
+    ] == [
+        ("discord", True, 3),
+        (None, True, 5),
+        (None, False, 18),
+    ]
+    json.dumps(rows, allow_nan=False)
+
+
 def test_malformed_nonfinite_and_out_of_range_timestamps_group_as_unknown():
     events = [
         {"timestamp": 0, "input_tokens": 1},
@@ -764,6 +803,7 @@ def test_summary_wrappers_do_not_call_raw_materializing_query(db, monkeypatch):
 
     assert db.summarize_usage_events()["event_count"] == 1
     assert db.summarize_usage_by_provider_model()[0]["event_count"] == 1
+    assert db.summarize_usage_by_source()[0]["event_count"] == 1
     assert db.summarize_usage_daily(timezone_name="UTC")[0]["event_count"] == 1
     assert db.summarize_session_routes("session-1")[0]["event_count"] == 1
 

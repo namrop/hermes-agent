@@ -5,7 +5,7 @@
 ## Current status
 
 - State: implementation in progress
-- Active task: Task 5 quality follow-up — conservative invalid/unattributed dimensions
+- Active task: Task 7 — dashboard analytics event-time cutover
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -31,9 +31,9 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
 | 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
 | 4. Residual-only historical backfill | completed | `cc1b84d72`, `26ff22a71` | spec PASS; quality APPROVED; 241 state + 267 focused tests | Idempotent residuals; ambiguous routes remain unattributed |
-| 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d` + invalid-dimension follow-up (this commit) | spec PASS; quality APPROVED; GREEN 272 + 298 | Streaming, strict-JSON-safe, exact-cost semantics |
-| 6. Insights cutover | pending | — | RED pending | Keep session activity metrics |
-| 7. Dashboard API cutover | pending | — | — | Event-time daily windows |
+| 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d`, `461ac1a33` | spec PASS; quality APPROVED; GREEN 272 + 298 | Streaming, strict-JSON-safe, exact-cost semantics |
+| 6. Insights cutover | completed | this commit | RED/GREEN complete; quality APPROVED; 345 focused/combined | Event usage + session activity; three constant ledger scans |
+| 7. Dashboard API cutover | in progress | — | RED pending | Event-time daily windows |
 | 8. CLI/gateway `/usage` cutover | pending | — | — | Full persisted mixed routes |
 | 9. Cross-harness contract docs | pending | — | — | Quota and billing remain separate |
 | 10. Integration review/handoff | pending | — | — | No push/deploy without approval |
@@ -321,6 +321,44 @@ Append each RED and GREEN command here with exit code and concise result.
 - Final combined accounting GREEN: exit 0; `298 passed in 16.36s`.
 - Compilation and scoped diff checks: PASS.
 
+### Task 6
+
+- Initial RED command: `.venv/bin/python -m pytest tests/agent/test_insights.py::TestEventDerivedInsights -o 'addopts=' -q`.
+- Initial RED result: exit 1; `4 failed in 5.65s`. Failures proved Insights
+  still used scalar session tokens/model/cost, omitted source-filtered event
+  usage, and hid historical aggregate coverage.
+- Initial GREEN: exit 0; `4 passed in 1.04s`.
+- Existing-suite adaptation added per-event facts to historical test fixtures;
+  session scalar aggregates remain present but are no longer authoritative.
+- Event-time follow-up RED: `2 failed`; a recent event from a session started
+  before the cutoff crashed the empty-session activity path, and “Most tokens”
+  still read scalar session counters. GREEN removed scalar-token notable-session
+  leakage and retained event-only reports with zero fabricated activity.
+- First combined GREEN: `337 passed`; quality review requested changes for
+  event-only source platforms, repeated per-platform ledger scans, hidden
+  reconstructed coverage, and misleading compatibility ratios.
+- Source-group read-model RED failed on missing `summarize_usage_by_source`;
+  GREEN added one streaming canonical source scan with the same valid-NULL versus
+  invalid/unattributed policy.
+- Second combined GREEN: `339 passed`; review follow-ups added event-only
+  platform union, empty-activity semantics, reconstructed-call formatting, and
+  explicit non-numeric deprecated session aliases.
+- Identity/coverage RED: `8 failed`; covered canonical NULL/empty/malformed
+  model identity, unknown reconstructed-call coverage, valid NULL versus
+  malformed source labels, empty-string source filters, and accurate stored-cost
+  coverage names. GREEN preserved canonical values plus separate display labels.
+- Final review follow-up corrected deterministic canonical source ordering,
+  displayed API attempts rather than only successes under “Calls,” and exposed
+  `source_filter=''` as `(empty)` in terminal/gateway headers.
+- Final combined GREEN: `.venv/bin/python -m pytest tests/agent/test_insights.py tests/agent/test_usage_analytics.py tests/test_hermes_state.py tests/test_sql_injection.py -o 'addopts=' -q` → `345 passed in 15.73s`.
+- Determinism probe: five local hash seeds and the reviewer’s 50-seed probe all
+  returned canonical source order `['', '(empty)']`.
+- Final quality review: APPROVED; focused Insights/read-model suite `100 passed`;
+  gateway/account-usage adjacency `12 passed`; compilation and diff checks PASS.
+- Files changed: `agent/insights.py`, `agent/usage_analytics.py`,
+  `hermes_state.py`, `tests/agent/test_insights.py`,
+  `tests/agent/test_usage_analytics.py`, and this ledger.
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -409,6 +447,21 @@ Append each RED and GREEN command here with exit code and concise result.
 - Daily read models use event timestamps. `timezone_name=None` uses the local
   process timezone; explicit IANA names use `zoneinfo.ZoneInfo` and invalid
   names raise a clear `ValueError`. Core costs are not rounded.
+- Insights performs exactly three bounded event-ledger scans: global usage,
+  provider/model routes, and source routes. Session rows supply only activity
+  metrics (session/message/tool counts, durations, temporal activity, and
+  activity-ranked notable sessions); scalar session token/cost/model fields are
+  excluded from its session projection.
+- Insights preserves canonical provider/model/source values and validity bits.
+  Human labels (`unattributed`, `invalid/unattributed`, `(empty)`) are separate
+  display fields and never replace canonical identity.
+- Model “Calls” means observed API attempts plus known reconstructed calls.
+  Missing historical call coverage remains `unknown`, not zero; successes remain
+  available independently. Historical aggregate/call coverage is visible in both
+  terminal and gateway formatters.
+- Stored estimated-cost presence is named cost coverage, not pricing knowledge.
+  Legacy pricing/session-cost aliases remain present only as explicit `None`
+  values where no truthful event-to-session mapping exists.
 
 ## Known risks
 
@@ -457,10 +510,10 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 4 residual-only historical backfill and attribution hardening are
   complete in `cc1b84d72` and `26ff22a71`; spec PASS, quality APPROVED,
   `241` state tests and `267` combined focused tests.
-- Task 5 canonical event-derived read models are committed through boundary
-  hardening at `49847935d`; the conservative invalid/unattributed dimension
-  follow-up is green in the current worktree (`272` required; `298` combined),
-  and its quality re-review is APPROVED. Commit is the remaining Task 5 gate.
-- Task 6 remains the active task. Before its first code change, complete Task 5's
-  quality re-review; then cut Insights usage sections over while retaining
-  session-derived activity metrics.
+- Task 5 canonical event-derived read models and conservative
+  invalid/unattributed dimension policy are complete through `461ac1a33`;
+  quality APPROVED.
+- Task 6 Insights cutover is green and quality APPROVED in the current commit:
+  event-derived provider/model/token/cost and source rows, session-derived
+  activity only, constant three ledger scans, and explicit historical/invalid/
+  unknown coverage. Task 7 dashboard analytics is active next.
