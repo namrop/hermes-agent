@@ -179,6 +179,124 @@ class TestSessionLifecycle:
         event = db.get_llm_usage_events(session_id="s1")[0]
         assert event["source"] == "telegram"
 
+    def test_record_usage_and_rollup_inserts_event_and_increments_session(self, db):
+        db.create_session(session_id="s1", source="discord")
+
+        result = db.record_usage_and_rollup(
+            event_uid="hermes:test-call:1",
+            session_id="s1",
+            provider="openai-codex",
+            model="gpt-5.5",
+            input_tokens=120,
+            output_tokens=30,
+            cache_read_tokens=80,
+            cache_write_tokens=10,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.25,
+            actual_cost_usd=0.20,
+            cost_status="estimated",
+            cost_source="catalog",
+            pricing_version="2026-07-11",
+            api_call_index=1,
+        )
+
+        assert result["inserted"] is True
+        assert result["event_uid"] == "hermes:test-call:1"
+        assert result["provider"] == "openai-codex"
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 120
+        assert session["output_tokens"] == 30
+        assert session["cache_read_tokens"] == 80
+        assert session["cache_write_tokens"] == 10
+        assert session["reasoning_tokens"] == 7
+        assert session["estimated_cost_usd"] == pytest.approx(0.25)
+        assert session["actual_cost_usd"] == pytest.approx(0.20)
+        assert session["api_call_count"] == 1
+
+    def test_record_usage_and_rollup_deduplicates_event_uid_replay(self, db):
+        db.create_session(session_id="s1", source="cron")
+        kwargs = {
+            "event_uid": "hermes:test-call:replayed",
+            "session_id": "s1",
+            "provider": "openrouter",
+            "model": "aion-labs/aion-3.0",
+            "input_tokens": 40,
+            "output_tokens": 5,
+            "api_call_index": 1,
+        }
+
+        first = db.record_usage_and_rollup(**kwargs)
+        replay = db.record_usage_and_rollup(**kwargs)
+
+        assert first["inserted"] is True
+        assert replay["inserted"] is False
+        assert replay["id"] == first["id"]
+        assert len(db.get_llm_usage_events(session_id="s1")) == 1
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 40
+        assert session["output_tokens"] == 5
+        assert session["api_call_count"] == 1
+
+    def test_record_usage_and_rollup_rolls_back_session_when_event_insert_fails(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db._conn.execute(
+            """CREATE TRIGGER reject_test_usage_event
+               BEFORE INSERT ON llm_usage_events
+               BEGIN
+                   SELECT RAISE(FAIL, 'forced usage event insert failure');
+               END"""
+        )
+
+        with pytest.raises(Exception, match="forced usage event insert failure"):
+            db.record_usage_and_rollup(
+                event_uid="hermes:test-call:rejected",
+                session_id="s1",
+                provider="deepseek",
+                model="deepseek-v4-pro",
+                input_tokens=90,
+                output_tokens=10,
+                estimated_cost_usd=0.5,
+                api_call_index=1,
+            )
+
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 0
+        assert session["output_tokens"] == 0
+        assert session["estimated_cost_usd"] is None
+        assert session["api_call_count"] == 0
+
+    def test_record_usage_and_rollup_preserves_mixed_event_dimensions(self, db):
+        db.create_session(session_id="s1", source="discord")
+
+        db.record_usage_and_rollup(
+            event_uid="hermes:mixed:1",
+            session_id="s1",
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            input_tokens=10,
+            output_tokens=2,
+            api_call_index=1,
+        )
+        db.record_usage_and_rollup(
+            event_uid="hermes:mixed:2",
+            session_id="s1",
+            provider="openrouter",
+            model="aion-labs/aion-3.0",
+            input_tokens=20,
+            output_tokens=3,
+            api_call_index=2,
+        )
+
+        events = db.get_llm_usage_events(session_id="s1")
+        assert [(event["provider"], event["model"]) for event in events] == [
+            ("openai-codex", "gpt-5.6-sol"),
+            ("openrouter", "aion-labs/aion-3.0"),
+        ]
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 30
+        assert session["output_tokens"] == 5
+        assert session["api_call_count"] == 2
+
     def test_backfill_llm_usage_events_from_session_totals_is_approximate_and_idempotent(self, db):
         db.create_session(session_id="s1", source="discord", model="gpt-5.5")
         db.update_token_counts(

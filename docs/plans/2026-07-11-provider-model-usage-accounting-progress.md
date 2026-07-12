@@ -4,8 +4,8 @@
 
 ## Current status
 
-- State: documentation kickoff in progress
-- Active task: Task 1 — commit plan and progress ledger
+- State: implementation in progress
+- Active task: Task 3 — background-review accounting
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -27,9 +27,9 @@ These existed before this work and must remain unstaged/unmodified by this imple
 
 | Task | State | Commit | Verification | Notes |
 |---|---|---|---|---|
-| 1. Plan + progress ledger | in progress | pending | pending | Must land before production code |
-| 2. Atomic event + rollup | pending | — | — | TDD required |
-| 3. Background-review accounting | pending | — | — | Preserve transcript boundary |
+| 1. Plan + progress ledger | completed | `a3a8b38ce` | readback + diff checks PASS | Landed before production code |
+| 2. Atomic event + rollup | completed | `feat: make LLM usage event rollups atomic` (this commit) | 225 + 11 tests PASS | Atomic and replay-safe |
+| 3. Background-review accounting | active | — | RED pending | Preserve transcript boundary |
 | 4. Residual-only historical backfill | pending | — | — | No overlap with real events |
 | 5. Event-derived read models | pending | — | — | Central query semantics |
 | 6. Insights cutover | pending | — | — | Keep session activity metrics |
@@ -85,11 +85,25 @@ Append each RED and GREEN command here with exit code and concise result.
 
 - Documents written and read back: PASS
 - `git diff --check` on both documents: PASS
-- Commit: pending scoped documentation commit
+- Commit: `a3a8b38ce` (`docs: plan provider model usage accounting`)
+
+### Task 2
+
+- RED command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py -o 'addopts=' -q`
+- RED result: exit 1; `6 failed, 219 passed in 11.04s`.
+- Expected failures: four missing `SessionDB.record_usage_and_rollup()` behaviors and two conversation-loop assertions showing that the old separate persistence path was still used.
+- GREEN command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py -o 'addopts=' -q`
+- Final GREEN result after refactor: exit 0; `225 passed in 10.83s`.
+- Pricing regression command: `.venv/bin/python -m pytest tests/agent/test_usage_pricing.py -o 'addopts=' -q`
+- Final pricing result after refactor: exit 0; `11 passed in 0.92s`.
+- Files changed: `hermes_state.py`, `agent/conversation_loop.py`, `tests/test_hermes_state.py`, `tests/run_agent/test_token_persistence_non_cli.py`, and this progress ledger.
 
 ## Decisions and deviations
 
-- None yet.
+- Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
+- `event_uid` is additive and nullable for legacy writers, with a SQLite partial unique index over non-NULL values.
+- The conversation loop generates one `hermes:<uuid4>` identity before persistence and uses only `record_usage_and_rollup()` for ordinary successful-call DB accounting.
+- `record_llm_usage_event()` and `update_token_counts()` remain unchanged and available for compatibility; prompt-cache/token bucket semantics are unchanged.
 
 ## Known risks
 
@@ -116,5 +130,6 @@ Append each RED and GREEN command here with exit code and concise result.
 
 ## Last verified continuation point
 
-- No implementation commit yet.
-- Next action: verify and commit Task 1 documentation, then begin Task 2 by writing failing atomic-persistence tests.
+- Task 1 documentation is committed at `a3a8b38ce`.
+- Task 2 implementation and focused tests are complete; the scoped commit is `feat: make LLM usage event rollups atomic`.
+- Next action: begin Task 3 by writing failing background-review accounting tests before changing production code.

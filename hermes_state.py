@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE TABLE IF NOT EXISTS llm_usage_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_uid TEXT,
     timestamp REAL NOT NULL,
     session_id TEXT REFERENCES sessions(id),
     source TEXT,
@@ -615,6 +616,14 @@ class SessionDB:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
+        # event_uid is reconciled onto legacy tables above, so this index must
+        # be created afterward. NULL keeps legacy event writers additive while
+        # non-NULL producer IDs provide idempotency for atomic accounting.
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_usage_events_event_uid "
+            "ON llm_usage_events(event_uid) WHERE event_uid IS NOT NULL"
+        )
+
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
         # version.  No version-gated column additions remain.
@@ -980,6 +989,175 @@ class SessionDB:
                 ),
             )
             return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def record_usage_and_rollup(
+        self,
+        event_uid: str,
+        session_id: Optional[str] = None,
+        *,
+        timestamp: Optional[float] = None,
+        source: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        api_mode: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+        latency_ms: Optional[int] = None,
+        request_status: str = "ok",
+        error_class: Optional[str] = None,
+        api_call_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Atomically persist one usage event and its session rollup.
+
+        ``event_uid`` is a stable producer identity. Replaying it returns the
+        existing event with ``inserted=False`` and leaves the compatibility
+        session counters unchanged. Legacy :meth:`record_llm_usage_event`
+        remains available for callers that only write event facts.
+        """
+        if not isinstance(event_uid, str) or not event_uid.strip():
+            raise ValueError("event_uid must be a non-empty string")
+
+        now = time.time()
+        event_ts = float(timestamp if timestamp is not None else now)
+
+        def _to_int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except Exception:
+                return 0
+
+        input_count = _to_int(input_tokens)
+        output_count = _to_int(output_tokens)
+        cache_read_count = _to_int(cache_read_tokens)
+        cache_write_count = _to_int(cache_write_tokens)
+        reasoning_count = _to_int(reasoning_tokens)
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT * FROM llm_usage_events WHERE event_uid = ?",
+                (event_uid,),
+            ).fetchone()
+            if existing is not None:
+                result = dict(existing)
+                result["inserted"] = False
+                return result
+
+            event_source = source
+            if session_id:
+                # Keep session creation in this transaction too: a failed
+                # event insert must not leave even a placeholder row behind.
+                conn.execute(
+                    """INSERT OR IGNORE INTO sessions
+                           (id, source, model, started_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (session_id, source or "unknown", model, event_ts),
+                )
+                session = conn.execute(
+                    "SELECT source FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if session is not None:
+                    event_source = event_source or session["source"]
+
+                # Deliberately update before INSERT: _execute_write() rolls
+                # this back if any event constraint or trigger rejects the
+                # event, proving there is no partial compatibility rollup.
+                conn.execute(
+                    """UPDATE sessions SET
+                           input_tokens = input_tokens + ?,
+                           output_tokens = output_tokens + ?,
+                           cache_read_tokens = cache_read_tokens + ?,
+                           cache_write_tokens = cache_write_tokens + ?,
+                           reasoning_tokens = reasoning_tokens + ?,
+                           estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
+                           actual_cost_usd = CASE
+                               WHEN ? IS NULL THEN actual_cost_usd
+                               ELSE COALESCE(actual_cost_usd, 0) + ?
+                           END,
+                           cost_status = COALESCE(?, cost_status),
+                           cost_source = COALESCE(?, cost_source),
+                           pricing_version = COALESCE(?, pricing_version),
+                           billing_provider = COALESCE(billing_provider, ?),
+                           billing_base_url = COALESCE(billing_base_url, ?),
+                           billing_mode = COALESCE(billing_mode, ?),
+                           model = COALESCE(model, ?),
+                           api_call_count = COALESCE(api_call_count, 0) + 1
+                       WHERE id = ?""",
+                    (
+                        input_count,
+                        output_count,
+                        cache_read_count,
+                        cache_write_count,
+                        reasoning_count,
+                        estimated_cost_usd,
+                        actual_cost_usd,
+                        actual_cost_usd,
+                        cost_status,
+                        cost_source,
+                        pricing_version,
+                        provider,
+                        billing_base_url,
+                        billing_mode,
+                        model,
+                        session_id,
+                    ),
+                )
+
+            cursor = conn.execute(
+                """INSERT INTO llm_usage_events (
+                       event_uid, timestamp, session_id, source, provider, model,
+                       api_mode, billing_base_url, billing_mode, input_tokens,
+                       output_tokens, cache_read_tokens, cache_write_tokens,
+                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                       cost_status, cost_source, pricing_version, latency_ms,
+                       request_status, error_class, api_call_index, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_uid,
+                    event_ts,
+                    session_id,
+                    event_source,
+                    provider,
+                    model,
+                    api_mode,
+                    billing_base_url,
+                    billing_mode,
+                    input_count,
+                    output_count,
+                    cache_read_count,
+                    cache_write_count,
+                    reasoning_count,
+                    estimated_cost_usd,
+                    actual_cost_usd,
+                    cost_status,
+                    cost_source,
+                    pricing_version,
+                    latency_ms,
+                    request_status or "ok",
+                    error_class,
+                    api_call_index,
+                    now,
+                ),
+            )
+            event = conn.execute(
+                "SELECT * FROM llm_usage_events WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            result = dict(event)
+            result["inserted"] = True
+            return result
 
         return self._execute_write(_do)
 

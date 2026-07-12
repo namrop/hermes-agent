@@ -1587,23 +1587,16 @@ def run_conversation(
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
 
-                    # Persist token counts to session DB for /insights.
-                    # Do this for every platform with a session_id so non-CLI
-                    # sessions (gateway, cron, delegated runs) cannot lose
-                    # token/accounting data if a higher-level persistence path
-                    # is skipped or fails. Gateway/session-store writes use
+                    # Persist each successful call as one idempotent event and
+                    # update the compatibility session rollup in the same DB
+                    # transaction. Do this for every platform with a session_id
+                    # so non-CLI sessions (gateway, cron, delegated runs) cannot
+                    # lose accounting if a higher-level persistence path is
+                    # skipped or fails. Gateway/session-store writes use
                     # absolute totals, so they safely overwrite these per-call
                     # deltas instead of double-counting them.
                     if agent._session_db and agent.session_id:
                         try:
-                            # Ensure the session row exists before attempting UPDATE.
-                            # Under concurrent load (cron/kanban), the initial
-                            # _ensure_db_session() may have failed due to SQLite
-                            # locking.  Retry here so per-call token deltas are
-                            # not silently lost (UPDATE on a non-existent row
-                            # affects 0 rows without error).
-                            if not agent._session_db_created:
-                                agent._ensure_db_session()
                             estimated_cost = (
                                 float(cost_result.amount_usd)
                                 if cost_result.amount_usd is not None else None
@@ -1612,8 +1605,16 @@ def run_conversation(
                                 "subscription_included"
                                 if cost_result.status == "included" else None
                             )
-                            agent._session_db.update_token_counts(
-                                agent.session_id,
+                            event_uid = f"hermes:{uuid.uuid4()}"
+                            agent._session_db.record_usage_and_rollup(
+                                event_uid=event_uid,
+                                session_id=agent.session_id,
+                                source=getattr(agent, "platform", None),
+                                provider=agent.provider,
+                                model=agent.model,
+                                api_mode=agent.api_mode,
+                                billing_base_url=agent.base_url,
+                                billing_mode=billing_mode,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
                                 cache_read_tokens=canonical_usage.cache_read_tokens,
@@ -1622,34 +1623,11 @@ def run_conversation(
                                 estimated_cost_usd=estimated_cost,
                                 cost_status=cost_result.status,
                                 cost_source=cost_result.source,
-                                billing_provider=agent.provider,
-                                billing_base_url=agent.base_url,
-                                billing_mode=billing_mode,
-                                model=agent.model,
-                                api_call_count=1,
+                                pricing_version=cost_result.pricing_version,
+                                latency_ms=int(api_duration * 1000),
+                                request_status="ok",
+                                api_call_index=agent.session_api_calls,
                             )
-                            if hasattr(agent._session_db, "record_llm_usage_event"):
-                                agent._session_db.record_llm_usage_event(
-                                    session_id=agent.session_id,
-                                    source=getattr(agent, "platform", None),
-                                    provider=agent.provider,
-                                    model=agent.model,
-                                    api_mode=agent.api_mode,
-                                    billing_base_url=agent.base_url,
-                                    billing_mode=billing_mode,
-                                    input_tokens=canonical_usage.input_tokens,
-                                    output_tokens=canonical_usage.output_tokens,
-                                    cache_read_tokens=canonical_usage.cache_read_tokens,
-                                    cache_write_tokens=canonical_usage.cache_write_tokens,
-                                    reasoning_tokens=canonical_usage.reasoning_tokens,
-                                    estimated_cost_usd=estimated_cost,
-                                    cost_status=cost_result.status,
-                                    cost_source=cost_result.source,
-                                    pricing_version=cost_result.pricing_version,
-                                    latency_ms=int(api_duration * 1000),
-                                    request_status="ok",
-                                    api_call_index=agent.session_api_calls,
-                                )
                         except Exception as e:
                             # Log token persistence failures so they're
                             # visible in agent.log — silent loss here is
