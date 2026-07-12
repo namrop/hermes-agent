@@ -5,7 +5,7 @@
 ## Current status
 
 - State: implementation in progress
-- Active task: Task 9 — cross-harness contract documentation
+- Active task: Task 10 — final integration review and handoff
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -35,7 +35,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 6. Insights cutover | completed | `96c7f193e` | RED/GREEN complete; quality APPROVED; 345 focused/combined | Event usage + session activity; three constant ledger scans |
 | 7. Dashboard API cutover | completed | `00ffd02ca` | RED/GREEN complete; quality APPROVED; 41 combined focused tests; web build PASS | Event-time daily windows and route truth |
 | 8. CLI/gateway `/usage` cutover | completed | `9bb3c633a` | RED/GREEN complete; quality APPROVED; 429 combined focused tests | Atomic persisted report with full mixed routes |
-| 9. Cross-harness contract docs | pending | — | — | Quota and billing remain separate |
+| 9. Cross-harness contract docs | completed | `1b78f7637` | six JSON examples parse; AI-writing residue LOW; spec review APPROVED | Quota and billing remain separate |
 | 10. Integration review/handoff | pending | — | — | No push/deploy without approval |
 
 ## Evidence captured before implementation
@@ -421,6 +421,30 @@ Append each RED and GREEN command here with exit code and concise result.
   quality review: APPROVED. The full web-server file still has the same two
   unrelated PTY/WebSocket baseline failures recorded under Task 7.
 - Commit: `9bb3c633a` (`feat: derive session usage from event ledger`).
+
+### Task 9
+
+- Added `docs/architecture/usage-accounting-event-contract.md` as the stable
+  version 1 interchange contract rather than treating Hermes's SQLite table as
+  the public schema.
+- Defined separate `usage_event_v1`, `quota_observation_v1`, and
+  `billing_fact_v1` fact classes; normative identity/replay conflict rules;
+  provider/model and token-bucket semantics; purpose, completeness, confidence,
+  request, and cost enums; public aggregate-only exclusions; and Hermes, Codex
+  CLI, and reconstructed examples.
+- The document explicitly names current Hermes projection gaps, including
+  incomplete failed-attempt capture, no requested/reported model split, no
+  logical-call/attempt identifiers, conservative completeness export, local
+  `cost_status=reconstructed` mapping, and ID-only deduplication without payload
+  conflict detection.
+- Review follow-ups defined canonical replay comparison, correction pointers by
+  normative identity, billing sign rules, quota/billing validation and replay,
+  token-only missing fields versus route-attribution gaps, extensible enum
+  handling, I-JSON integer bounds, and deterministic timestamp normalization.
+- Verification: all six fenced JSON examples parse; required contract surfaces
+  are present; `git diff --check` PASS; deterministic AI-writing scanner gestalt
+  LOW (`0.81 / 1000 words`); final specification review APPROVED.
+- Commit: `1b78f7637` (`docs: define cross-harness usage accounting contract`).
 
 ## Decisions and deviations
 
