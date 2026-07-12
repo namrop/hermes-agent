@@ -3,6 +3,8 @@
 import os
 import json
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -971,6 +973,289 @@ class TestNewEndpoints:
             },
             "top_skills": [],
         }
+
+    def test_analytics_usage_uses_event_time_and_mixed_routes(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        now = time.time()
+        old_start = now - 40 * 86400
+        try:
+            db.create_session(
+                session_id="analytics-mixed-old",
+                source="cli",
+                model="scalar/wrong",
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (old_start, "analytics-mixed-old"),
+            )
+            db.update_token_counts(
+                "analytics-mixed-old",
+                input_tokens=9999,
+                output_tokens=9999,
+                billing_provider="scalar-wrong",
+                estimated_cost_usd=99.0,
+            )
+            db.record_llm_usage_event(
+                "analytics-mixed-old",
+                timestamp=now,
+                source="cli",
+                provider="openrouter",
+                model="shared-model",
+                input_tokens=10,
+                output_tokens=2,
+                estimated_cost_usd=0.11,
+            )
+            db.record_llm_usage_event(
+                "analytics-mixed-old",
+                timestamp=now + 1,
+                source="cli",
+                provider="anthropic",
+                model="shared-model",
+                input_tokens=20,
+                output_tokens=3,
+                estimated_cost_usd=0.22,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/usage?days=7")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["totals"]["total_input"] == 30
+        assert data["totals"]["total_output"] == 5
+        assert data["totals"]["total_estimated_cost"] == pytest.approx(0.33)
+        assert data["totals"]["total_api_calls"] == 2
+        assert data["totals"]["total_sessions"] == 0
+        assert {
+            (row["provider"], row["model"], row["input_tokens"])
+            for row in data["by_model"]
+        } == {
+            ("openrouter", "shared-model", 10),
+            ("anthropic", "shared-model", 20),
+        }
+        expected_day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+        day = next(row for row in data["daily"] if row["day"] == expected_day)
+        assert day["input_tokens"] == 30
+        assert day["total_tokens"] == 35
+        assert day["api_calls"] == 2
+        assert day["sessions"] == 0
+
+    def test_analytics_daily_rows_preserve_cost_coverage(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        now = time.time()
+        try:
+            db.create_session(session_id="analytics-daily-cost", source="cli")
+            db.record_llm_usage_event(
+                "analytics-daily-cost",
+                timestamp=now,
+                provider="openrouter",
+                model="daily-cost-model",
+                input_tokens=1,
+                output_tokens=1,
+                estimated_cost_usd=None,
+                actual_cost_usd=0.0,
+            )
+        finally:
+            db.close()
+
+        data = self.client.get("/api/analytics/usage?days=7").json()
+        expected_day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+        day = next(row for row in data["daily"] if row["day"] == expected_day)
+
+        assert day["estimated_cost_exact"] == "0"
+        assert day["estimated_cost_known_event_count"] == 0
+        assert day["estimated_cost_unknown_event_count"] == 1
+        assert day["actual_cost_exact"] == "0"
+        assert day["actual_cost_known_event_count"] == 1
+        assert day["actual_cost_unknown_event_count"] == 0
+
+    def test_models_analytics_uses_event_routes_and_event_session_association(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        now = time.time()
+        try:
+            db.create_session(
+                session_id="models-mixed",
+                source="discord",
+                model="scalar/wrong",
+            )
+            db.update_token_counts(
+                "models-mixed",
+                input_tokens=7777,
+                output_tokens=7777,
+                billing_provider="scalar-wrong",
+                estimated_cost_usd=88.0,
+            )
+            db.record_llm_usage_event(
+                "models-mixed",
+                timestamp=now,
+                source="discord",
+                provider="openrouter",
+                model="same-model",
+                input_tokens=100,
+                output_tokens=10,
+                estimated_cost_usd=0.1,
+            )
+            db.record_llm_usage_event(
+                "models-mixed",
+                timestamp=now + 1,
+                source="discord",
+                provider="groq",
+                model="same-model",
+                input_tokens=50,
+                output_tokens=5,
+                estimated_cost_usd=None,
+                request_status="error",
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/models?days=7")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["totals"]["distinct_models"] == 1
+        assert data["totals"]["distinct_routes"] == 2
+        assert data["totals"]["total_input"] == 150
+        assert data["totals"]["total_output"] == 15
+        assert data["totals"]["total_estimated_cost"] == pytest.approx(0.1)
+        assert data["totals"]["total_api_calls"] == 2
+        assert data["totals"]["total_sessions"] == 1
+        rows = {(row["provider"], row["model"]): row for row in data["models"]}
+        assert set(rows) == {("openrouter", "same-model"), ("groq", "same-model")}
+        assert rows[("openrouter", "same-model")]["sessions"] == 1
+        assert rows[("groq", "same-model")]["sessions"] == 1
+        assert rows[("openrouter", "same-model")]["api_calls"] == 1
+        assert rows[("groq", "same-model")]["api_calls"] == 1
+        assert rows[("openrouter", "same-model")]["total_tokens"] == 110
+        assert rows[("groq", "same-model")]["estimated_cost_usd_exact"] == "0"
+        assert rows[("groq", "same-model")]["estimated_cost_unknown_event_count"] == 1
+        assert rows[("openrouter", "same-model")]["tool_calls"] is None
+        assert rows[("openrouter", "same-model")]["last_used_at"] == pytest.approx(now)
+        assert rows[("openrouter", "same-model")]["avg_tokens_per_session"] == 110
+        assert data["models"][0]["provider"] == "openrouter"
+
+    def test_models_analytics_keeps_unknown_session_attribution_unknown(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        now = time.time()
+        try:
+            db.create_session(session_id="models-unattributed", source="cli")
+            event_id = db.record_llm_usage_event(
+                "models-unattributed",
+                timestamp=now,
+                provider="openrouter",
+                model="unknown-session-model",
+                input_tokens=12,
+                output_tokens=3,
+            )
+            db._conn.execute(
+                "UPDATE llm_usage_events SET session_id = NULL WHERE id = ?",
+                (event_id,),
+            )
+        finally:
+            db.close()
+
+        data = self.client.get("/api/analytics/models?days=7").json()
+        row = next(
+            row for row in data["models"] if row["model"] == "unknown-session-model"
+        )
+
+        assert row["sessions"] is None
+        assert row["avg_tokens_per_session"] is None
+        assert data["totals"]["total_sessions"] is None
+
+    def test_models_analytics_activity_uses_canonical_inclusive_event_window(
+        self, monkeypatch
+    ):
+        from hermes_state import SessionDB
+        import hermes_cli.web_server as web_server
+
+        now = 2_000_000_000.0
+        cutoff = now - 7 * 86400
+        monkeypatch.setattr(web_server.time, "time", lambda: now)
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="models-boundary", source="cli")
+            db.record_llm_usage_event(
+                "models-boundary",
+                timestamp=cutoff,
+                provider="openrouter",
+                model="boundary-model",
+                input_tokens=10,
+                output_tokens=1,
+            )
+            malformed_id = db.record_llm_usage_event(
+                "models-boundary",
+                timestamp=cutoff + 1,
+                provider="openrouter",
+                model="boundary-model",
+                input_tokens=999,
+                output_tokens=999,
+            )
+            db._conn.execute(
+                "UPDATE llm_usage_events SET timestamp = 'malformed' WHERE id = ?",
+                (malformed_id,),
+            )
+        finally:
+            db.close()
+
+        data = self.client.get("/api/analytics/models?days=7").json()
+        row = next(row for row in data["models"] if row["model"] == "boundary-model")
+
+        assert row["input_tokens"] == 10
+        assert row["sessions"] == 1
+        assert row["last_used_at"] == cutoff
+
+    def test_analytics_exposes_historical_reconstruction_coverage(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="analytics-historical",
+                source="cli",
+                model="legacy",
+            )
+            event_id = db.record_llm_usage_event(
+                "analytics-historical",
+                timestamp=time.time(),
+                source="cli",
+                provider=None,
+                model=None,
+                input_tokens=100,
+                output_tokens=20,
+                api_call_index=4,
+                estimated_cost_usd=0.5,
+            )
+            db._conn.execute(
+                "UPDATE llm_usage_events SET record_kind = 'historical_aggregate' "
+                "WHERE id = ?",
+                (event_id,),
+            )
+        finally:
+            db.close()
+
+        usage = self.client.get("/api/analytics/usage?days=7").json()
+        models = self.client.get("/api/analytics/models?days=7").json()
+
+        assert usage["totals"]["historical_aggregate_count"] == 1
+        assert usage["totals"]["reconstructed_call_count"] == 4
+        assert usage["by_model"][0]["provider"] is None
+        assert usage["by_model"][0]["model"] is None
+        assert usage["by_model"][0]["provider_is_valid"] is True
+        assert usage["by_model"][0]["model_is_valid"] is True
+        assert models["totals"]["historical_aggregate_count"] == 1
+        assert models["totals"]["reconstructed_call_count"] == 4
+        assert models["models"][0]["api_calls"] == 4
 
     def test_analytics_usage_includes_skill_breakdown(self):
         from hermes_state import SessionDB

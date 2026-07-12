@@ -5,7 +5,7 @@
 ## Current status
 
 - State: implementation in progress
-- Active task: Task 7 — dashboard analytics event-time cutover
+- Active task: Task 8 — CLI/gateway `/usage` persisted mixed-route cutover
 - Repository: `/srv/pharos/repos/hermes-agent`
 - Branch: `luis/hermes-runtime-fixes-no-workflow`
 - Kickoff HEAD: `de43c8a12`
@@ -32,9 +32,9 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
 | 4. Residual-only historical backfill | completed | `cc1b84d72`, `26ff22a71` | spec PASS; quality APPROVED; 241 state + 267 focused tests | Idempotent residuals; ambiguous routes remain unattributed |
 | 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d`, `461ac1a33` | spec PASS; quality APPROVED; GREEN 272 + 298 | Streaming, strict-JSON-safe, exact-cost semantics |
-| 6. Insights cutover | completed | this commit | RED/GREEN complete; quality APPROVED; 345 focused/combined | Event usage + session activity; three constant ledger scans |
-| 7. Dashboard API cutover | in progress | — | RED pending | Event-time daily windows |
-| 8. CLI/gateway `/usage` cutover | pending | — | — | Full persisted mixed routes |
+| 6. Insights cutover | completed | `96c7f193e` | RED/GREEN complete; quality APPROVED; 345 focused/combined | Event usage + session activity; three constant ledger scans |
+| 7. Dashboard API cutover | completed | pending commit | RED/GREEN complete; quality APPROVED; 41 combined focused tests; web build PASS | Event-time daily windows and route truth |
+| 8. CLI/gateway `/usage` cutover | in progress | — | — | Full persisted mixed routes |
 | 9. Cross-harness contract docs | pending | — | — | Quota and billing remain separate |
 | 10. Integration review/handoff | pending | — | — | No push/deploy without approval |
 
@@ -359,6 +359,39 @@ Append each RED and GREEN command here with exit code and concise result.
   `hermes_state.py`, `tests/agent/test_insights.py`,
   `tests/agent/test_usage_analytics.py`, and this ledger.
 
+### Task 7
+
+- Initial dashboard regressions covered mixed provider/model routes, event-time
+  daily attribution, model-route session association, and visible historical
+  reconstruction coverage. Initial focused GREEN: `3 passed`.
+- Frontend typecheck RED: `npm run build` failed with eight nullable-field and
+  unused-helper errors in `ModelsPage.tsx`; nullable API values and canonical
+  route identities were then rendered explicitly. First web build GREEN: PASS.
+- First full backend file run: `146 passed, 2 failed`; both failures were
+  pre-existing PTY/WebSocket tests outside the accounting cutover. Repository
+  lint likewise remains blocked by pre-existing React-hook and i18n errors.
+- First quality review requested fixes for incomplete session attribution,
+  malformed timestamp filtering, cache-inclusive canonical token totals,
+  exact-cost/unknown-coverage display, distinct-model versus route counts,
+  React key collisions, stale explanatory copy, and lexical model ranking.
+- Review-follow-up RED: three route regressions failed for distinct model count,
+  unknown session attribution, and inclusive finite event-window activity.
+  GREEN: `3 passed` after reusing the canonical ledger filter, preserving NULL
+  attribution, counting models independently from routes, and ranking by usage.
+- Canonical daily-total RED failed on missing `total_tokens`; GREEN added the
+  field and cache-read/cache-write-aware frontend charts and model cards.
+- Second quality review requested daily cost coverage and matching displayed
+  token sorting. Daily cost-coverage RED failed on the missing known/unknown
+  fields; GREEN added all four daily coverage counters and changed the route
+  table to sort by `total_tokens`.
+- Final Task 7 analytics GREEN: `8 passed`; combined dashboard/read-model GREEN:
+  `.venv/bin/python -m pytest tests/hermes_cli/test_web_server.py -k 'analytics or dashboard_dimension or dashboard_call' tests/agent/test_usage_analytics.py tests/agent/test_insights.py tests/test_hermes_state.py -o 'addopts=' -q`
+  → `41 passed, 451 deselected`.
+- Frontend production build: `npm run build` → PASS. Python compilation and
+  scoped diff checks: PASS. Final quality review: APPROVED.
+- Unrelated baseline blockers remain explicit: the full web-server file has two
+  PTY/WebSocket failures; repository-wide frontend lint has pre-existing errors.
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -460,8 +493,23 @@ Append each RED and GREEN command here with exit code and concise result.
   available independently. Historical aggregate/call coverage is visible in both
   terminal and gateway formatters.
 - Stored estimated-cost presence is named cost coverage, not pricing knowledge.
-  Legacy pricing/session-cost aliases remain present only as explicit `None`
+- Legacy pricing/session-cost aliases remain present only as explicit `None`
   values where no truthful event-to-session mapping exists.
+- Dashboard `/api/analytics/usage` and `/api/analytics/models` now consume the
+  canonical event read models. Daily usage is event-time UTC; session-start
+  activity remains separately named. Provider/model routes preserve canonical
+  values and validity bits, while display labels are presentation-only.
+- Route session counts become NULL when any contributing event lacks a valid
+  session association; derived per-session averages and the Models total remain
+  unknown rather than using an incomplete denominator. Activity queries reuse
+  the canonical inclusive finite-timestamp ledger filter.
+- Dashboard canonical token totals include uncached input, cache read, cache
+  write, and output. Reasoning is displayed as output detail and never added a
+  second time. Exact decimal cost strings plus known/unknown coverage drive UI
+  cost display; compatibility floats are not treated as the accounting fact.
+- Model count and route count are distinct: one model reached through multiple
+  providers is one model and multiple accounting routes. Model cards rank by
+  canonical total-token usage with deterministic route-label tie breaks.
 
 ## Known risks
 

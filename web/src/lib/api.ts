@@ -451,20 +451,42 @@ export interface AnalyticsDailyEntry {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  cache_write_tokens: number;
   reasoning_tokens: number;
-  estimated_cost: number;
-  actual_cost: number;
+  total_tokens: number;
+  estimated_cost: number | null;
+  actual_cost: number | null;
+  estimated_cost_exact: string;
+  actual_cost_exact: string;
+  estimated_cost_known_event_count: number;
+  estimated_cost_unknown_event_count: number;
+  actual_cost_known_event_count: number;
+  actual_cost_unknown_event_count: number;
   sessions: number;
-  api_calls: number;
+  api_calls: number | null;
 }
 
 export interface AnalyticsModelEntry {
-  model: string;
+  model: string | null;
+  provider: string | null;
+  model_is_valid: boolean;
+  provider_is_valid: boolean;
+  display_model: string;
+  display_provider: string;
   input_tokens: number;
   output_tokens: number;
-  estimated_cost: number;
-  sessions: number;
-  api_calls: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  estimated_cost: number | null;
+  actual_cost: number | null;
+  estimated_cost_exact: string;
+  actual_cost_exact: string;
+  estimated_cost_unknown_event_count: number;
+  actual_cost_unknown_event_count: number;
+  sessions: number | null;
+  api_calls: number | null;
 }
 
 export interface AnalyticsSkillEntry {
@@ -490,11 +512,17 @@ export interface AnalyticsResponse {
     total_input: number;
     total_output: number;
     total_cache_read: number;
+    total_cache_write: number;
     total_reasoning: number;
-    total_estimated_cost: number;
-    total_actual_cost: number;
+    total_tokens: number;
+    total_estimated_cost: number | null;
+    total_actual_cost: number | null;
+    total_estimated_cost_exact: string;
+    total_actual_cost_exact: string;
+    estimated_cost_unknown_event_count: number;
+    actual_cost_unknown_event_count: number;
     total_sessions: number;
-    total_api_calls: number;
+    total_api_calls: number | null;
   };
   skills: {
     summary: AnalyticsSkillsSummary;
@@ -513,19 +541,29 @@ export interface ProfileInfo {
 }
 
 export interface ModelsAnalyticsModelEntry {
-  model: string;
-  provider: string;
+  model: string | null;
+  provider: string | null;
+  model_is_valid: boolean;
+  provider_is_valid: boolean;
+  display_model: string;
+  display_provider: string;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  cache_write_tokens: number;
   reasoning_tokens: number;
-  estimated_cost: number;
-  actual_cost: number;
-  sessions: number;
-  api_calls: number;
-  tool_calls: number;
-  last_used_at: number;
-  avg_tokens_per_session: number;
+  total_tokens: number;
+  estimated_cost: number | null;
+  actual_cost: number | null;
+  estimated_cost_exact: string;
+  actual_cost_exact: string;
+  estimated_cost_unknown_event_count: number;
+  actual_cost_unknown_event_count: number;
+  sessions: number | null;
+  api_calls: number | null;
+  tool_calls: number | null;
+  last_used_at: number | null;
+  avg_tokens_per_session: number | null;
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;
@@ -540,14 +578,21 @@ export interface ModelsAnalyticsResponse {
   models: ModelsAnalyticsModelEntry[];
   totals: {
     distinct_models: number;
+    distinct_routes: number;
     total_input: number;
     total_output: number;
     total_cache_read: number;
+    total_cache_write: number;
     total_reasoning: number;
-    total_estimated_cost: number;
-    total_actual_cost: number;
-    total_sessions: number;
-    total_api_calls: number;
+    total_tokens: number;
+    total_estimated_cost: number | null;
+    total_actual_cost: number | null;
+    total_estimated_cost_exact: string;
+    total_actual_cost_exact: string;
+    estimated_cost_unknown_event_count: number;
+    actual_cost_unknown_event_count: number;
+    total_sessions: number | null;
+    total_api_calls: number | null;
   };
   period_days: number;
 }

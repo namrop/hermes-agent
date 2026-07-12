@@ -133,7 +133,7 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
   if (daily.length === 0) return null;
 
   const maxTokens = Math.max(
-    ...daily.map((d) => d.input_tokens + d.output_tokens),
+    ...daily.map((d) => d.total_tokens),
     1,
   );
 
@@ -155,6 +155,10 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
             <div className="h-2.5 w-2.5 bg-emerald-500" />
             {t.analytics.output}
           </div>
+          <div className="flex items-center gap-1.5">
+            <div className="h-2.5 w-2.5 bg-blue-400" />
+            Cache
+          </div>
         </div>
       </CardHeader>
       <CardContent>
@@ -163,12 +167,16 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
           style={{ height: CHART_HEIGHT_PX }}
         >
           {daily.map((d) => {
-            const total = d.input_tokens + d.output_tokens;
+            const total = d.total_tokens;
+            const cache = d.cache_read_tokens + d.cache_write_tokens;
             const inputH = Math.round(
               (d.input_tokens / maxTokens) * CHART_HEIGHT_PX,
             );
             const outputH = Math.round(
               (d.output_tokens / maxTokens) * CHART_HEIGHT_PX,
+            );
+            const cacheH = Math.round(
+              (cache / maxTokens) * CHART_HEIGHT_PX,
             );
             return (
               <div
@@ -185,6 +193,7 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
                     <div>
                       {t.analytics.output}: {formatTokens(d.output_tokens)}
                     </div>
+                    <div>Cache: {formatTokens(cache)}</div>
                     <div>
                       {t.analytics.total}: {formatTokens(total)}
                     </div>
@@ -193,7 +202,14 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
 
                 <div
                   className="w-full bg-[#ffe6cb]/70"
-                  style={{ height: Math.max(inputH, total > 0 ? 1 : 0) }}
+                  style={{
+                    height: Math.max(inputH, d.input_tokens > 0 ? 1 : 0),
+                  }}
+                />
+
+                <div
+                  className="w-full bg-blue-400/60"
+                  style={{ height: Math.max(cacheH, cache > 0 ? 1 : 0) }}
                 />
 
                 <div
@@ -282,7 +298,7 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
 
 function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
   const { t } = useI18n();
-  const { sorted, sortKey, sortDir, toggle } = useTableSort(models, "input_tokens", "desc");
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(models, "total_tokens", "desc");
 
   if (models.length === 0) return null;
 
@@ -301,31 +317,32 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-muted-foreground text-xs">
-                <SortHeader label={t.analytics.model} col="model" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label={t.analytics.model} col="display_model" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
                 <SortHeader label={t.sessions.title} col="sessions" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
-                <SortHeader label={t.analytics.tokens} col="input_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
+                <SortHeader label={t.analytics.tokens} col="total_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
               </tr>
             </thead>
             <tbody>
               {sorted.map((m) => (
                 <tr
-                  key={m.model}
+                  key={JSON.stringify([
+                    m.provider,
+                    m.provider_is_valid,
+                    m.model,
+                    m.model_is_valid,
+                  ])}
                   className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
                 >
                   <td className="py-2 pr-4">
-                    <span className="font-mono-ui text-xs">{m.model}</span>
+                    <span className="font-mono-ui text-xs">
+                      {m.display_provider} / {m.display_model}
+                    </span>
                   </td>
                   <td className="text-right py-2 px-4 text-muted-foreground">
-                    {m.sessions}
+                    {m.sessions ?? "unknown"}
                   </td>
                   <td className="text-right py-2 pl-4">
-                    <span className="text-[#ffe6cb]">
-                      {formatTokens(m.input_tokens)}
-                    </span>
-                    {" / "}
-                    <span className="text-emerald-400">
-                      {formatTokens(m.output_tokens)}
-                    </span>
+                    {formatTokens(m.total_tokens)}
                   </td>
                 </tr>
               ))}
@@ -397,10 +414,9 @@ export default function AnalyticsPage() {
   const [data, setData] = useState<AnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Gated on `dashboard.show_token_analytics` (default off).  When off the
-  // page renders an explanation card instead of fetching analytics — the
-  // local token counts exclude auxiliary calls and provider retries, so
-  // they diverge from provider billing in ways that mislead users.
+  // Preserve the operator-controlled visibility gate. When enabled, these
+  // figures come from the persisted per-attempt ledger rather than session
+  // scalar estimates; provider invoices remain a separate authority.
   const [showTokens, setShowTokens] = useState<boolean | null>(null);
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
@@ -488,25 +504,16 @@ export default function AnalyticsPage() {
                 Token analytics hidden
               </h2>
               <p>
-                The token, cost, and per-day analytics on this page are a
-                local debug estimate. They only count successful main-agent
-                responses with a usable <span className="font-mono">usage</span>{" "}
-                block, and silently exclude auxiliary calls (context
-                compression, title generation, vision, session search, web
-                extract, smart approvals, MCP routing, plugin LLM access)
-                plus provider-side retries and fallback attempts. Cache
-                writes are missing entirely.
+                Token, cost, and per-day analytics are hidden by
+                configuration. When enabled, they are derived from persisted
+                per-attempt events, split by provider and model at event time.
+                Cache reads and writes are included in canonical token totals;
+                unknown historical call, cost, and route coverage remains
+                explicit rather than being shown as zero.
               </p>
               <p>
-                On models with heavy auxiliary traffic (Kimi K2.6, MiniMax
-                M2.7) the local total can be 10x–100x lower than what your
-                provider bills. Hiding these numbers is safer than letting
-                them look authoritative.
-              </p>
-              <p>
-                Check your provider dashboard (OpenRouter, Anthropic, etc.)
-                for actual usage and billing. To re-enable the local debug
-                estimate anyway, set{" "}
+                Provider dashboards remain the authority for invoices and
+                quota state. To show the local accounting ledger, set{" "}
                 <span className="font-mono">
                   dashboard.show_token_analytics: true
                 </span>{" "}
@@ -540,9 +547,7 @@ export default function AnalyticsPage() {
                   items={[
                     {
                       label: t.analytics.totalTokens,
-                      value: formatTokens(
-                        data.totals.total_input + data.totals.total_output,
-                      ),
+                      value: formatTokens(data.totals.total_tokens),
                     },
                     {
                       label: t.analytics.input,
@@ -558,10 +563,7 @@ export default function AnalyticsPage() {
                     },
                     {
                       label: t.analytics.apiCalls,
-                      value: String(
-                        data.totals.total_api_calls ??
-                          data.daily.reduce((sum, d) => sum + d.sessions, 0),
-                      ),
+                      value: String(data.totals.total_api_calls ?? "unknown"),
                     },
                   ]}
                 />

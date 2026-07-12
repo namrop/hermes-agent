@@ -14,6 +14,7 @@ import hmac
 import importlib.util
 import json
 import logging
+import math
 import os
 import secrets
 import subprocess
@@ -3148,6 +3149,238 @@ async def update_config_raw(body: RawConfigUpdate):
 # ---------------------------------------------------------------------------
 
 
+def _dashboard_dimension_display(value: Any, is_valid: bool) -> str:
+    """Render a dimension without replacing its canonical API value."""
+    if not is_valid:
+        return "invalid/unattributed"
+    if value is None:
+        return "unattributed"
+    if value == "":
+        return "(empty)"
+    return str(value)
+
+
+def _dashboard_call_count(summary: Dict[str, Any]) -> Optional[int]:
+    """Return observed attempts plus known reconstruction, or unknown."""
+    if summary["reconstructed_call_unknown_aggregate_count"]:
+        return None
+    return summary["api_attempt_count"] + summary["reconstructed_call_count"]
+
+
+def _dashboard_usage_totals(
+    summary: Dict[str, Any], *, total_sessions: Optional[int]
+) -> Dict[str, Any]:
+    """Map a canonical usage summary onto the stable dashboard total keys."""
+    return {
+        "total_input": summary["input_tokens"],
+        "total_output": summary["output_tokens"],
+        "total_cache_read": summary["cache_read_tokens"],
+        "total_cache_write": summary["cache_write_tokens"],
+        "total_reasoning": summary["reasoning_tokens"],
+        "total_tokens": summary["total_tokens"],
+        "total_estimated_cost": summary["estimated_cost_usd"],
+        "total_actual_cost": summary["actual_cost_usd"],
+        "total_estimated_cost_exact": summary["estimated_cost_usd_exact"],
+        "total_actual_cost_exact": summary["actual_cost_usd_exact"],
+        "total_sessions": total_sessions,
+        "total_api_calls": _dashboard_call_count(summary),
+        "event_count": summary["event_count"],
+        "api_attempt_count": summary["api_attempt_count"],
+        "successful_call_count": summary["successful_call_count"],
+        "historical_aggregate_count": summary["historical_aggregate_count"],
+        "reconstructed_call_count": summary["reconstructed_call_count"],
+        "reconstructed_call_known_aggregate_count": summary[
+            "reconstructed_call_known_aggregate_count"
+        ],
+        "reconstructed_call_unknown_aggregate_count": summary[
+            "reconstructed_call_unknown_aggregate_count"
+        ],
+        "estimated_cost_known_event_count": summary[
+            "estimated_cost_known_event_count"
+        ],
+        "estimated_cost_unknown_event_count": summary[
+            "estimated_cost_unknown_event_count"
+        ],
+        "actual_cost_known_event_count": summary["actual_cost_known_event_count"],
+        "actual_cost_unknown_event_count": summary[
+            "actual_cost_unknown_event_count"
+        ],
+        "invalid_numeric_event_count": summary["invalid_numeric_event_count"],
+        "invalid_numeric_value_count": summary["invalid_numeric_value_count"],
+    }
+
+
+def _dashboard_daily_rows(db: Any, cutoff: float) -> List[Dict[str, Any]]:
+    """Merge event-time usage days with session-start activity days."""
+    from agent.usage_analytics import summarize_usage_events
+
+    usage_days = {
+        row["date"]: row
+        for row in db.summarize_usage_daily(cutoff=cutoff, timezone_name="UTC")
+    }
+    session_rows = db._conn.execute(
+        """SELECT date(started_at, 'unixepoch') AS day, COUNT(*) AS sessions
+           FROM sessions WHERE started_at > ? GROUP BY day""",
+        (cutoff,),
+    ).fetchall()
+    sessions_by_day = {row["day"]: row["sessions"] for row in session_rows}
+
+    rows = []
+    for day in sorted(set(usage_days) | set(sessions_by_day)):
+        usage = usage_days.get(day)
+        if usage is None:
+            usage = summarize_usage_events(())
+        rows.append(
+            {
+                "day": day,
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "cache_read_tokens": usage["cache_read_tokens"],
+                "cache_write_tokens": usage["cache_write_tokens"],
+                "reasoning_tokens": usage["reasoning_tokens"],
+                "total_tokens": usage["total_tokens"],
+                "estimated_cost": usage["estimated_cost_usd"],
+                "actual_cost": usage["actual_cost_usd"],
+                "estimated_cost_exact": usage["estimated_cost_usd_exact"],
+                "actual_cost_exact": usage["actual_cost_usd_exact"],
+                "estimated_cost_known_event_count": usage[
+                    "estimated_cost_known_event_count"
+                ],
+                "estimated_cost_unknown_event_count": usage[
+                    "estimated_cost_unknown_event_count"
+                ],
+                "actual_cost_known_event_count": usage[
+                    "actual_cost_known_event_count"
+                ],
+                "actual_cost_unknown_event_count": usage[
+                    "actual_cost_unknown_event_count"
+                ],
+                "sessions": sessions_by_day.get(day, 0),
+                "api_calls": _dashboard_call_count(usage),
+                "event_count": usage["event_count"],
+                "historical_aggregate_count": usage[
+                    "historical_aggregate_count"
+                ],
+                "reconstructed_call_count": usage["reconstructed_call_count"],
+                "reconstructed_call_unknown_aggregate_count": usage[
+                    "reconstructed_call_unknown_aggregate_count"
+                ],
+            }
+        )
+    return rows
+
+
+def _dashboard_route_activity(
+    db: Any, cutoff: float
+) -> Tuple[
+    Dict[Tuple[Any, bool, Any, bool], Dict[str, Any]], Optional[int]
+]:
+    """Return event-associated session counts and last event time per route."""
+    where, params = db._llm_usage_filter(cutoff=cutoff)
+    rows = db._conn.execute(
+        f"""WITH normalized AS (
+               SELECT
+                 CASE WHEN typeof(provider) IN ('text', 'null')
+                      THEN provider ELSE NULL END AS normalized_provider,
+                 CASE WHEN typeof(provider) IN ('text', 'null')
+                      THEN 1 ELSE 0 END AS provider_is_valid,
+                 CASE WHEN typeof(model) IN ('text', 'null')
+                      THEN model ELSE NULL END AS normalized_model,
+                 CASE WHEN typeof(model) IN ('text', 'null')
+                      THEN 1 ELSE 0 END AS model_is_valid,
+                 CASE WHEN typeof(session_id) = 'text' AND session_id <> ''
+                      THEN session_id ELSE NULL END AS normalized_session_id,
+                 timestamp
+               FROM llm_usage_events
+               {where}
+           )
+           SELECT normalized_provider AS provider,
+                  provider_is_valid,
+                  normalized_model AS model,
+                  model_is_valid,
+                  COUNT(DISTINCT normalized_session_id) AS sessions,
+                  SUM(CASE WHEN normalized_session_id IS NULL THEN 1 ELSE 0 END)
+                      AS unattributed_session_event_count,
+                  MAX(timestamp) AS last_used_at
+           FROM normalized
+           GROUP BY normalized_provider, provider_is_valid,
+                    normalized_model, model_is_valid""",
+        params,
+    ).fetchall()
+    activity: Dict[Tuple[Any, bool, Any, bool], Dict[str, Any]] = {}
+    for row in rows:
+        last_used_at = row["last_used_at"]
+        if (
+            isinstance(last_used_at, bool)
+            or not isinstance(last_used_at, (int, float))
+            or not math.isfinite(last_used_at)
+        ):
+            last_used_at = None
+        else:
+            try:
+                time.gmtime(last_used_at)
+            except (OverflowError, OSError, ValueError):
+                last_used_at = None
+        key = (
+            row["provider"],
+            bool(row["provider_is_valid"]),
+            row["model"],
+            bool(row["model_is_valid"]),
+        )
+        activity[key] = {
+            "sessions": (
+                None
+                if row["unattributed_session_event_count"]
+                else row["sessions"]
+            ),
+            "last_used_at": last_used_at,
+        }
+    total_row = db._conn.execute(
+        f"""SELECT
+               COUNT(DISTINCT CASE
+                   WHEN typeof(session_id) = 'text' AND session_id <> ''
+                   THEN session_id END) AS sessions,
+               SUM(CASE
+                   WHEN typeof(session_id) = 'text' AND session_id <> ''
+                   THEN 0 ELSE 1 END) AS unattributed_session_event_count
+            FROM llm_usage_events{where}""",
+        params,
+    ).fetchone()
+    total_sessions = (
+        None
+        if total_row["unattributed_session_event_count"]
+        else total_row["sessions"]
+    )
+    return activity, total_sessions
+
+
+def _dashboard_model_row(
+    route: Dict[str, Any], activity: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Map a canonical provider/model summary onto dashboard route fields."""
+    sessions = activity["sessions"]
+    return {
+        **route,
+        "display_provider": _dashboard_dimension_display(
+            route["provider"], route["provider_is_valid"]
+        ),
+        "display_model": _dashboard_dimension_display(
+            route["model"], route["model_is_valid"]
+        ),
+        "estimated_cost": route["estimated_cost_usd"],
+        "actual_cost": route["actual_cost_usd"],
+        "estimated_cost_exact": route["estimated_cost_usd_exact"],
+        "actual_cost_exact": route["actual_cost_usd_exact"],
+        "sessions": sessions,
+        "api_calls": _dashboard_call_count(route),
+        "tool_calls": None,
+        "last_used_at": activity["last_used_at"],
+        "avg_tokens_per_session": (
+            route["total_tokens"] / sessions if sessions else None
+        ),
+    }
+
+
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):
     from hermes_state import SessionDB
@@ -3156,45 +3389,31 @@ async def get_usage_analytics(days: int = 30):
     db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
-        cur = db._conn.execute("""
-            SELECT date(started_at, 'unixepoch') as day,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ?
-            GROUP BY day ORDER BY day
-        """, (cutoff,))
-        daily = [dict(r) for r in cur.fetchall()]
+        usage = db.summarize_usage_events(cutoff=cutoff)
+        routes = db.summarize_usage_by_provider_model(cutoff=cutoff)
+        route_activity, _ = _dashboard_route_activity(db, cutoff)
+        daily = _dashboard_daily_rows(db, cutoff)
 
-        cur2 = db._conn.execute("""
-            SELECT model,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL
-            GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        by_model = [dict(r) for r in cur2.fetchall()]
+        session_count = db._conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE started_at > ?", (cutoff,)
+        ).fetchone()[0]
+        by_model = []
+        for route in routes:
+            key = (
+                route["provider"],
+                route["provider_is_valid"],
+                route["model"],
+                route["model_is_valid"],
+            )
+            by_model.append(
+                _dashboard_model_row(
+                    route,
+                    route_activity.get(
+                        key, {"sessions": None, "last_used_at": None}
+                    ),
+                )
+            )
 
-        cur3 = db._conn.execute("""
-            SELECT SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ?
-        """, (cutoff,))
-        totals = dict(cur3.fetchone())
         insights_report = InsightsEngine(db).generate(days=days)
         skills = insights_report.get("skills", {
             "summary": {
@@ -3209,8 +3428,12 @@ async def get_usage_analytics(days: int = 30):
         return {
             "daily": daily,
             "by_model": by_model,
-            "totals": totals,
+            "totals": _dashboard_usage_totals(
+                usage, total_sessions=session_count
+            ),
             "period_days": days,
+            "usage_time_basis": "event_occurred_at",
+            "session_activity_time_basis": "session_started_at",
             "skills": skills,
         }
     finally:
@@ -3229,82 +3452,69 @@ async def get_models_analytics(days: int = 30):
     db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
-
-        cur = db._conn.execute("""
-            SELECT model,
-                   billing_provider,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls,
-                   SUM(tool_call_count) as tool_calls,
-                   MAX(started_at) as last_used_at,
-                   AVG(input_tokens + output_tokens) as avg_tokens_per_session
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-            GROUP BY model, billing_provider
-            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        rows = [dict(r) for r in cur.fetchall()]
+        usage = db.summarize_usage_events(cutoff=cutoff)
+        routes = db.summarize_usage_by_provider_model(cutoff=cutoff)
+        route_activity, total_sessions = _dashboard_route_activity(db, cutoff)
 
         models = []
-        for row in rows:
-            provider = row.get("billing_provider") or ""
-            model_name = row["model"]
+        for route in routes:
+            key = (
+                route["provider"],
+                route["provider_is_valid"],
+                route["model"],
+                route["model_is_valid"],
+            )
+            model_row = _dashboard_model_row(
+                route,
+                route_activity.get(key, {"sessions": None, "last_used_at": None}),
+            )
+            provider = route["provider"]
+            model_name = route["model"]
             caps = {}
-            try:
-                from agent.models_dev import get_model_capabilities
-                mc = get_model_capabilities(provider=provider, model=model_name)
-                if mc is not None:
-                    caps = {
-                        "supports_tools": mc.supports_tools,
-                        "supports_vision": mc.supports_vision,
-                        "supports_reasoning": mc.supports_reasoning,
-                        "context_window": mc.context_window,
-                        "max_output_tokens": mc.max_output_tokens,
-                        "model_family": mc.model_family,
-                    }
-            except Exception:
-                pass
+            if isinstance(provider, str) and isinstance(model_name, str):
+                try:
+                    from agent.models_dev import get_model_capabilities
+                    mc = get_model_capabilities(
+                        provider=provider, model=model_name
+                    )
+                    if mc is not None:
+                        caps = {
+                            "supports_tools": mc.supports_tools,
+                            "supports_vision": mc.supports_vision,
+                            "supports_reasoning": mc.supports_reasoning,
+                            "context_window": mc.context_window,
+                            "max_output_tokens": mc.max_output_tokens,
+                            "model_family": mc.model_family,
+                        }
+                except Exception:
+                    pass
+            model_row["capabilities"] = caps
+            models.append(model_row)
 
-            models.append({
-                "model": model_name,
-                "provider": provider,
-                "input_tokens": row["input_tokens"],
-                "output_tokens": row["output_tokens"],
-                "cache_read_tokens": row["cache_read_tokens"],
-                "reasoning_tokens": row["reasoning_tokens"],
-                "estimated_cost": row["estimated_cost"],
-                "actual_cost": row["actual_cost"],
-                "sessions": row["sessions"],
-                "api_calls": row["api_calls"],
-                "tool_calls": row["tool_calls"],
-                "last_used_at": row["last_used_at"],
-                "avg_tokens_per_session": row["avg_tokens_per_session"],
-                "capabilities": caps,
-            })
+        models.sort(
+            key=lambda row: (
+                -row["total_tokens"],
+                row["display_provider"],
+                row["display_model"],
+                not row["provider_is_valid"],
+                not row["model_is_valid"],
+            )
+        )
 
-        totals_cur = db._conn.execute("""
-            SELECT COUNT(DISTINCT model) as distinct_models,
-                   SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-        """, (cutoff,))
-        totals = dict(totals_cur.fetchone())
+        totals = _dashboard_usage_totals(
+            usage, total_sessions=total_sessions
+        )
+        totals["distinct_models"] = len(
+            {(row["model"], row["model_is_valid"]) for row in models}
+        )
+        totals["distinct_routes"] = len(models)
 
         return {
             "models": models,
             "totals": totals,
             "period_days": days,
+            "usage_time_basis": "event_occurred_at",
+            "session_activity_time_basis": "event_session_association",
         }
     finally:
         db.close()

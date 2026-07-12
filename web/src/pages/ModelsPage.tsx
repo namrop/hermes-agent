@@ -58,11 +58,10 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
-function formatCost(n: number): string {
-  if (n >= 1) return `$${n.toFixed(2)}`;
-  if (n >= 0.01) return `$${n.toFixed(3)}`;
-  if (n > 0) return `$${n.toFixed(4)}`;
-  return "$0";
+function formatCost(exact: string, unknownEventCount: number): string {
+  const known = exact === "0" ? "$0" : `$${exact}`;
+  if (unknownEventCount === 0) return known;
+  return exact === "0" ? "unknown" : `${known} + unknown`;
 }
 
 /** Short model name: strip vendor prefix like "openrouter/" or "anthropic/". */
@@ -72,64 +71,63 @@ function shortModelName(model: string): string {
   return model;
 }
 
-/** Extract vendor prefix from a model string like "anthropic/claude-opus-4.7" → "anthropic". */
-function modelVendor(model: string, fallback?: string): string {
-  const slashIdx = model.indexOf("/");
-  if (slashIdx > 0) return model.slice(0, slashIdx);
-  return fallback || "";
-}
-
 function TokenBar({
   input,
   output,
   cacheRead,
+  cacheWrite,
   reasoning,
 }: {
   input: number;
   output: number;
   cacheRead: number;
+  cacheWrite: number;
   reasoning: number;
 }) {
-  const total = input + output + cacheRead + reasoning;
-  if (total === 0) return null;
+  const total = input + output + cacheRead + cacheWrite;
+  if (total === 0 && reasoning === 0) return null;
 
   const segments = [
     { value: cacheRead, color: "bg-blue-400/60", dotColor: "bg-blue-400", label: "Cache Read" },
-    { value: reasoning, color: "bg-purple-400/60", dotColor: "bg-purple-400", label: "Reasoning" },
+    { value: cacheWrite, color: "bg-cyan-400/60", dotColor: "bg-cyan-400", label: "Cache Write" },
     { value: input, color: "bg-[#ffe6cb]/70", dotColor: "bg-[#ffe6cb]", label: "Input" },
     { value: output, color: "bg-emerald-500/70", dotColor: "bg-emerald-500", label: "Output" },
   ].filter((s) => s.value > 0);
 
   return (
     <div className="space-y-1.5">
-      {/* Stacked bar — segments fill proportionally to their share of total */}
-      <div className="relative flex min-h-[1.5rem] w-full items-stretch overflow-hidden">
-        {segments.map((s, i) => (
-          <div
-            key={i}
-            className={`${s.color} relative flex items-center transition-all duration-300`}
-            style={{ width: `${(s.value / total) * 100}%` }}
-          >
-            {/* Stepped fill pattern overlay */}
+      {total > 0 && (
+        <div className="relative flex min-h-[1.5rem] w-full items-stretch overflow-hidden">
+          {segments.map((s) => (
             <div
-              className="absolute inset-0 opacity-30"
-              style={{
-                backgroundImage:
-                  "repeating-linear-gradient(to right, transparent 0 0.4rem, currentColor 0.4rem calc(0.4rem + 1px))",
-              }}
-            />
-          </div>
-        ))}
-      </div>
+              key={s.label}
+              className={`${s.color} relative flex items-center transition-all duration-300`}
+              style={{ width: `${(s.value / total) * 100}%` }}
+            >
+              <div
+                className="absolute inset-0 opacity-30"
+                style={{
+                  backgroundImage:
+                    "repeating-linear-gradient(to right, transparent 0 0.4rem, currentColor 0.4rem calc(0.4rem + 1px))",
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      )}
 
-      {/* Legend */}
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
-        {segments.map((s, i) => (
-          <span key={i} className="flex items-center gap-1">
+        {segments.map((s) => (
+          <span key={s.label} className="flex items-center gap-1">
             <span className={`inline-block h-1.5 w-1.5 rounded-full ${s.dotColor}`} />
             {s.label} {formatTokens(s.value)}
           </span>
         ))}
+        {reasoning > 0 && (
+          <span className="flex items-center gap-1 text-purple-400">
+            Reasoning detail {formatTokens(reasoning)} (included in output)
+          </span>
+        )}
       </div>
     </div>
   );
@@ -320,20 +318,34 @@ function ModelCard({
   showTokens: boolean;
 }) {
   const { t } = useI18n();
-  const provider = entry.provider || modelVendor(entry.model);
-  const totalTokens = entry.input_tokens + entry.output_tokens;
+  const canonicalProvider = entry.provider;
+  const canonicalModel = entry.model;
+  const provider = entry.display_provider;
+  const modelLabel =
+    entry.model_is_valid && canonicalModel
+      ? shortModelName(entry.display_model)
+      : entry.display_model;
+  const canAssign =
+    entry.provider_is_valid &&
+    entry.model_is_valid &&
+    typeof canonicalProvider === "string" &&
+    typeof canonicalModel === "string";
+  const totalTokens = entry.total_tokens;
+  const sessionCount = entry.sessions;
   const caps = entry.capabilities;
 
   const isMain =
+    canAssign &&
     !!main &&
-    main.provider === provider &&
-    main.model === entry.model;
+    main.provider === canonicalProvider &&
+    main.model === canonicalModel;
 
   // First aux task currently using this model (if any).
-  const mainAuxTask =
-    aux.find(
-      (a) => a.provider === provider && a.model === entry.model,
-    )?.task ?? null;
+  const mainAuxTask = canAssign
+    ? aux.find(
+        (a) => a.provider === canonicalProvider && a.model === canonicalModel,
+      )?.task ?? null
+    : null;
 
   return (
     <Card
@@ -347,7 +359,7 @@ function ModelCard({
                 #{rank}
               </span>
               <CardTitle className="text-sm font-mono-ui truncate">
-                {shortModelName(entry.model)}
+                {modelLabel}
               </CardTitle>
               {isMain && (
                 <span className="inline-flex items-center gap-0.5 bg-primary/15 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-primary">
@@ -389,10 +401,10 @@ function ModelCard({
                 </div>
               </div>
             ) : (
-              entry.sessions > 0 && (
+              (sessionCount === null || sessionCount > 0) && (
                 <div className="text-right">
                   <div className="text-xs font-mono font-semibold">
-                    {entry.sessions}
+                    {sessionCount === null ? "unknown" : sessionCount}
                   </div>
                   <div className="text-[10px] text-muted-foreground">
                     {t.models.sessions}
@@ -400,13 +412,15 @@ function ModelCard({
                 </div>
               )
             )}
-            <UseAsMenu
-              provider={provider}
-              model={entry.model}
-              isMain={isMain}
-              mainAuxTask={mainAuxTask}
-              onAssigned={onAssigned}
-            />
+            {canAssign && (
+              <UseAsMenu
+                provider={canonicalProvider}
+                model={canonicalModel}
+                isMain={isMain}
+                mainAuxTask={mainAuxTask}
+                onAssigned={onAssigned}
+              />
+            )}
           </div>
         </div>
       </CardHeader>
@@ -417,19 +431,24 @@ function ModelCard({
               input={entry.input_tokens}
               output={entry.output_tokens}
               cacheRead={entry.cache_read_tokens}
+              cacheWrite={entry.cache_write_tokens}
               reasoning={entry.reasoning_tokens}
             />
 
             <div className="grid grid-cols-3 gap-2 text-xs">
               <div className="text-center">
-                <div className="font-mono font-semibold">{entry.sessions}</div>
+                <div className="font-mono font-semibold">
+                  {sessionCount === null ? "—" : sessionCount}
+                </div>
                 <div className="text-[10px] text-muted-foreground">
                   {t.models.sessions}
                 </div>
               </div>
               <div className="text-center">
                 <div className="font-mono font-semibold">
-                  {formatTokens(entry.avg_tokens_per_session)}
+                  {entry.avg_tokens_per_session === null
+                    ? "—"
+                    : formatTokens(entry.avg_tokens_per_session)}
                 </div>
                 <div className="text-[10px] text-muted-foreground">
                   {t.models.avgPerSession}
@@ -437,7 +456,9 @@ function ModelCard({
               </div>
               <div className="text-center">
                 <div className="font-mono font-semibold">
-                  {entry.api_calls > 0 ? formatTokens(entry.api_calls) : "—"}
+                  {entry.api_calls === null
+                    ? "—"
+                    : formatTokens(entry.api_calls)}
                 </div>
                 <div className="text-[10px] text-muted-foreground">
                   {t.models.apiCalls}
@@ -449,22 +470,25 @@ function ModelCard({
 
         <div className="flex items-center justify-between text-[10px] text-muted-foreground border-t border-border/30 pt-2">
           <div className="flex items-center gap-3">
-            {showTokens && entry.estimated_cost > 0 && (
+            {showTokens && (
               <span className="flex items-center gap-0.5">
                 <DollarSign className="h-2.5 w-2.5" />
-                {formatCost(entry.estimated_cost)}
+                {formatCost(
+                  entry.estimated_cost_exact,
+                  entry.estimated_cost_unknown_event_count,
+                )}
               </span>
             )}
-            {showTokens && entry.tool_calls > 0 && (
+            {showTokens && (
               <span className="flex items-center gap-0.5">
                 <Zap className="h-2.5 w-2.5" />
-                {entry.tool_calls} {t.models.toolCalls}
+                {entry.tool_calls === null ? "—" : entry.tool_calls} {t.models.toolCalls}
               </span>
             )}
           </div>
-          {entry.last_used_at > 0 && (
-            <span>{timeAgo(entry.last_used_at)}</span>
-          )}
+          <span>
+            {entry.last_used_at === null ? "—" : timeAgo(entry.last_used_at)}
+          </span>
         </div>
 
         <CapabilityBadges capabilities={entry.capabilities} />
@@ -771,9 +795,9 @@ export default function ModelsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saveKey, setSaveKey] = useState(0);
-  // Gate the token/cost UI on `dashboard.show_token_analytics`.  See
-  // hermes_cli/config.py for the rationale: the numbers exclude auxiliary
-  // calls and retries, so they're misleading next to provider billing.
+  // Preserve the operator-controlled visibility gate. When enabled, these
+  // figures come from the persisted per-attempt ledger rather than session
+  // scalar estimates; provider invoices remain a separate authority.
   const [showTokens, setShowTokens] = useState(false);
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
@@ -786,7 +810,7 @@ export default function ModelsPage() {
         setShowTokens(dash.show_token_analytics === true);
       })
       .catch(() => {
-        // Default to hidden on any failure — safer than showing wrong numbers.
+        // Preserve the configured hidden-by-default posture on read failure.
         setShowTokens(false);
       });
   }, []);
@@ -889,9 +913,7 @@ export default function ModelsPage() {
                         },
                         {
                           label: t.analytics.totalTokens,
-                          value: formatTokens(
-                            data.totals.total_input + data.totals.total_output,
-                          ),
+                          value: formatTokens(data.totals.total_tokens),
                         },
                         {
                           label: t.analytics.input,
@@ -903,11 +925,14 @@ export default function ModelsPage() {
                         },
                         {
                           label: t.models.estimatedCost,
-                          value: formatCost(data.totals.total_estimated_cost),
+                          value: formatCost(
+                            data.totals.total_estimated_cost_exact,
+                            data.totals.estimated_cost_unknown_event_count,
+                          ),
                         },
                         {
                           label: t.analytics.totalSessions,
-                          value: String(data.totals.total_sessions),
+                          value: String(data.totals.total_sessions ?? "unknown"),
                         },
                       ]
                     : [
@@ -917,7 +942,7 @@ export default function ModelsPage() {
                         },
                         {
                           label: t.analytics.totalSessions,
-                          value: String(data.totals.total_sessions),
+                          value: String(data.totals.total_sessions ?? "unknown"),
                         },
                       ]
                 }
@@ -925,13 +950,14 @@ export default function ModelsPage() {
               </div>
               {!showTokens && (
                 <p className="mt-4 text-[10px] text-muted-foreground/70 leading-relaxed">
-                  Token & cost analytics are hidden because the local counts
-                  exclude auxiliary calls (compression, vision, web extract,
-                  …) and provider retries, so they diverge from your provider
-                  bill. Enable{" "}
+                  Token & cost analytics are hidden by configuration. When
+                  enabled, they are derived from persisted per-attempt events,
+                  split by provider and model at event time; unknown cost,
+                  call, and session-attribution coverage stays explicit. Enable{" "}
                   <span className="font-mono">dashboard.show_token_analytics</span>{" "}
                   in <a href="/config" className="underline">Config</a> to
-                  show the local debug estimate anyway.
+                  show the local accounting ledger. Provider invoices remain
+                  the billing authority.
                 </p>
               )}
             </CardContent>
@@ -959,7 +985,12 @@ export default function ModelsPage() {
             <div className="grid min-w-0 gap-4 md:grid-cols-2 xl:grid-cols-3">
               {data.models.map((m, i) => (
                 <ModelCard
-                  key={`${m.model}:${m.provider}`}
+                  key={JSON.stringify([
+                    m.provider,
+                    m.provider_is_valid,
+                    m.model,
+                    m.model_is_valid,
+                  ])}
                   entry={m}
                   rank={i + 1}
                   main={aux?.main ?? null}
