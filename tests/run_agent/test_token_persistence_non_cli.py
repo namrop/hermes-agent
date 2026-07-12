@@ -73,6 +73,35 @@ def test_run_conversation_persists_tokens_for_cron_sessions():
     session_db.record_llm_usage_event.assert_not_called()
 
 
+def test_run_conversation_emits_one_distinct_hermes_event_uid_per_call():
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="discord")
+
+    with patch(
+        "agent.conversation_loop.uuid.uuid4",
+        side_effect=["observed-call-one", "observed-call-two"],
+    ) as mock_uuid4:
+        first = agent.run_conversation("hello", task_id="task-one")
+        second = agent.run_conversation("hello again", task_id="task-two")
+
+    assert first["final_response"] == "done"
+    assert second["final_response"] == "done"
+    event_uids = [
+        call.kwargs["event_uid"]
+        for call in session_db.record_usage_and_rollup.call_args_list
+    ]
+    assert event_uids == [
+        "hermes:observed-call-one",
+        "hermes:observed-call-two",
+    ]
+    assert all(event_uid.startswith("hermes:") for event_uid in event_uids)
+    assert all(event_uid.removeprefix("hermes:") for event_uid in event_uids)
+    assert len(set(event_uids)) == 2
+    assert mock_uuid4.call_count == 2
+    session_db.update_token_counts.assert_not_called()
+    session_db.record_llm_usage_event.assert_not_called()
+
+
 def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):
     sentinel_db = object()
     captured = {}

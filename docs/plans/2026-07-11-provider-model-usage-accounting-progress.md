@@ -28,7 +28,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | Task | State | Commit | Verification | Notes |
 |---|---|---|---|---|
 | 1. Plan + progress ledger | completed | `a3a8b38ce` | readback + diff checks PASS | Landed before production code |
-| 2. Atomic event + rollup | completed | `feat: make LLM usage event rollups atomic` (this commit) | 225 + 11 tests PASS | Atomic and replay-safe |
+| 2. Atomic event + rollup | completed | `dbd307323`; `test: cover usage event migration and rollups` (this commit) | initial 225 + 11 PASS; spec-review suite 238 PASS | Atomic, replay-safe, and regression-covered |
 | 3. Background-review accounting | active | — | RED pending | Preserve transcript boundary |
 | 4. Residual-only historical backfill | pending | — | — | No overlap with real events |
 | 5. Event-derived read models | pending | — | — | Central query semantics |
@@ -98,6 +98,16 @@ Append each RED and GREEN command here with exit code and concise result.
 - Final pricing result after refactor: exit 0; `11 passed in 0.92s`.
 - Files changed: `hermes_state.py`, `agent/conversation_loop.py`, `tests/test_hermes_state.py`, `tests/run_agent/test_token_persistence_non_cli.py`, and this progress ledger.
 
+#### Spec-review regression follow-up
+
+- Finding: Task 2 behavior was implemented and green, but its proof did not directly cover migration of a pre-`event_uid` database, every numeric compatibility-rollup bucket across mixed provider/model routes, or uniqueness of IDs emitted by multiple observed main-loop calls.
+- Tests added: a disposable existing-database migration regression verifies the reconciled `event_uid` column, partial unique index, readable legacy event, and a successful post-migration atomic write; the mixed-route regression now sums input/output/cache-read/cache-write/reasoning/estimated-cost/actual-cost/call-count while retaining each event route; and the non-CLI loop regression observes two fixed, distinct, nonempty `hermes:` IDs passed to two atomic recorder invocations.
+- RED status: not applicable. These were coverage gaps on already-implemented behavior, and all new tests passed immediately; no failure was fabricated and no production file was changed.
+- Verification command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/agent/test_usage_pricing.py -o 'addopts=' -q`
+- Verification result: exit 0; `238 passed in 11.35s`.
+- Production defect found: none.
+- Second Task 2 commit: `test: cover usage event migration and rollups` (this commit).
+
 ## Decisions and deviations
 
 - Task 2 atomic API returns the persisted event row plus an `inserted` boolean so callers can distinguish a new write from an idempotent replay.
@@ -131,5 +141,5 @@ Append each RED and GREEN command here with exit code and concise result.
 ## Last verified continuation point
 
 - Task 1 documentation is committed at `a3a8b38ce`.
-- Task 2 implementation and focused tests are complete; the scoped commit is `feat: make LLM usage event rollups atomic`.
+- Task 2 implementation and spec-review regression follow-up are complete; commits are `dbd307323` (`feat: make LLM usage event rollups atomic`) and `test: cover usage event migration and rollups` (this commit).
 - Next action: begin Task 3 by writing failing background-review accounting tests before changing production code.

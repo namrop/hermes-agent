@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import sqlite3
 import time
 import pytest
 from pathlib import Path
@@ -213,6 +214,84 @@ class TestSessionLifecycle:
         assert session["actual_cost_usd"] == pytest.approx(0.20)
         assert session["api_call_count"] == 1
 
+    def test_pre_event_uid_database_migrates_without_losing_usage(self, tmp_path):
+        db_path = tmp_path / "legacy_state.db"
+        legacy_db = SessionDB(db_path=db_path)
+        legacy_db.create_session(session_id="legacy-session", source="discord")
+        legacy_event_id = legacy_db.record_llm_usage_event(
+            session_id="legacy-session",
+            provider="openrouter",
+            model="legacy/model",
+            input_tokens=12,
+            output_tokens=3,
+        )
+        legacy_db.close()
+
+        # Deterministically turn the disposable database into the schema that
+        # existed immediately before event_uid was added. All other columns,
+        # rows, and indexes remain representative of an existing installation.
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP INDEX idx_llm_usage_events_event_uid")
+            connection.execute("ALTER TABLE llm_usage_events DROP COLUMN event_uid")
+            legacy_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(llm_usage_events)")
+            }
+            assert "event_uid" not in legacy_columns
+
+        migrated_db = SessionDB(db_path=db_path)
+        try:
+            migrated_connection = migrated_db._conn
+            assert migrated_connection is not None
+            migrated_columns = {
+                row[1]
+                for row in migrated_connection.execute(
+                    "PRAGMA table_info(llm_usage_events)"
+                )
+            }
+            assert "event_uid" in migrated_columns
+
+            event_uid_index = migrated_connection.execute(
+                """SELECT sql FROM sqlite_master
+                   WHERE type = 'index'
+                     AND name = 'idx_llm_usage_events_event_uid'"""
+            ).fetchone()
+            assert event_uid_index is not None
+            normalized_index_sql = " ".join(event_uid_index["sql"].lower().split())
+            assert "create unique index" in normalized_index_sql
+            assert "where event_uid is not null" in normalized_index_sql
+
+            legacy_event = migrated_db.get_llm_usage_events(
+                session_id="legacy-session"
+            )[0]
+            assert legacy_event["id"] == legacy_event_id
+            assert legacy_event["event_uid"] is None
+            assert legacy_event["provider"] == "openrouter"
+            assert legacy_event["model"] == "legacy/model"
+            assert legacy_event["input_tokens"] == 12
+            assert legacy_event["output_tokens"] == 3
+
+            recorded = migrated_db.record_usage_and_rollup(
+                event_uid="hermes:post-migration",
+                session_id="legacy-session",
+                provider="openai-codex",
+                model="gpt-5.6-sol",
+                input_tokens=8,
+                output_tokens=2,
+            )
+            assert recorded["inserted"] is True
+            assert recorded["event_uid"] == "hermes:post-migration"
+            assert len(
+                migrated_db.get_llm_usage_events(session_id="legacy-session")
+            ) == 2
+            session = migrated_db.get_session("legacy-session")
+            assert session is not None
+            assert session["input_tokens"] == 8
+            assert session["output_tokens"] == 2
+            assert session["api_call_count"] == 1
+        finally:
+            migrated_db.close()
+
     def test_record_usage_and_rollup_deduplicates_event_uid_replay(self, db):
         db.create_session(session_id="s1", source="cron")
         kwargs = {
@@ -275,6 +354,11 @@ class TestSessionLifecycle:
             model="gpt-5.6-sol",
             input_tokens=10,
             output_tokens=2,
+            cache_read_tokens=30,
+            cache_write_tokens=4,
+            reasoning_tokens=1,
+            estimated_cost_usd=0.11,
+            actual_cost_usd=0.07,
             api_call_index=1,
         )
         db.record_usage_and_rollup(
@@ -284,6 +368,11 @@ class TestSessionLifecycle:
             model="aion-labs/aion-3.0",
             input_tokens=20,
             output_tokens=3,
+            cache_read_tokens=40,
+            cache_write_tokens=5,
+            reasoning_tokens=2,
+            estimated_cost_usd=0.22,
+            actual_cost_usd=0.13,
             api_call_index=2,
         )
 
@@ -295,6 +384,11 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["input_tokens"] == 30
         assert session["output_tokens"] == 5
+        assert session["cache_read_tokens"] == 70
+        assert session["cache_write_tokens"] == 9
+        assert session["reasoning_tokens"] == 3
+        assert session["estimated_cost_usd"] == pytest.approx(0.33)
+        assert session["actual_cost_usd"] == pytest.approx(0.20)
         assert session["api_call_count"] == 2
 
     def test_backfill_llm_usage_events_from_session_totals_is_approximate_and_idempotent(self, db):
