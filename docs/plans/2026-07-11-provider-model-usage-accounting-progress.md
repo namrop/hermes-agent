@@ -2,6 +2,8 @@
 
 **Companion plan:** `docs/plans/2026-07-11-provider-model-usage-accounting.md`
 
+**Final implementation record:** `docs/architecture/provider-model-usage-accounting-implementation.md`
+
 ## Current status
 
 - State: implementation complete
@@ -31,12 +33,12 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | 2. Atomic event + rollup | completed | `dbd307323`, `43e4e4093`, `3d03ea32e` | spec PASS; quality APPROVED; 247 focused tests | TDD + review gaps closed |
 | 3. Background-review accounting | completed | `90b9be0ff`, `773faee49` | spec PASS; quality APPROVED; 270 focused tests | Purpose-aware accounting; SQLite/JSON transcript isolation |
 | 4. Residual-only historical backfill | completed | `cc1b84d72`, `26ff22a71` | spec PASS; quality APPROVED; 241 state + 267 focused tests | Idempotent residuals; ambiguous routes remain unattributed |
-| 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d`, `461ac1a33` | spec PASS; quality APPROVED; GREEN 272 + 298 | Streaming, strict-JSON-safe, exact-cost semantics |
+| 5. Event-derived read models | completed | `707a36416`, `a44d047a1`, `cda7204cb`, `49847935d`, `6b678ef55`, `461ac1a33` | spec PASS; quality APPROVED; GREEN 272 + 298 | Streaming, strict-JSON-safe, exact-cost semantics |
 | 6. Insights cutover | completed | `96c7f193e` | RED/GREEN complete; quality APPROVED; 345 focused/combined | Event usage + session activity; three constant ledger scans |
 | 7. Dashboard API cutover | completed | `00ffd02ca` | RED/GREEN complete; quality APPROVED; 41 combined focused tests; web build PASS | Event-time daily windows and route truth |
 | 8. CLI/gateway `/usage` cutover | completed | `9bb3c633a` | RED/GREEN complete; quality APPROVED; 429 combined focused tests | Atomic persisted report with full mixed routes |
 | 9. Cross-harness contract docs | completed | `1b78f7637` | six JSON examples parse; AI-writing residue LOW; spec review APPROVED | Quota and billing remain separate |
-| 10. Integration review/handoff | completed | `16944f86c` | 1,396 run-agent PASS; 244 state PASS; adapter regressions PASS; final blocker review APPROVED | Every harness-visible transport attempt accounted; no push/deploy |
+| 10. Integration review/handoff | completed | `16944f86c` | 1,396 run-agent PASS; 244 state PASS; adapter regressions PASS; final blocker review APPROVED | Every AIAgent transport invocation instrumented; persistence remains best-effort; no push/deploy |
 
 ## Evidence captured before implementation
 
@@ -234,11 +236,12 @@ Append each RED and GREEN command here with exit code and concise result.
   `tests/agent/test_usage_analytics.py`, and this ledger — PASS.
 - Files changed: `agent/usage_analytics.py`, `hermes_state.py`,
   `tests/agent/test_usage_analytics.py`, and this progress ledger.
-- Output contract: every summary exposes five disjoint token buckets plus
-  canonical prompt/total tokens; event, real-attempt, success, latency,
-  historical-aggregate, and reconstructed-call counts; independent actual and
-  estimated cost sums and known/unknown event-coverage counts. Grouped rows add
-  provider/model, date, or provider/model/purpose identity fields.
+- Output contract: every summary exposes four additive/disjoint token buckets plus
+  reasoning output detail and canonical prompt/total tokens; event, real-attempt,
+  success, latency, historical-aggregate, and reconstructed-call counts;
+  independent actual and estimated cost sums and known/unknown event-coverage
+  counts. Grouped rows add provider/model, date, or provider/model/purpose
+  identity fields.
 - Task 5 is complete and Task 6 (Insights event cutover) is active next.
 
 #### Task 5 code-quality hardening follow-up
@@ -406,9 +409,10 @@ Append each RED and GREEN command here with exit code and concise result.
 - The gateway ledger read runs through `asyncio.to_thread()`. Both CLI and
   gateway work without a resident agent. Compression count was removed because
   it is not durable ledger truth.
-- “API calls” was renamed to “Recorded calls.” The current event writer records
-  successful model responses, but failed provider dispatches and pre-fallback
-  retries are not yet comprehensively persisted.
+- “API calls” was renamed to “Recorded calls.” At Task 8 completion, the event
+  writer recorded successful model responses but not failed dispatches and
+  pre-fallback retries comprehensively. Task 10 superseded that instrumentation
+  gap; recorder absence and write failure remain lossy.
 - Review follow-up RED: two regressions failed for overlapping unknown plus
   subscription-included estimated-cost coverage and hard-coded English
   unknown/unattributed fragments in localized gateway output. GREEN excluded
@@ -432,11 +436,13 @@ Append each RED and GREEN command here with exit code and concise result.
   provider/model and token-bucket semantics; purpose, completeness, confidence,
   request, and cost enums; public aggregate-only exclusions; and Hermes, Codex
   CLI, and reconstructed examples.
-- The document explicitly names current Hermes projection gaps, including
-  incomplete failed-attempt capture, no requested/reported model split, no
-  logical-call/attempt identifiers, conservative completeness export, local
+- At Task 9 completion, the document explicitly named Hermes projection gaps,
+  including incomplete failed-attempt capture, no requested/reported model split,
+  no logical-call/attempt identifiers, conservative completeness export, local
   `cost_status=reconstructed` mapping, and ID-only deduplication without payload
-  conflict detection.
+  conflict detection. Task 10 later closed the scoped AIAgent instrumentation
+  gap and the contract was updated; lossless persistence and whole-runtime
+  auxiliary coverage remain incomplete.
 - Review follow-ups defined canonical replay comparison, correction pointers by
   normative identity, billing sign rules, quota/billing validation and replay,
   token-only missing fields versus route-attribution gaps, extensible enum
@@ -448,16 +454,19 @@ Append each RED and GREEN command here with exit code and concise result.
 
 ### Task 10
 
-- Main-loop accounting now persists every outer retry and every inner streaming
-  transport attempt with a frozen provider/model/API-mode/base-URL route,
-  per-attempt latency, terminal request status, error class, and unique event ID.
+- Main-loop accounting now instruments every outer retry and every inner streaming
+  transport invocation with a frozen provider/model/API-mode/base-URL route and,
+  when recorder/session state exists and the write succeeds, persists per-attempt
+  latency, terminal request status, error class, and a unique event ID.
 - Streaming receipts are created when transport starts, so interruption during a
   later inner retry cannot erase the active attempt. Stale-detector terminations
   remain timeouts, partial recovery stubs are not counted as new transports, and
   returned usage is persisted before local finish-reason processing.
-- OpenAI, Anthropic, AnthropicBedrock, and boto3 Bedrock runtime clients disable
-  opaque SDK retries. Retry ownership therefore stays in Hermes, where each
-  physical request has an observable accounting boundary.
+- Anthropic, AnthropicBedrock, and boto3 Bedrock runtime clients disable opaque
+  SDK retries. OpenAI-compatible clients default `max_retries` to zero unless an
+  explicit client-kwargs override is already present. Retry ownership therefore
+  normally stays in Hermes, but exact provider-received request counts are not
+  claimed.
 - Process-local counters advance only after the corresponding durable event
   succeeds; recorder failures remain non-blocking and emit WARNING evidence.
   Usage normalization is attempted once and cannot trigger another billable
@@ -648,10 +657,11 @@ Append each RED and GREEN command here with exit code and concise result.
   cutover is complete in `00ffd02ca`; Task 8 persisted `/usage` cutover is
   complete in `9bb3c633a`; and Task 9's cross-harness contract is complete in
   `1b78f7637`.
-- Task 10 integration closure is complete in `16944f86c`: every Hermes-owned
-  transport retry has a durable attempt boundary, opaque SDK retries are
-  disabled, process counters follow successful ledger writes, and the one-time
-  historical migration is atomic under concurrent initialization.
+- Task 10 integration closure is complete in `16944f86c`: every AIAgent
+  transport invocation has an accounting boundary, persistence is attempted
+  when recorder/session state exists, SDK retries are disabled or defaulted off
+  on the covered clients, process counters follow successful ledger writes, and
+  the one-time historical migration is atomic under concurrent initialization.
 - Final verification: `1396 passed, 3 skipped` for `tests/run_agent/`; `244
   passed` for `tests/test_hermes_state.py`; focused adapter/client regressions,
   Python compilation, and diff checks PASS; final blocker review APPROVED.

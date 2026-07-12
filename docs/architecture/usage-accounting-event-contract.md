@@ -18,7 +18,7 @@ The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 
 - JSON field names are stable within version 1.
 - Producers MAY add namespaced extension fields prefixed with `x_`.
-- Consumers MUST ignore unknown extension fields and MUST NOT reinterpret them as canonical fields.
+- Consumers MUST NOT reinterpret unknown extension fields as canonical fields. They MUST preserve the fields, or preserve their canonical hash, so replay conflict detection still includes them.
 - For extensible enum fields such as `purpose`, values prefixed with `x_` MUST be accepted and preserved. Unknown unnamespaced enum values MUST be rejected or quarantined rather than silently mapped to a core value.
 - Decimal monetary amounts MUST be strings. This avoids binary-float drift across harnesses and storage systems.
 - A missing or `null` measurement means unknown or unavailable. Numeric zero means known zero.
@@ -136,7 +136,7 @@ For replay comparison, the canonical payload is the complete fact after these tr
 1. Materialize every canonical optional field defined by this version, using explicit `null` or `[]` where appropriate.
 2. Normalize RFC 3339 timestamps to UTC with uppercase `Z`, retaining seconds. Trim trailing fractional-second zeroes and omit the fractional part when it becomes zero. Thus `.100Z` canonicalizes to `.1Z` and `.000Z` to `Z`.
 3. Normalize decimal strings to plain base-10 notation with no leading `+`, no unnecessary leading zeroes, and no trailing fractional zeroes; zero is `"0"`.
-4. Sort set-like arrays such as `missing_fields` and `attribution_gaps` lexically and remove duplicates. Sort `usage_event_refs` by `(source_namespace, source_event_id)` and remove duplicate pairs.
+4. Sort set-like arrays such as `missing_fields` and `attribution_gaps` lexically. Sort `usage_event_refs` by `(source_namespace, source_event_id)`. Validation of required uniqueness occurs before canonicalization; duplicate entries are invalid rather than silently removed.
 5. Include namespaced extension fields. Canonicalize the resulting JSON object with RFC 8785 JSON Canonicalization Scheme.
 
 This comparison is semantic: source JSON key order, insignificant decimal spelling, timestamp offsets representing the same instant, and omitted-versus-materialized optional fields do not create conflicts. A producer MUST NOT change a namespaced extension on replay under the same identity.
@@ -554,7 +554,9 @@ Hermes currently stores these fields in `llm_usage_events`:
 - estimated/actual cost, status, source, and pricing version;
 - latency, request status, error class, and `api_call_index`.
 
-The current successful-call writer freezes route attribution before dispatch, normalizes response usage, and atomically writes an event plus compatibility session rollup. It currently writes successful responses that contain a usage object. It does not comprehensively persist failed dispatches, pre-fallback retries, cancelled requests, timeouts, or successful responses without usage.
+The current conversation-loop writer freezes route attribution before dispatch, normalizes response usage once, and atomically writes an event plus compatibility session rollup when a recorder and session ID are available and the write succeeds. It instruments every Hermes transport invocation in that path, including outer retries, inner streaming retries, failed or invalid responses, timeouts, cancellations, successful responses without usage, and successful responses before local finish-reason processing. Recorder absence and write failure remain lossy because there is no durable outbox. Anthropic and Bedrock SDK retries are disabled on this path. OpenAI-compatible retries default to zero but an explicit nonzero client override remains possible. A partial-stream recovery stub is not a second transport and therefore shares the failed attempt receipt that caused recovery.
+
+This coverage claim is scoped to transports routed through the AIAgent conversation loop and its usage recorder, including background-review forks. The receipt is created before some credential/client preparation, so it proves a Hermes transport invocation, not necessarily a provider-received network request. Standalone auxiliary clients that bypass the recorder still require explicit integration before Hermes can claim whole-runtime coverage.
 
 The following version 1 interchange fields are not distinct persisted Hermes columns as of this document:
 
@@ -571,17 +573,18 @@ The following version 1 interchange fields are not distinct persisted Hermes col
 Other limits matter when exporting:
 
 - Current `model` is the frozen requested model, not a requested/reported pair.
-- Current `api_call_index` is a successful-call index. Historical rows also use it as reconstructed call count. It is not version 1 `attempt_no`.
-- Current `timestamp` is recorded after a response and is the best available occurrence time, not a separately persisted request-start time.
-- Successful rows rely on database defaults for `record_kind=api_attempt`, `usage_source=provider_reported`, and `measurement_confidence=exact`.
+- The local `api_attempt` boundary is a Hermes transport invocation. A receipt can be created before credential refresh or client preparation, so a pre-network failure may be stored under that record kind even though the portable contract reserves `api_attempt` for a real provider/network attempt. An exporter cannot claim an exact physical request without lower-level send evidence or a provider receipt.
+- Current `api_call_index` is a process-local agent attempt sequence and resets when an agent instance is reconstructed. Historical rows also use it as reconstructed call count. It is not version 1 `attempt_no`.
+- Current `timestamp` is persistence-call time and is only the best available occurrence-time approximation, not a separately persisted request start or completion time. Failed inner streaming receipts may be persisted only after later retries finish and can therefore cross an analytics time boundary. Streaming receipts retain start time only in memory long enough to derive latency.
+- Ordinary rows rely on database defaults for `record_kind=api_attempt`, `usage_source=provider_reported`, and `measurement_confidence=exact`, including failed attempts whose token values are unavailable. Exporters must therefore derive conservative completeness and source claims from the full row rather than copying these defaults blindly.
 - Token columns default to zero, so older/current rows do not always prove known-zero versus not supplied. Exporters should mark completeness conservatively.
-- A random `event_uid` is generated immediately before persistence. Reusing that identity deduplicates inside SQLite, but current Hermes does not compare canonical payloads or detect same-ID/different-payload conflicts. There is also no durable producer outbox that can recover the same ID after a failed process-level delivery.
+- A random `event_uid` is generated immediately before persistence for each observable attempt. Reusing that identity deduplicates inside SQLite, but current Hermes does not compare canonical payloads or detect same-ID/different-payload conflicts. There is also no durable producer outbox that can recover the same ID after a failed accounting write.
 - Legacy event-only writers may create rows without `event_uid`.
 - Historical backfill idempotency currently comes from session-scoped reconciliation, not every version 1 identity field.
 - Historical backfill currently writes local `cost_status=reconstructed`, which is not a version 1 cost-status value. An exporter maps it according to the monetary fact present: a reconstructed pricing result becomes `cost_status=estimated`; a defensible provider-reported request amount becomes `actual`; otherwise it becomes `unknown`. Reconstruction remains visible in `measurement_confidence=reconstructed` and `cost_source`.
 - `billing_base_url` is an internal route/provenance value. It is not part of the portable contract and must not appear in a public projection.
 
-The local table remains a valid Hermes accounting source for the observed facts it contains. It must not be described as a complete all-attempt cross-harness ledger until the missing attempt boundaries and completeness fields are captured.
+The local table is a valid Hermes accounting source for the facts successfully persisted. The AIAgent path instruments all of its transport-invocation boundaries, but recorder absence, write failure, explicit OpenAI retry overrides, pre-network failures, standalone auxiliary clients, and missing interchange completeness/identity fields prevent any claim of a lossless whole-runtime, exact physical-request, billing-grade, or cross-harness ledger.
 
 ## Public projection
 
