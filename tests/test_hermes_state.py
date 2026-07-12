@@ -1,9 +1,12 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import sqlite3
+import threading
 import time
-import pytest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from hermes_state import SessionDB
 
@@ -35,6 +38,60 @@ class TestSessionLifecycle:
         assert session["source"] == "cli"
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
+
+    def test_create_session_enriches_accounting_placeholder_without_clobbering_metadata(self, db):
+        db.create_session(session_id="parent", source="cli")
+        db.record_usage_and_rollup(
+            event_uid="hermes:placeholder",
+            session_id="s1",
+            timestamp=12345.0,
+            input_tokens=10,
+            output_tokens=2,
+        )
+        placeholder = db.get_session("s1")
+        assert placeholder is not None
+        assert placeholder["source"] == "unknown"
+        assert placeholder["model"] is None
+
+        db.create_session(
+            session_id="s1",
+            source="discord",
+            model="openrouter/original-model",
+            model_config={"temperature": 0.2},
+            system_prompt="full system prompt",
+            user_id="user-1",
+            parent_session_id="parent",
+        )
+
+        enriched = db.get_session("s1")
+        assert enriched is not None
+        assert enriched["source"] == "discord"
+        assert enriched["model"] == "openrouter/original-model"
+        assert enriched["model_config"] == '{"temperature": 0.2}'
+        assert enriched["system_prompt"] == "full system prompt"
+        assert enriched["user_id"] == "user-1"
+        assert enriched["parent_session_id"] == "parent"
+        assert enriched["started_at"] == placeholder["started_at"] == 12345.0
+
+        # Once meaningful metadata exists, a later create call is enrichment
+        # only and cannot replace the established session identity snapshot.
+        db.create_session(
+            session_id="s1",
+            source="cli",
+            model="different-model",
+            model_config={"temperature": 0.9},
+            system_prompt="different prompt",
+            user_id="user-2",
+        )
+        preserved = db.get_session("s1")
+        assert preserved is not None
+        assert preserved["source"] == "discord"
+        assert preserved["model"] == "openrouter/original-model"
+        assert preserved["model_config"] == '{"temperature": 0.2}'
+        assert preserved["system_prompt"] == "full system prompt"
+        assert preserved["user_id"] == "user-1"
+        assert preserved["parent_session_id"] == "parent"
+        assert preserved["started_at"] == 12345.0
 
 
     def test_get_nonexistent_session(self, db):
@@ -214,6 +271,90 @@ class TestSessionLifecycle:
         assert session["actual_cost_usd"] == pytest.approx(0.20)
         assert session["api_call_count"] == 1
 
+    def test_record_usage_and_rollup_unknown_cost_stays_null(self, db):
+        db.record_usage_and_rollup(
+            event_uid="hermes:unknown-only",
+            session_id="unknown-only",
+            estimated_cost_usd=None,
+            cost_status="unknown",
+            input_tokens=10,
+        )
+
+        session = db.get_session("unknown-only")
+        assert session["estimated_cost_usd"] is None
+        assert session["cost_status"] == "unknown"
+
+    @pytest.mark.parametrize("unknown_first", [False, True])
+    def test_record_usage_and_rollup_known_plus_unknown_cost_is_order_independent(
+        self, db, unknown_first
+    ):
+        session_id = f"known-unknown-{unknown_first}"
+        known = {
+            "event_uid": f"hermes:{session_id}:known",
+            "session_id": session_id,
+            "estimated_cost_usd": 0.25,
+            "cost_status": "estimated",
+            "cost_source": "catalog",
+            "pricing_version": "catalog-v1",
+        }
+        unknown = {
+            "event_uid": f"hermes:{session_id}:unknown",
+            "session_id": session_id,
+            "estimated_cost_usd": None,
+            "cost_status": "unknown",
+        }
+
+        for event in ([unknown, known] if unknown_first else [known, unknown]):
+            db.record_usage_and_rollup(**event)
+
+        session = db.get_session(session_id)
+        assert session["estimated_cost_usd"] == pytest.approx(0.25)
+        assert session["cost_status"] == "unknown"
+        assert session["cost_source"] == "catalog"
+        assert session["pricing_version"] == "catalog-v1"
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_record_usage_and_rollup_cost_provenance_disagreement_is_sticky_mixed(
+        self, db, reverse
+    ):
+        session_id = f"mixed-provenance-{reverse}"
+        events = [
+            {
+                "event_uid": f"hermes:{session_id}:one",
+                "session_id": session_id,
+                "estimated_cost_usd": 0.10,
+                "cost_status": "included",
+                "cost_source": "source-a",
+                "pricing_version": "version-a",
+            },
+            {
+                "event_uid": f"hermes:{session_id}:two",
+                "session_id": session_id,
+                "estimated_cost_usd": 0.20,
+                "cost_status": "actual",
+                "cost_source": "source-b",
+                "pricing_version": "version-b",
+            },
+        ]
+        if reverse:
+            events.reverse()
+        for event in events:
+            db.record_usage_and_rollup(**event)
+        db.record_usage_and_rollup(
+            event_uid=f"hermes:{session_id}:three",
+            session_id=session_id,
+            estimated_cost_usd=0.30,
+            cost_status="estimated",
+            cost_source="source-a",
+            pricing_version="version-a",
+        )
+
+        session = db.get_session(session_id)
+        assert session["estimated_cost_usd"] == pytest.approx(0.60)
+        assert session["cost_status"] == "estimated"
+        assert session["cost_source"] == "mixed"
+        assert session["pricing_version"] == "mixed"
+
     def test_pre_event_uid_database_migrates_without_losing_usage(self, tmp_path):
         db_path = tmp_path / "legacy_state.db"
         legacy_db = SessionDB(db_path=db_path)
@@ -315,6 +456,38 @@ class TestSessionLifecycle:
         assert session["input_tokens"] == 40
         assert session["output_tokens"] == 5
         assert session["api_call_count"] == 1
+
+    def test_record_usage_and_rollup_deduplicates_two_connection_replay_race(self, tmp_path):
+        db_path = tmp_path / "usage-race.db"
+        first_db = SessionDB(db_path=db_path)
+        second_db = SessionDB(db_path=db_path)
+        first_db.create_session(session_id="race", source="cron")
+        barrier = threading.Barrier(2)
+
+        def record(connection):
+            barrier.wait(timeout=2)
+            return connection.record_usage_and_rollup(
+                event_uid="hermes:race:shared",
+                session_id="race",
+                input_tokens=40,
+                output_tokens=5,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(record, (first_db, second_db)))
+
+            assert sorted(result["inserted"] for result in results) == [False, True]
+            assert results[0]["id"] == results[1]["id"]
+            assert len(first_db.get_llm_usage_events(session_id="race")) == 1
+            session = first_db.get_session("race")
+            assert session is not None
+            assert session["input_tokens"] == 40
+            assert session["output_tokens"] == 5
+            assert session["api_call_count"] == 1
+        finally:
+            first_db.close()
+            second_db.close()
 
     def test_record_usage_and_rollup_rolls_back_session_when_event_insert_fails(self, db):
         db.create_session(session_id="s1", source="cli")

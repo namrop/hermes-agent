@@ -25,6 +25,7 @@ import ssl
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.anthropic_adapter import _is_oauth_token
@@ -71,6 +72,16 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _DispatchRoute:
+    """Immutable billing/normalization identity for one transport attempt."""
+
+    provider: Optional[str]
+    model: Optional[str]
+    api_mode: Optional[str]
+    base_url: Optional[str]
 
 
 def _ra():
@@ -1070,6 +1081,17 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                # Agent routing fields are mutable: provider callbacks, retry
+                # recovery, and fallback activation may change them while an
+                # attempt is in flight. Capture the route after fallback setup
+                # and immediately before transport execution, then use only
+                # this frozen value for usage normalization and accounting.
+                dispatch_route = _DispatchRoute(
+                    provider=agent.provider,
+                    model=agent.model,
+                    api_mode=agent.api_mode,
+                    base_url=agent.base_url,
+                )
                 if _use_streaming:
                     response = agent._interruptible_streaming_api_call(
                         api_kwargs, on_first_delta=_stop_spinner
@@ -1530,8 +1552,8 @@ def run_conversation(
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
-                        provider=agent.provider,
-                        api_mode=agent.api_mode,
+                        provider=dispatch_route.provider,
+                        api_mode=dispatch_route.api_mode,
                     )
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
@@ -1570,16 +1592,17 @@ def run_conversation(
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
-                        agent.session_api_calls, agent.model, agent.provider or "unknown",
+                        agent.session_api_calls, dispatch_route.model,
+                        dispatch_route.provider or "unknown",
                         prompt_tokens, completion_tokens, total_tokens,
                         api_duration, _cache_pct,
                     )
 
                     cost_result = estimate_usage_cost(
-                        agent.model,
+                        dispatch_route.model,
                         canonical_usage,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
+                        provider=dispatch_route.provider,
+                        base_url=dispatch_route.base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
                     if cost_result.amount_usd is not None:
@@ -1596,6 +1619,7 @@ def run_conversation(
                     # absolute totals, so they safely overwrite these per-call
                     # deltas instead of double-counting them.
                     if agent._session_db and agent.session_id:
+                        event_uid = f"hermes:{uuid.uuid4()}"
                         try:
                             estimated_cost = (
                                 float(cost_result.amount_usd)
@@ -1605,15 +1629,14 @@ def run_conversation(
                                 "subscription_included"
                                 if cost_result.status == "included" else None
                             )
-                            event_uid = f"hermes:{uuid.uuid4()}"
                             agent._session_db.record_usage_and_rollup(
                                 event_uid=event_uid,
                                 session_id=agent.session_id,
                                 source=getattr(agent, "platform", None),
-                                provider=agent.provider,
-                                model=agent.model,
-                                api_mode=agent.api_mode,
-                                billing_base_url=agent.base_url,
+                                provider=dispatch_route.provider,
+                                model=dispatch_route.model,
+                                api_mode=dispatch_route.api_mode,
+                                billing_base_url=dispatch_route.base_url,
                                 billing_mode=billing_mode,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
@@ -1629,12 +1652,16 @@ def run_conversation(
                                 api_call_index=agent.session_api_calls,
                             )
                         except Exception as e:
-                            # Log token persistence failures so they're
-                            # visible in agent.log — silent loss here is
-                            # the root cause of undercounted analytics.
-                            logger.debug(
-                                "Token persistence failed (session=%s, tokens=%d): %s",
-                                agent.session_id, total_tokens, e,
+                            # Accounting loss must be visible while preserving
+                            # the successful model response for the caller.
+                            logger.warning(
+                                "Usage accounting persistence failed "
+                                "(session=%s, event_uid=%s, tokens=%d): %s",
+                                agent.session_id,
+                                event_uid,
+                                total_tokens,
+                                e,
+                                exc_info=True,
                             )
                     
                     if agent.verbose_logging:

@@ -744,12 +744,38 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
     ) -> None:
-        """Shared INSERT OR IGNORE for session rows."""
+        """Insert a session or enrich metadata missing from an existing row.
+
+        Accounting can create a reduced placeholder after the original
+        session-creation write failed.  A later full ``create_session()`` must
+        therefore fill NULL metadata without replacing established values.
+        ``source`` is the sole placeholder-aware field: NULL, empty, and
+        ``unknown`` may be replaced by a meaningful incoming source.
+        ``started_at`` always belongs to the first successful insert.
+        """
         def _do(conn):
             conn.execute(
-                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+                """INSERT INTO sessions (id, source, user_id, model, model_config,
                    system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       source = CASE
+                           WHEN (sessions.source IS NULL
+                                 OR TRIM(sessions.source) = ''
+                                 OR LOWER(TRIM(sessions.source)) = 'unknown')
+                                AND excluded.source IS NOT NULL
+                                AND TRIM(excluded.source) != ''
+                                AND LOWER(TRIM(excluded.source)) != 'unknown'
+                           THEN excluded.source
+                           ELSE sessions.source
+                       END,
+                       user_id = COALESCE(sessions.user_id, excluded.user_id),
+                       model = COALESCE(sessions.model, excluded.model),
+                       model_config = COALESCE(sessions.model_config, excluded.model_config),
+                       system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
+                       parent_session_id = COALESCE(
+                           sessions.parent_session_id, excluded.parent_session_id
+                       )""",
                 (
                     session_id,
                     source,
@@ -1044,6 +1070,56 @@ class SessionDB:
         cache_write_count = _to_int(cache_write_tokens)
         reasoning_count = _to_int(reasoning_tokens)
 
+        def _canonical_cost_status(value: Optional[str]) -> Optional[str]:
+            """Normalize rollup statuses into an order-independent lattice.
+
+            Missing/blank values carry no information and are ignored.
+            Unknown, unpriced, or unfamiliar values conservatively become
+            ``unknown``. ``exact`` is the legacy spelling of ``actual``.
+            Coverage precedence is unknown > estimated > actual > included.
+            """
+            if value is None or not str(value).strip():
+                return None
+            normalized = str(value).strip().lower()
+            if normalized in {"unknown", "unpriced"}:
+                return "unknown"
+            if normalized == "estimated":
+                return "estimated"
+            if normalized in {"actual", "exact"}:
+                return "actual"
+            if normalized == "included":
+                return "included"
+            return "unknown"
+
+        def _merge_cost_status(existing: Optional[str], incoming: Optional[str]) -> Optional[str]:
+            ranks = {"included": 1, "actual": 2, "estimated": 3, "unknown": 4}
+            left = _canonical_cost_status(existing)
+            right = _canonical_cost_status(incoming)
+            if left is None:
+                return right
+            if right is None:
+                return left
+            return left if ranks[left] >= ranks[right] else right
+
+        def _merge_provenance(existing: Optional[str], incoming: Optional[str]) -> Optional[str]:
+            """Keep one agreed known label; disagreement is sticky ``mixed``."""
+            left = str(existing).strip() if existing is not None else ""
+            right = str(incoming).strip() if incoming is not None else ""
+            if left.lower() == "mixed" or right.lower() == "mixed":
+                return "mixed"
+            if not left:
+                return right or None
+            if not right:
+                return left
+            return left if left == right else "mixed"
+
+        def _sum_known(existing: Optional[float], incoming: Optional[float]) -> Optional[float]:
+            if incoming is None:
+                return existing
+            if existing is None:
+                return incoming
+            return existing + incoming
+
         def _do(conn):
             existing = conn.execute(
                 "SELECT * FROM llm_usage_events WHERE event_uid = ?",
@@ -1058,22 +1134,55 @@ class SessionDB:
             if session_id:
                 # Keep session creation in this transaction too: a failed
                 # event insert must not leave even a placeholder row behind.
+                # A meaningful route source may enrich an older placeholder,
+                # but established compatibility metadata remains immutable.
+                placeholder_source = source or "unknown"
                 conn.execute(
-                    """INSERT OR IGNORE INTO sessions
-                           (id, source, model, started_at)
-                       VALUES (?, ?, ?, ?)""",
-                    (session_id, source or "unknown", model, event_ts),
+                    """INSERT INTO sessions (id, source, model, started_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           source = CASE
+                               WHEN (sessions.source IS NULL
+                                     OR TRIM(sessions.source) = ''
+                                     OR LOWER(TRIM(sessions.source)) = 'unknown')
+                                    AND TRIM(excluded.source) != ''
+                                    AND LOWER(TRIM(excluded.source)) != 'unknown'
+                               THEN excluded.source
+                               ELSE sessions.source
+                           END,
+                           model = COALESCE(sessions.model, excluded.model)""",
+                    (session_id, placeholder_source, model, event_ts),
                 )
                 session = conn.execute(
-                    "SELECT source FROM sessions WHERE id = ?",
+                    """SELECT source, estimated_cost_usd, actual_cost_usd,
+                              cost_status, cost_source, pricing_version
+                       FROM sessions WHERE id = ?""",
                     (session_id,),
                 ).fetchone()
-                if session is not None:
-                    event_source = event_source or session["source"]
+                assert session is not None
+                event_source = event_source or session["source"]
+
+                merged_estimated_cost = _sum_known(
+                    session["estimated_cost_usd"], estimated_cost_usd
+                )
+                merged_actual_cost = _sum_known(
+                    session["actual_cost_usd"], actual_cost_usd
+                )
+                merged_cost_status = _merge_cost_status(
+                    session["cost_status"], cost_status
+                )
+                merged_cost_source = _merge_provenance(
+                    session["cost_source"], cost_source
+                )
+                merged_pricing_version = _merge_provenance(
+                    session["pricing_version"], pricing_version
+                )
 
                 # Deliberately update before INSERT: _execute_write() rolls
                 # this back if any event constraint or trigger rejects the
                 # event, proving there is no partial compatibility rollup.
+                # These session fields are compatibility-only; event rows are
+                # authoritative for per-route cost and provenance.
                 conn.execute(
                     """UPDATE sessions SET
                            input_tokens = input_tokens + ?,
@@ -1081,14 +1190,11 @@ class SessionDB:
                            cache_read_tokens = cache_read_tokens + ?,
                            cache_write_tokens = cache_write_tokens + ?,
                            reasoning_tokens = reasoning_tokens + ?,
-                           estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
-                           actual_cost_usd = CASE
-                               WHEN ? IS NULL THEN actual_cost_usd
-                               ELSE COALESCE(actual_cost_usd, 0) + ?
-                           END,
-                           cost_status = COALESCE(?, cost_status),
-                           cost_source = COALESCE(?, cost_source),
-                           pricing_version = COALESCE(?, pricing_version),
+                           estimated_cost_usd = ?,
+                           actual_cost_usd = ?,
+                           cost_status = ?,
+                           cost_source = ?,
+                           pricing_version = ?,
                            billing_provider = COALESCE(billing_provider, ?),
                            billing_base_url = COALESCE(billing_base_url, ?),
                            billing_mode = COALESCE(billing_mode, ?),
@@ -1101,12 +1207,11 @@ class SessionDB:
                         cache_read_count,
                         cache_write_count,
                         reasoning_count,
-                        estimated_cost_usd,
-                        actual_cost_usd,
-                        actual_cost_usd,
-                        cost_status,
-                        cost_source,
-                        pricing_version,
+                        merged_estimated_cost,
+                        merged_actual_cost,
+                        merged_cost_status,
+                        merged_cost_source,
+                        merged_pricing_version,
                         provider,
                         billing_base_url,
                         billing_mode,

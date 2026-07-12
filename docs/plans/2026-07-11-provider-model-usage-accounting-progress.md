@@ -28,7 +28,7 @@ These existed before this work and must remain unstaged/unmodified by this imple
 | Task | State | Commit | Verification | Notes |
 |---|---|---|---|---|
 | 1. Plan + progress ledger | completed | `a3a8b38ce` | readback + diff checks PASS | Landed before production code |
-| 2. Atomic event + rollup | completed | `dbd307323`; `test: cover usage event migration and rollups` (this commit) | initial 225 + 11 PASS; spec-review suite 238 PASS | Atomic, replay-safe, and regression-covered |
+| 2. Atomic event + rollup | completed | `dbd307323`; `43e4e4093`; `fix: harden atomic usage accounting semantics` (this commit) | quality RED 7 failed/229 passed; final 247 PASS | Atomic, replay-safe, enriched, route-stable, and non-lossy |
 | 3. Background-review accounting | active | — | RED pending | Preserve transcript boundary |
 | 4. Residual-only historical backfill | pending | — | — | No overlap with real events |
 | 5. Event-derived read models | pending | — | — | Central query semantics |
@@ -106,7 +106,30 @@ Append each RED and GREEN command here with exit code and concise result.
 - Verification command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/agent/test_usage_pricing.py -o 'addopts=' -q`
 - Verification result: exit 0; `238 passed in 11.35s`.
 - Production defect found: none.
-- Second Task 2 commit: `test: cover usage event migration and rollups` (this commit).
+- Second Task 2 commit: `43e4e4093` (`test: cover usage event migration and rollups`).
+
+#### Code-quality blocker follow-up
+
+- Findings: the atomic writer could strand a reduced session because later
+  `create_session()` used `INSERT OR IGNORE`; unknown cost events coerced a
+  never-known aggregate to `0.0`; status/provenance rollups were last-writer
+  wins; the main loop read mutable route state after dispatch; and accounting
+  failures were logged below the normal production log threshold.
+- RED command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py -o 'addopts=' -q`
+- RED result: exit 1; `7 failed, 229 passed in 12.39s`. Expected failures
+  covered placeholder enrichment, unknown-only cost, order-independent status,
+  mixed provenance, immutable dispatch attribution, and WARNING visibility.
+  The new deterministic two-connection replay-race regression passed on RED.
+- First GREEN command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py -o 'addopts=' -q`
+- First GREEN result: exit 0; `236 passed in 11.53s`.
+- Final GREEN command: `.venv/bin/python -m pytest tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py tests/agent/test_usage_pricing.py -o 'addopts=' -q`
+- Final GREEN result: exit 0; `247 passed in 11.73s`.
+- Compilation: `.venv/bin/python -m py_compile hermes_state.py agent/conversation_loop.py tests/test_hermes_state.py tests/run_agent/test_token_persistence_non_cli.py` — PASS.
+- Diff check: `git diff --check` over the five Task 2 quality-fix paths — PASS.
+- Files changed: `hermes_state.py`, `agent/conversation_loop.py`,
+  `tests/test_hermes_state.py`,
+  `tests/run_agent/test_token_persistence_non_cli.py`, and this ledger.
+- Task 2 remains completed after this quality pass; Task 3 is active next.
 
 ## Decisions and deviations
 
@@ -114,6 +137,26 @@ Append each RED and GREEN command here with exit code and concise result.
 - `event_uid` is additive and nullable for legacy writers, with a SQLite partial unique index over non-NULL values.
 - The conversation loop generates one `hermes:<uuid4>` identity before persistence and uses only `record_usage_and_rollup()` for ordinary successful-call DB accounting.
 - `record_llm_usage_event()` and `update_token_counts()` remain unchanged and available for compatibility; prompt-cache/token bucket semantics are unchanged.
+- Session creation is an enrichment upsert: first-write `started_at` and all
+  established metadata win, NULL metadata is filled, and only placeholder
+  source values (NULL/blank/`unknown`) yield to a meaningful source.
+- Compatibility cost sums retain NULL until an estimate exists and ignore
+  later absent amounts. Status merge uses the conservative, commutative rank
+  `unknown`/`unpriced` > `estimated` > `actual`/`exact` > `included`; blank or
+  NULL status carries no information, aliases canonicalize to `unknown` and
+  `actual`, and unfamiliar statuses conservatively become `unknown`.
+- Compatibility `cost_source` and `pricing_version` ignore NULL/blank values,
+  preserve one agreed value, and become sticky `mixed` on disagreement. Event
+  rows remain authoritative; these session columns are compatibility-only.
+- Each transport attempt captures a frozen provider/model/API-mode/base-URL
+  route immediately before dispatch. Usage normalization, pricing, logging,
+  and event persistence use that attempt snapshot even if agent state mutates.
+- Usage-accounting persistence failures now emit WARNING with session ID,
+  event UID, token total, exception text, and traceback while returning the
+  successful model response.
+- Legacy `update_token_counts()` cost semantics are intentionally deferred and
+  unchanged: no focused regression showed that compatibility API was required
+  for the atomic writer quality fix.
 
 ## Known risks
 
@@ -141,5 +184,7 @@ Append each RED and GREEN command here with exit code and concise result.
 ## Last verified continuation point
 
 - Task 1 documentation is committed at `a3a8b38ce`.
-- Task 2 implementation and spec-review regression follow-up are complete; commits are `dbd307323` (`feat: make LLM usage event rollups atomic`) and `test: cover usage event migration and rollups` (this commit).
+- Task 2 implementation, spec-review coverage, and code-quality blocker fixes
+  are complete; commits are `dbd307323`, `43e4e4093`, and
+  `fix: harden atomic usage accounting semantics` (this commit).
 - Next action: begin Task 3 by writing failing background-review accounting tests before changing production code.
