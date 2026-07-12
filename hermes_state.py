@@ -32,6 +32,7 @@ from agent.usage_analytics import (
     summarize_usage_by_source as aggregate_usage_by_source,
     summarize_usage_daily as aggregate_usage_daily,
     summarize_usage_events as aggregate_usage_events,
+    summarize_usage_with_provider_models as aggregate_usage_with_provider_models,
 )
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
@@ -1512,6 +1513,15 @@ class SessionDB:
             source=source,
             session_id=session_id,
             purpose=purpose,
+        )
+
+    def summarize_session_usage_report(self, session_id: str) -> Dict[str, Any]:
+        """Return reconciled session totals and routes from one ledger snapshot."""
+        return self._aggregate_filtered_llm_usage(
+            aggregate_usage_with_provider_models,
+            _LLM_USAGE_ACCOUNTING_COLUMNS
+            + ("provider", "model", "billing_mode"),
+            session_id=session_id,
         )
 
     def summarize_usage_by_source(

@@ -238,6 +238,45 @@ class TestSessionLifecycle:
         event = db.get_llm_usage_events(session_id="s1")[0]
         assert event["source"] == "telegram"
 
+    def test_summarize_session_usage_report_is_reconciled_and_preserves_billing_mode(
+        self, db
+    ):
+        db.record_usage_and_rollup(
+            event_uid="hermes:report:1",
+            session_id="report-session",
+            source="cli",
+            provider="openrouter",
+            model="model-a",
+            input_tokens=10,
+            cache_read_tokens=5,
+            cache_write_tokens=2,
+            output_tokens=2,
+            estimated_cost_usd=0.11,
+            request_status="ok",
+        )
+        db.record_usage_and_rollup(
+            event_uid="hermes:report:2",
+            session_id="report-session",
+            source="cli",
+            provider="openai-codex",
+            model="model-b",
+            billing_mode="subscription_included",
+            input_tokens=20,
+            output_tokens=5,
+            estimated_cost_usd=0,
+            request_status="ok",
+        )
+
+        report = db.summarize_session_usage_report("report-session")
+
+        assert report["summary"]["total_tokens"] == 44
+        assert sum(row["total_tokens"] for row in report["routes"]) == 44
+        assert report["summary"]["subscription_included_event_count"] == 1
+        included = next(
+            row for row in report["routes"] if row["provider"] == "openai-codex"
+        )
+        assert included["subscription_included_event_count"] == 1
+
     def test_record_usage_and_rollup_inserts_event_and_increments_session(self, db):
         db.create_session(session_id="s1", source="discord")
 

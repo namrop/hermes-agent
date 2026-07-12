@@ -242,6 +242,23 @@ def test_actual_and_estimated_cost_coverage_are_independent(db):
     assert summary["actual_cost_unknown_event_count"] == 2
 
 
+def test_subscription_included_estimate_is_not_also_counted_unknown(db):
+    _record(
+        db,
+        "included",
+        billing_mode="subscription_included",
+        estimated_cost_usd=None,
+        actual_cost_usd=None,
+    )
+
+    report = db.summarize_session_usage_report("session-1")
+
+    assert report["summary"]["subscription_included_event_count"] == 1
+    assert report["summary"]["estimated_cost_unknown_event_count"] == 0
+    assert report["summary"]["actual_cost_unknown_event_count"] == 1
+    assert report["routes"][0]["estimated_cost_unknown_event_count"] == 0
+
+
 def test_reasoning_tokens_are_annotation_not_added_to_total(db):
     _record(
         db,

@@ -245,6 +245,11 @@ class _SummaryAccumulator:
             unknown_key = f"{dimension}_cost_unknown_event_count"
             raw_cost = event.get(cost_key)
             if raw_cost is None:
+                if (
+                    dimension == "estimated"
+                    and event.get("billing_mode") == "subscription_included"
+                ):
+                    continue
                 summary[unknown_key] += 1
                 continue
             cost = _finite_fraction(raw_cost, allow_negative=is_correction)
@@ -346,6 +351,61 @@ def summarize_usage_by_provider_model(
 ) -> list[Summary]:
     """Group events by billing provider and model without collapsing either."""
     return _group_usage_events(events, ("provider", "model"))
+
+
+def summarize_usage_with_provider_models(
+    events: Iterable[UsageEvent],
+) -> dict[str, Any]:
+    """Build reconciled global and provider/model views in one event pass.
+
+    This composite read model is for user-facing session reports that must not
+    mix snapshots taken before and after a concurrent event insert. Billing
+    mode coverage is carried alongside monetary facts so a subscription-
+    included zero is not rendered as an ordinary priced zero.
+    """
+    total = _SummaryAccumulator()
+    grouped: dict[tuple[Any, ...], _SummaryAccumulator] = {}
+    total_included = 0
+    included_by_group: dict[tuple[Any, ...], int] = {}
+
+    for event in events:
+        total.add(event)
+        identity = tuple(
+            _json_dimension(event.get(dimension))
+            for dimension in ("provider", "model")
+        )
+        accumulator = grouped.get(identity)
+        if accumulator is None:
+            accumulator = grouped[identity] = _SummaryAccumulator()
+        accumulator.add(event)
+        if event.get("billing_mode") == "subscription_included":
+            total_included += 1
+            included_by_group[identity] = included_by_group.get(identity, 0) + 1
+
+    summary = total.finish()
+    summary["subscription_included_event_count"] = total_included
+    routes: list[Summary] = []
+    for identity, accumulator in grouped.items():
+        row = accumulator.finish()
+        for dimension, (value, is_valid) in zip(
+            ("provider", "model"), identity
+        ):
+            row[dimension] = value
+            row[f"{dimension}_is_valid"] = is_valid
+        row["subscription_included_event_count"] = included_by_group.get(
+            identity, 0
+        )
+        routes.append(row)
+    routes.sort(
+        key=lambda row: tuple(
+            (
+                _sort_value(row.get(dimension)),
+                not bool(row.get(f"{dimension}_is_valid")),
+            )
+            for dimension in ("provider", "model")
+        )
+    )
+    return {"summary": summary, "routes": routes}
 
 
 def summarize_usage_by_source(events: Iterable[UsageEvent]) -> list[Summary]:

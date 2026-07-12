@@ -12801,8 +12801,8 @@ class GatewayRunner:
         """Handle /usage command -- show token usage for the current session.
 
         Checks both _running_agents (mid-turn) and _agent_cache (between turns)
-        so that rate limits, cost estimates, and detailed token breakdowns are
-        available whenever the user asks, not only while the agent is running.
+        for live rate limits and context pressure. Cumulative tokens, route
+        subtotals, and stored costs always come from the persisted event ledger.
         """
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -12818,24 +12818,29 @@ class GatewayRunner:
                     if cached:
                         agent = cached[0]
 
-        # Resolve provider/base_url/api_key for the account-usage fetch.
-        # Prefer the live agent; fall back to persisted billing data on the
-        # SessionDB row so `/usage` still returns account info between turns
-        # when no agent is resident.
-        provider = getattr(agent, "provider", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
-        base_url = getattr(agent, "base_url", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
-        api_key = getattr(agent, "api_key", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
-        if not provider and getattr(self, "_session_db", None) is not None:
-            try:
-                _entry_for_billing = self.session_store.get_or_create_session(source)
-                persisted = self._session_db.get_session(_entry_for_billing.session_id) or {}
-            except Exception:
-                persisted = {}
-            provider = provider or persisted.get("billing_provider")
-            base_url = base_url or persisted.get("billing_base_url")
+        session_entry = self.session_store.get_or_create_session(source)
+        from agent.usage_reporting import (
+            format_session_usage_lines,
+            read_persisted_session_usage,
+        )
 
-        # Fetch account usage off the event loop so slow provider APIs don't
-        # block the gateway. Failures are non-fatal -- account_lines stays [].
+        report = await asyncio.to_thread(
+            read_persisted_session_usage,
+            getattr(self, "_session_db", None),
+            session_entry.session_id,
+        )
+
+        # Account limits are current live-route observations, not cumulative
+        # usage. Never infer one account/provider from a mixed-route ledger.
+        live_agent = (
+            agent
+            if agent and agent is not _AGENT_PENDING_SENTINEL
+            else None
+        )
+        provider = getattr(live_agent, "provider", None)
+        base_url = getattr(live_agent, "base_url", None)
+        api_key = getattr(live_agent, "api_key", None)
+
         account_lines: list[str] = []
         if provider:
             try:
@@ -12848,91 +12853,89 @@ class GatewayRunner:
             except Exception:
                 account_snapshot = None
             if account_snapshot:
-                account_lines = render_account_usage_lines(account_snapshot, markdown=True)
+                account_lines = render_account_usage_lines(
+                    account_snapshot, markdown=True
+                )
 
-        if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
-            lines = []
+        lines: list[str] = []
 
-            # Rate limits (when available from provider headers)
-            rl_state = agent.get_rate_limit_state()
+        # Rate limits and context pressure remain live operational state.
+        if live_agent:
+            rl_state = live_agent.get_rate_limit_state()
             if rl_state and rl_state.has_data:
                 from agent.rate_limit_tracker import format_rate_limit_compact
-                lines.append(t("gateway.usage.rate_limits", state=format_rate_limit_compact(rl_state)))
-                lines.append("")
 
-            # Session token usage — detailed breakdown matching CLI
-            input_tokens = getattr(agent, "session_input_tokens", 0) or 0
-            output_tokens = getattr(agent, "session_output_tokens", 0) or 0
-            cache_read = getattr(agent, "session_cache_read_tokens", 0) or 0
-            cache_write = getattr(agent, "session_cache_write_tokens", 0) or 0
-
-            lines.append(t("gateway.usage.header_session"))
-            lines.append(t("gateway.usage.label_model", model=agent.model))
-            lines.append(t("gateway.usage.label_input_tokens", count=f"{input_tokens:,}"))
-            if cache_read:
-                lines.append(t("gateway.usage.label_cache_read", count=f"{cache_read:,}"))
-            if cache_write:
-                lines.append(t("gateway.usage.label_cache_write", count=f"{cache_write:,}"))
-            lines.append(t("gateway.usage.label_output_tokens", count=f"{output_tokens:,}"))
-            lines.append(t("gateway.usage.label_total", count=f"{agent.session_total_tokens:,}"))
-            lines.append(t("gateway.usage.label_api_calls", count=agent.session_api_calls))
-
-            # Cost estimation
-            try:
-                from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-                cost_result = estimate_usage_cost(
-                    agent.model,
-                    CanonicalUsage(
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cache_read_tokens=cache_read,
-                        cache_write_tokens=cache_write,
-                    ),
-                    provider=getattr(agent, "provider", None),
-                    base_url=getattr(agent, "base_url", None),
+                lines.append(
+                    t(
+                        "gateway.usage.rate_limits",
+                        state=format_rate_limit_compact(rl_state),
+                    )
                 )
-                if cost_result.amount_usd is not None:
-                    prefix = "~" if cost_result.status == "estimated" else ""
-                    lines.append(t("gateway.usage.label_cost", prefix=prefix, amount=f"{float(cost_result.amount_usd):.4f}"))
-                elif cost_result.status == "included":
-                    lines.append(t("gateway.usage.label_cost_included"))
-            except Exception:
-                pass
+                lines.append("")
 
-            # Context window and compressions
-            ctx = agent.context_compressor
+        def _usage_translate(key: str, **values: Any) -> str:
+            paths = {
+                "header": "gateway.usage.header_session",
+                "input": "gateway.usage.label_input_tokens",
+                "cache_read": "gateway.usage.label_cache_read",
+                "cache_write": "gateway.usage.label_cache_write",
+                "output": "gateway.usage.label_output_tokens",
+                "reasoning": "gateway.usage.label_reasoning_subset",
+                "prompt": "gateway.usage.label_prompt_total",
+                "total": "gateway.usage.label_total_tokens",
+                "recorded_calls": "gateway.usage.label_recorded_calls",
+                "estimated_cost": "gateway.usage.label_estimated_cost",
+                "actual_cost": "gateway.usage.label_actual_cost",
+                "cost_unknown": "gateway.usage.cost_unknown",
+                "cost_included": "gateway.usage.cost_included",
+                "cost_amount": "gateway.usage.cost_amount",
+                "cost_amount_unknown": "gateway.usage.cost_amount_unknown",
+                "cost_amount_included": "gateway.usage.cost_amount_included",
+                "cost_amount_unknown_included": (
+                    "gateway.usage.cost_amount_unknown_included"
+                ),
+                "routes": "gateway.usage.header_routes",
+                "route": "gateway.usage.label_route",
+                "dimension_invalid": "gateway.usage.dimension_invalid",
+                "dimension_unattributed": "gateway.usage.dimension_unattributed",
+                "dimension_empty": "gateway.usage.dimension_empty",
+                "value_unknown": "gateway.usage.value_unknown",
+                "recorded_attempts_unknown": (
+                    "gateway.usage.recorded_attempts_unknown"
+                ),
+            }
+            return t(paths[key], **values)
+
+        if report:
+            lines.extend(
+                format_session_usage_lines(report, translate=_usage_translate)
+            )
+        else:
+            lines.append(t("gateway.usage.no_data"))
+
+        if live_agent:
+            ctx = live_agent.context_compressor
             if ctx.last_prompt_tokens:
-                pct = min(100, ctx.last_prompt_tokens / ctx.context_length * 100) if ctx.context_length else 0
-                lines.append(t("gateway.usage.label_context", used=f"{ctx.last_prompt_tokens:,}", total=f"{ctx.context_length:,}", pct=f"{pct:.0f}"))
-            if ctx.compression_count:
-                lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
+                pct = (
+                    min(100, ctx.last_prompt_tokens / ctx.context_length * 100)
+                    if ctx.context_length
+                    else 0
+                )
+                lines.append(
+                    t(
+                        "gateway.usage.label_context",
+                        used=f"{ctx.last_prompt_tokens:,}",
+                        total=f"{ctx.context_length:,}",
+                        pct=f"{pct:.0f}",
+                    )
+                )
 
-            if account_lines:
-                lines.append("")
-                lines.extend(account_lines)
-
-            return "\n".join(lines)
-
-        # No agent at all -- check session history for a rough count
-        session_entry = self.session_store.get_or_create_session(source)
-        history = self.session_store.load_transcript(session_entry.session_id)
-        if history:
-            from agent.model_metadata import estimate_messages_tokens_rough
-            msgs = [m for m in history if m.get("role") in {"user", "assistant"} and m.get("content")]
-            approx = estimate_messages_tokens_rough(msgs)
-            lines = [
-                t("gateway.usage.header_session_info"),
-                t("gateway.usage.label_messages", count=len(msgs)),
-                t("gateway.usage.label_estimated_context", count=f"{approx:,}"),
-                t("gateway.usage.detailed_after_first"),
-            ]
-            if account_lines:
-                lines.append("")
-                lines.extend(account_lines)
-            return "\n".join(lines)
         if account_lines:
-            return "\n".join(account_lines)
-        return t("gateway.usage.no_data")
+            if lines:
+                lines.append("")
+            lines.extend(account_lines)
+
+        return "\n".join(lines)
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""

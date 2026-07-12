@@ -82,8 +82,6 @@ import threading
 import queue
 
 from agent.usage_pricing import (
-    CanonicalUsage,
-    estimate_usage_cost,
     format_duration_compact,
     format_token_count_compact,
 )
@@ -9448,122 +9446,95 @@ class HermesCLI:
         return True
 
     def _show_usage(self):
-        """Show rate limits (if available) and session token usage."""
-        if not self.agent:
-            print("(._.) No active agent -- send a message first.")
-            return
+        """Show persisted session usage plus live operational context."""
+        from agent.usage_reporting import (
+            format_session_usage_lines,
+            read_persisted_session_usage,
+        )
 
         agent = self.agent
-        calls = agent.session_api_calls
-
-        if calls == 0:
-            print("(._.) No API calls made yet in this session.")
-            return
-
-        # ── Rate limits (shown first when available) ────────────────
-        rl_state = agent.get_rate_limit_state()
-        if rl_state and rl_state.has_data:
-            from agent.rate_limit_tracker import format_rate_limit_display
-            print()
-            print(format_rate_limit_display(rl_state))
-            print()
-
-        # ── Session token usage ─────────────────────────────────────
-        input_tokens = getattr(agent, "session_input_tokens", 0) or 0
-        output_tokens = getattr(agent, "session_output_tokens", 0) or 0
-        cache_read_tokens = getattr(agent, "session_cache_read_tokens", 0) or 0
-        cache_write_tokens = getattr(agent, "session_cache_write_tokens", 0) or 0
-        reasoning_tokens = getattr(agent, "session_reasoning_tokens", 0) or 0
-        prompt = agent.session_prompt_tokens
-        completion = agent.session_completion_tokens
-        total = agent.session_total_tokens
-
-        compressor = agent.context_compressor
-        last_prompt = compressor.last_prompt_tokens
-        ctx_len = compressor.context_length
-        pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
-        compressions = compressor.compression_count
-
-        msg_count = len(self.conversation_history)
-        cost_result = estimate_usage_cost(
-            agent.model,
-            CanonicalUsage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-            ),
-            provider=getattr(agent, "provider", None),
-            base_url=getattr(agent, "base_url", None),
+        report = read_persisted_session_usage(
+            getattr(self, "_session_db", None), getattr(self, "session_id", None)
         )
-        elapsed = format_duration_compact((datetime.now() - self.session_start).total_seconds())
 
-        print("  📊 Session Token Usage")
-        print(f"  {'─' * 40}")
-        print(f"  Model:                     {agent.model}")
-        print(f"  Input tokens:              {input_tokens:>10,}")
-        print(f"  Cache read tokens:         {cache_read_tokens:>10,}")
-        print(f"  Cache write tokens:        {cache_write_tokens:>10,}")
-        print(f"  Output tokens:             {output_tokens:>10,}")
-        if reasoning_tokens:
-            print(f"  ↳ Reasoning (subset):      {reasoning_tokens:>10,}")
-        print(f"  Prompt tokens (total):     {prompt:>10,}")
-        print(f"  Completion tokens:         {completion:>10,}")
-        print(f"  Total tokens:              {total:>10,}")
-        print(f"  API calls:                 {calls:>10,}")
-        print(f"  Session duration:          {elapsed:>10}")
-        print(f"  Cost status:              {cost_result.status:>10}")
-        print(f"  Cost source:              {cost_result.source:>10}")
-        if cost_result.amount_usd is not None:
-            prefix = "~" if cost_result.status == "estimated" else ""
-            print(f"  Total cost:              {prefix}${float(cost_result.amount_usd):>10.4f}")
-        elif cost_result.status == "included":
-            print(f"  Total cost:              {'included':>10}")
+        # Rate-limit headers are live operational state, not cumulative usage.
+        if agent:
+            rl_state = agent.get_rate_limit_state()
+            if rl_state and rl_state.has_data:
+                from agent.rate_limit_tracker import format_rate_limit_display
+
+                print()
+                print(format_rate_limit_display(rl_state))
+                print()
+
+        if report:
+            for line in format_session_usage_lines(report):
+                print(f"  {line}")
         else:
-            print(f"  Total cost:              {'n/a':>10}")
-        print(f"  {'─' * 40}")
-        print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
-        print(f"  Messages:         {msg_count}")
-        print(f"  Compressions:     {compressions}")
-        if cost_result.status == "unknown":
-            print(f"  Note:             Pricing unknown for {agent.model}")
+            print("(._.) No persisted API usage found for this session.")
 
-        # Account limits -- fetched off-thread with a hard timeout so slow
-        # provider APIs don't hang the prompt.
-        provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
-        base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None)
-        api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
-        # Lazy import — pulls the OpenAI SDK chain, only needed here.
-        from agent.account_usage import fetch_account_usage, render_account_usage_lines
-        account_snapshot = None
-        if provider:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-                try:
-                    account_snapshot = _pool.submit(
-                        fetch_account_usage, provider,
-                        base_url=base_url, api_key=api_key,
-                    ).result(timeout=10.0)
-                except (concurrent.futures.TimeoutError, Exception):
-                    account_snapshot = None
-        account_lines = [f"  {line}" for line in render_account_usage_lines(account_snapshot)]
-        if account_lines:
-            print()
-            for line in account_lines:
-                print(line)
+        elapsed = format_duration_compact(
+            (datetime.now() - self.session_start).total_seconds()
+        )
+        print(f"  Session duration: {elapsed}")
+        print(f"  Messages: {len(self.conversation_history)}")
+
+        # Context pressure and compression count are meaningful only on the
+        # resident agent and deliberately remain separate from ledger totals.
+        if agent:
+            compressor = agent.context_compressor
+            last_prompt = compressor.last_prompt_tokens
+            ctx_len = compressor.context_length
+            pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
+            print(f"  Current context: {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
+
+            # Account limits are a current provider snapshot. They are fetched
+            # from the live route only and never inferred from cumulative tokens.
+            provider = getattr(agent, "provider", None) or getattr(
+                self, "provider", None
+            )
+            base_url = getattr(agent, "base_url", None) or getattr(
+                self, "base_url", None
+            )
+            api_key = getattr(agent, "api_key", None) or getattr(
+                self, "api_key", None
+            )
+            from agent.account_usage import (
+                fetch_account_usage,
+                render_account_usage_lines,
+            )
+
+            account_snapshot = None
+            if provider:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                    try:
+                        account_snapshot = _pool.submit(
+                            fetch_account_usage,
+                            provider,
+                            base_url=base_url,
+                            api_key=api_key,
+                        ).result(timeout=10.0)
+                    except (concurrent.futures.TimeoutError, Exception):
+                        account_snapshot = None
+            account_lines = [
+                f"  {line}" for line in render_account_usage_lines(account_snapshot)
+            ]
+            if account_lines:
+                print()
+                for line in account_lines:
+                    print(line)
 
         if self.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
-            for noisy in ('openai', 'openai._base_client', 'httpx', 'httpcore', 'asyncio', 'hpack', 'grpc', 'modal'):
+            for noisy in (
+                'openai', 'openai._base_client', 'httpx', 'httpcore',
+                'asyncio', 'hpack', 'grpc', 'modal'
+            ):
                 logging.getLogger(noisy).setLevel(logging.WARNING)
         else:
             logging.getLogger().setLevel(logging.INFO)
-            # NOTE: We deliberately do NOT raise per-logger levels for
-            # tools/run_agent/etc. in quiet mode. Setting logger.setLevel
-            # above the file handler level filters records before they
-            # reach handlers, so agent.log / errors.log lose visibility
-            # into stream-retry events, credential rotations, etc.
-            # Console quietness is enforced by hermes_logging not
-            # installing a console StreamHandler in non-verbose mode.
+            # Console quietness is enforced by hermes_logging not installing a
+            # console StreamHandler in non-verbose mode.
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""

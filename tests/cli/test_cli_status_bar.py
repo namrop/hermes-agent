@@ -52,6 +52,43 @@ def _attach_agent(
     return cli_obj
 
 
+def _attach_persisted_usage(
+    cli_obj,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    api_calls: int,
+    estimated_cost_exact: str,
+    estimated_cost_unknown: int = 0,
+):
+    cli_obj.session_id = "cli-persisted"
+    cli_obj._session_db = MagicMock()
+    cli_obj._session_db.summarize_usage_events.return_value = {
+        "event_count": api_calls,
+        "input_tokens": input_tokens,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": 0,
+        "prompt_tokens": input_tokens,
+        "total_tokens": total_tokens,
+        "api_attempt_count": api_calls,
+        "reconstructed_call_count": 0,
+        "reconstructed_call_unknown_aggregate_count": 0,
+        "estimated_cost_usd_exact": estimated_cost_exact,
+        "estimated_cost_unknown_event_count": estimated_cost_unknown,
+        "actual_cost_usd_exact": "0",
+        "actual_cost_unknown_event_count": api_calls,
+    }
+    cli_obj._session_db.summarize_usage_by_provider_model.return_value = []
+    cli_obj._session_db.summarize_session_usage_report.return_value = {
+        "summary": cli_obj._session_db.summarize_usage_events.return_value,
+        "routes": [],
+    }
+    return cli_obj
+
+
 class TestCLIStatusBar:
     def test_context_style_thresholds(self):
         cli_obj = _make_cli()
@@ -512,20 +549,25 @@ class TestCLIUsageReport:
             compressions=1,
         )
         cli_obj.verbose = False
+        _attach_persisted_usage(
+            cli_obj,
+            input_tokens=10_230,
+            output_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            estimated_cost_exact="0.064",
+        )
 
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
-        assert "Model:" in output
-        assert "Cost status:" in output
-        assert "Cost source:" in output
-        assert "Total cost:" in output
-        assert "$" in output
-        assert "0.064" in output
+        assert "Session Token Usage" in output
+        assert "Estimated cost: $0.064" in output
+        assert "Total tokens: 12,450" in output
         assert "Session duration:" in output
-        assert "Compressions:" in output
+        assert "Compressions:" not in output
 
-    def test_show_usage_marks_unknown_pricing(self, capsys):
+    def test_show_usage_marks_unknown_stored_cost_coverage(self, capsys):
         cli_obj = _attach_agent(
             _make_cli(model="local/my-custom-model"),
             prompt_tokens=1_000,
@@ -536,15 +578,22 @@ class TestCLIUsageReport:
             context_length=32_000,
         )
         cli_obj.verbose = False
+        _attach_persisted_usage(
+            cli_obj,
+            input_tokens=1_000,
+            output_tokens=500,
+            total_tokens=1_500,
+            api_calls=1,
+            estimated_cost_exact="0",
+            estimated_cost_unknown=1,
+        )
 
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
-        assert "Total cost:" in output
-        assert "n/a" in output
-        assert "Pricing unknown for local/my-custom-model" in output
+        assert "Estimated cost: unknown" in output
 
-    def test_zero_priced_provider_models_stay_unknown(self, capsys):
+    def test_zero_stored_cost_remains_distinct_from_unknown(self, capsys):
         cli_obj = _attach_agent(
             _make_cli(model="glm-5"),
             prompt_tokens=1_000,
@@ -555,13 +604,149 @@ class TestCLIUsageReport:
             context_length=32_000,
         )
         cli_obj.verbose = False
+        _attach_persisted_usage(
+            cli_obj,
+            input_tokens=1_000,
+            output_tokens=500,
+            total_tokens=1_500,
+            api_calls=1,
+            estimated_cost_exact="0",
+            estimated_cost_unknown=0,
+        )
 
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
-        assert "Total cost:" in output
-        assert "n/a" in output
-        assert "Pricing unknown for glm-5" in output
+        assert "Estimated cost: $0" in output
+        assert "Estimated cost: unknown" not in output
+
+    def test_show_usage_uses_persisted_mixed_routes_without_repricing(
+        self, capsys
+    ):
+        cli_obj = _attach_agent(
+            _make_cli(model="current/wrong-model"),
+            prompt_tokens=90_000,
+            completion_tokens=10_000,
+            total_tokens=100_000,
+            api_calls=99,
+            context_tokens=1_000,
+            context_length=32_000,
+        )
+        cli_obj.verbose = False
+        cli_obj.session_id = "cli-persisted-mixed"
+        cli_obj._session_db = MagicMock()
+        cli_obj._session_db.summarize_usage_events.return_value = {
+            "event_count": 2,
+            "input_tokens": 30,
+            "cache_read_tokens": 5,
+            "cache_write_tokens": 2,
+            "output_tokens": 7,
+            "reasoning_tokens": 3,
+            "prompt_tokens": 37,
+            "total_tokens": 44,
+            "api_attempt_count": 2,
+            "reconstructed_call_count": 0,
+            "reconstructed_call_unknown_aggregate_count": 0,
+            "estimated_cost_usd_exact": "0.33",
+            "estimated_cost_unknown_event_count": 0,
+            "actual_cost_usd_exact": "0",
+            "actual_cost_unknown_event_count": 2,
+        }
+        cli_obj._session_db.summarize_usage_by_provider_model.return_value = [
+            {
+                "provider": "openrouter",
+                "provider_is_valid": True,
+                "model": "model-a",
+                "model_is_valid": True,
+                "input_tokens": 10,
+                "cache_read_tokens": 5,
+                "cache_write_tokens": 2,
+                "output_tokens": 2,
+                "reasoning_tokens": 0,
+                "prompt_tokens": 17,
+                "total_tokens": 19,
+                "api_attempt_count": 1,
+                "reconstructed_call_count": 0,
+                "reconstructed_call_unknown_aggregate_count": 0,
+                "estimated_cost_usd_exact": "0.11",
+                "estimated_cost_unknown_event_count": 0,
+                "actual_cost_usd_exact": "0",
+                "actual_cost_unknown_event_count": 1,
+            },
+            {
+                "provider": "anthropic",
+                "provider_is_valid": True,
+                "model": "model-b",
+                "model_is_valid": True,
+                "input_tokens": 20,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 5,
+                "reasoning_tokens": 0,
+                "prompt_tokens": 20,
+                "total_tokens": 25,
+                "api_attempt_count": 1,
+                "reconstructed_call_count": 0,
+                "reconstructed_call_unknown_aggregate_count": 0,
+                "estimated_cost_usd_exact": "0.22",
+                "estimated_cost_unknown_event_count": 0,
+                "actual_cost_usd_exact": "0",
+                "actual_cost_unknown_event_count": 1,
+            },
+        ]
+        cli_obj._session_db.summarize_session_usage_report.return_value = {
+            "summary": cli_obj._session_db.summarize_usage_events.return_value,
+            "routes": cli_obj._session_db.summarize_usage_by_provider_model.return_value,
+        }
+
+        with patch("agent.usage_pricing.estimate_usage_cost") as reprice:
+            cli_obj._show_usage()
+
+        output = capsys.readouterr().out
+        assert "openrouter / model-a" in output
+        assert "anthropic / model-b" in output
+        assert "Total tokens: 44" in output
+        assert "Estimated cost: $0.33" in output
+        assert "100,000" not in output
+        assert sum(
+            route["total_tokens"]
+            for route in cli_obj._session_db.summarize_usage_by_provider_model.return_value
+        ) == 44
+        reprice.assert_not_called()
+
+    def test_show_usage_without_agent_reads_persisted_events(self, capsys):
+        cli_obj = _make_cli()
+        cli_obj.verbose = False
+        cli_obj.session_id = "cli-persisted-no-agent"
+        cli_obj._session_db = MagicMock()
+        cli_obj._session_db.summarize_usage_events.return_value = {
+            "event_count": 1,
+            "input_tokens": 4,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 2,
+            "reasoning_tokens": 0,
+            "prompt_tokens": 4,
+            "total_tokens": 6,
+            "api_attempt_count": 1,
+            "reconstructed_call_count": 0,
+            "reconstructed_call_unknown_aggregate_count": 0,
+            "estimated_cost_usd_exact": "0.01",
+            "estimated_cost_unknown_event_count": 0,
+            "actual_cost_usd_exact": "0",
+            "actual_cost_unknown_event_count": 1,
+        }
+        cli_obj._session_db.summarize_usage_by_provider_model.return_value = []
+        cli_obj._session_db.summarize_session_usage_report.return_value = {
+            "summary": cli_obj._session_db.summarize_usage_events.return_value,
+            "routes": [],
+        }
+
+        cli_obj._show_usage()
+
+        output = capsys.readouterr().out
+        assert "Total tokens: 6" in output
+        assert "No active agent" not in output
 
 
 class TestStatusBarWidthSource:

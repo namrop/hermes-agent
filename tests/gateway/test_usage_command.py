@@ -1,6 +1,5 @@
 """Tests for gateway /usage command — agent cache lookup and output fields."""
 
-import asyncio
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -52,6 +51,18 @@ def _make_runner(session_key, agent=None, cached_agent=None):
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
     runner.session_store = MagicMock()
+    runner._session_db = MagicMock()
+    runner._session_db.summarize_session_usage_report.return_value = {
+        "summary": _persisted_usage(),
+        "routes": _persisted_routes(),
+    }
+    runner._session_db.summarize_usage_events.return_value = _persisted_usage()
+    runner._session_db.summarize_usage_by_provider_model.return_value = (
+        _persisted_routes()
+    )
+    runner.session_store.get_or_create_session.return_value = MagicMock(
+        session_id="persisted-default"
+    )
 
     if agent is not None:
         runner._running_agents[session_key] = agent
@@ -68,6 +79,68 @@ def _make_runner(session_key, agent=None, cached_agent=None):
 SK = "agent:main:telegram:private:12345"
 
 
+def _persisted_usage():
+    return {
+        "event_count": 2,
+        "input_tokens": 30,
+        "cache_read_tokens": 5,
+        "cache_write_tokens": 2,
+        "output_tokens": 7,
+        "reasoning_tokens": 3,
+        "prompt_tokens": 37,
+        "total_tokens": 44,
+        "api_attempt_count": 2,
+        "reconstructed_call_count": 0,
+        "reconstructed_call_unknown_aggregate_count": 0,
+        "estimated_cost_usd_exact": "0.33",
+        "estimated_cost_unknown_event_count": 0,
+        "actual_cost_usd_exact": "0",
+        "actual_cost_unknown_event_count": 2,
+    }
+
+
+def _persisted_routes():
+    common = {
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "api_attempt_count": 1,
+        "reconstructed_call_count": 0,
+        "reconstructed_call_unknown_aggregate_count": 0,
+        "estimated_cost_unknown_event_count": 0,
+        "actual_cost_usd_exact": "0",
+        "actual_cost_unknown_event_count": 1,
+    }
+    return [
+        {
+            **common,
+            "provider": "openrouter",
+            "provider_is_valid": True,
+            "model": "model-a",
+            "model_is_valid": True,
+            "input_tokens": 10,
+            "cache_read_tokens": 5,
+            "cache_write_tokens": 2,
+            "output_tokens": 2,
+            "prompt_tokens": 17,
+            "total_tokens": 19,
+            "estimated_cost_usd_exact": "0.11",
+        },
+        {
+            **common,
+            "provider": "anthropic",
+            "provider_is_valid": True,
+            "model": "model-b",
+            "model_is_valid": True,
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "prompt_tokens": 20,
+            "total_tokens": 25,
+            "estimated_cost_usd_exact": "0.22",
+        },
+    ]
+
+
 class TestUsageCachedAgent:
     """The main fix: /usage should find agents in _agent_cache between turns."""
 
@@ -82,21 +155,22 @@ class TestUsageCachedAgent:
             mock_cost.return_value = MagicMock(amount_usd=0.1234, status="estimated")
             result = await runner._handle_usage_command(event)
 
-        assert "claude-sonnet-4.6" in result
-        assert "35,000" in result  # input tokens
-        assert "10,000" in result  # output tokens
-        assert "5,000" in result   # cache read
-        assert "2,000" in result   # cache write
-        assert "50,000" in result  # total
-        assert "$0.1234" in result
-        assert "30,000" in result  # context
-        assert "Compressions: 1" in result
+        assert "openrouter / model-a" in result
+        assert "anthropic / model-b" in result
+        assert "Input tokens: 30" in result
+        assert "Total tokens: 44" in result
+        assert "Estimated cost: $0.33" in result
+        assert "30,000" in result  # live context
+        assert "Compressions:" not in result
+        mock_cost.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_running_agent_preferred_over_cache(self):
         """When agent is in both dicts, the running one wins."""
         running = _make_mock_agent(session_api_calls=10, session_total_tokens=80_000)
         cached = _make_mock_agent(session_api_calls=5, session_total_tokens=50_000)
+        running.context_compressor.last_prompt_tokens = 31_000
+        cached.context_compressor.last_prompt_tokens = 22_000
         runner = _make_runner(SK, agent=running, cached_agent=cached)
         event = MagicMock()
 
@@ -105,8 +179,9 @@ class TestUsageCachedAgent:
             mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
             result = await runner._handle_usage_command(event)
 
-        assert "80,000" in result   # running agent's total
-        assert "API calls: 10" in result
+        assert "Total tokens: 44" in result
+        assert "Context: 31,000" in result
+        assert "22,000" not in result
 
     @pytest.mark.asyncio
     async def test_sentinel_skipped_uses_cache(self):
@@ -123,13 +198,13 @@ class TestUsageCachedAgent:
             mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
             result = await runner._handle_usage_command(event)
 
-        assert "claude-sonnet-4.6" in result
+        assert "openrouter / model-a" in result
         assert "Session Token Usage" in result
 
     @pytest.mark.asyncio
-    async def test_no_agent_anywhere_falls_to_history(self):
-        """No running or cached agent → rough estimate from transcript."""
+    async def test_no_persisted_events_returns_explicit_no_data(self):
         runner = _make_runner(SK)
+        runner._session_db = None
         event = MagicMock()
 
         session_entry = MagicMock()
@@ -140,16 +215,14 @@ class TestUsageCachedAgent:
             {"role": "assistant", "content": "hi there"},
         ]
 
-        with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=500):
+        with patch("agent.model_metadata.estimate_messages_tokens_rough") as rough:
             result = await runner._handle_usage_command(event)
 
-        assert "Session Info" in result
-        assert "Messages: 2" in result
-        assert "~500" in result
+        assert "No usage data available for this session" in result
+        rough.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cache_read_write_hidden_when_zero(self):
-        """Cache token lines should be omitted when zero."""
+    async def test_persisted_cache_usage_overrides_live_zero_counters(self):
         agent = _make_mock_agent(session_cache_read_tokens=0, session_cache_write_tokens=0)
         runner = _make_runner(SK, cached_agent=agent)
         event = MagicMock()
@@ -159,12 +232,11 @@ class TestUsageCachedAgent:
             mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
             result = await runner._handle_usage_command(event)
 
-        assert "Cache read" not in result
-        assert "Cache write" not in result
+        assert "Cache read tokens: 5" in result
+        assert "Cache write tokens: 2" in result
 
     @pytest.mark.asyncio
-    async def test_cost_included_status(self):
-        """Subscription-included providers show 'included' instead of dollar amount."""
+    async def test_subscription_route_is_not_repriced_from_live_counters(self):
         agent = _make_mock_agent(provider="openai-codex")
         runner = _make_runner(SK, cached_agent=agent)
         event = MagicMock()
@@ -174,7 +246,92 @@ class TestUsageCachedAgent:
             mock_cost.return_value = MagicMock(amount_usd=None, status="included")
             result = await runner._handle_usage_command(event)
 
-        assert "Cost: included" in result
+        assert "Estimated cost: $0.33" in result
+        mock_cost.assert_not_called()
+
+
+class TestPersistedMixedRouteUsage:
+    @pytest.mark.asyncio
+    async def test_persisted_routes_override_resident_agent_counters(self):
+        agent = _make_mock_agent(
+            provider=None,
+            session_total_tokens=987_654,
+            session_input_tokens=900_000,
+            session_api_calls=99,
+        )
+        agent.get_rate_limit_state.return_value.has_data = False
+        runner = _make_runner(SK, cached_agent=agent)
+        runner._session_db = MagicMock()
+        runner._session_db.summarize_session_usage_report.return_value = {
+            "summary": _persisted_usage(),
+            "routes": _persisted_routes(),
+        }
+        session_entry = MagicMock(session_id="persisted-mixed")
+        runner.session_store.get_or_create_session.return_value = session_entry
+        event = MagicMock()
+
+        with patch("agent.usage_pricing.estimate_usage_cost") as reprice:
+            result = await runner._handle_usage_command(event)
+
+        assert "openrouter / model-a" in result
+        assert "anthropic / model-b" in result
+        assert "Total tokens: 44" in result
+        assert "Estimated cost: $0.33" in result
+        assert "987,654" not in result
+        assert sum(route["total_tokens"] for route in _persisted_routes()) == 44
+        reprice.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_resident_agent_uses_persisted_detail_not_transcript_estimate(
+        self,
+    ):
+        runner = _make_runner(SK)
+        runner._session_db = MagicMock()
+        runner._session_db.summarize_session_usage_report.return_value = {
+            "summary": _persisted_usage(),
+            "routes": _persisted_routes(),
+        }
+        session_entry = MagicMock(session_id="persisted-no-agent")
+        runner.session_store.get_or_create_session.return_value = session_entry
+        event = MagicMock()
+
+        with patch("agent.model_metadata.estimate_messages_tokens_rough") as rough:
+            result = await runner._handle_usage_command(event)
+
+        assert "openrouter / model-a" in result
+        assert "anthropic / model-b" in result
+        assert "Recorded calls: 2" in result
+        rough.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_operational_state_names_missing_persisted_usage(self):
+        agent = _make_mock_agent(provider=None)
+        agent.get_rate_limit_state.return_value.has_data = False
+        runner = _make_runner(SK, cached_agent=agent)
+        runner._session_db.summarize_session_usage_report.return_value = None
+        event = MagicMock()
+
+        result = await runner._handle_usage_command(event)
+
+        assert "No usage data available for this session" in result
+        assert "Context: 30,000" in result
+
+    @pytest.mark.asyncio
+    async def test_persisted_ledger_scan_runs_off_event_loop(self, monkeypatch):
+        runner = _make_runner(SK)
+        event = MagicMock()
+        called = []
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            called.append(fn.__name__)
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.run.asyncio.to_thread", fake_to_thread)
+
+        result = await runner._handle_usage_command(event)
+
+        assert "Session Token Usage" in result
+        assert "read_persisted_session_usage" in called
 
 
 class TestUsageAccountSection:
@@ -210,44 +367,21 @@ class TestUsageAccountSection:
         assert "Provider: openai-codex (Pro)" in result
 
     @pytest.mark.asyncio
-    async def test_usage_command_uses_persisted_provider_when_agent_not_running(self, monkeypatch):
+    async def test_no_resident_agent_does_not_infer_account_from_session_scalar(
+        self, monkeypatch
+    ):
         runner = _make_runner(SK)
-        runner._session_db = MagicMock()
         runner._session_db.get_session.return_value = {
             "billing_provider": "openai-codex",
             "billing_base_url": "https://chatgpt.com/backend-api/codex",
         }
-        session_entry = MagicMock()
-        session_entry.session_id = "sess-1"
-        runner.session_store.get_or_create_session.return_value = session_entry
-        runner.session_store.load_transcript.return_value = [
-            {"role": "user", "content": "earlier"},
-        ]
-
-        calls = {}
-
-        async def _fake_to_thread(fn, *args, **kwargs):
-            calls["args"] = args
-            calls["kwargs"] = kwargs
-            return fn(*args, **kwargs)
-
-        monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
-        monkeypatch.setattr(
-            "gateway.run.fetch_account_usage",
-            lambda provider, base_url=None, api_key=None: object(),
-        )
-        monkeypatch.setattr(
-            "gateway.run.render_account_usage_lines",
-            lambda snapshot, markdown=False: [
-                "📈 **Account limits**",
-                "Provider: openai-codex (Pro)",
-            ],
-        )
+        fetch = MagicMock(return_value=object())
+        monkeypatch.setattr("gateway.run.fetch_account_usage", fetch)
 
         event = MagicMock()
         result = await runner._handle_usage_command(event)
 
-        assert calls["args"] == ("openai-codex",)
-        assert calls["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
-        assert "📊 **Session Info**" in result
-        assert "📈 **Account limits**" in result
+        assert "📊 **Session Token Usage**" in result
+        assert "openrouter / model-a" in result
+        assert "Account limits" not in result
+        fetch.assert_not_called()
