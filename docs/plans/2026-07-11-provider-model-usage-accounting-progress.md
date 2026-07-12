@@ -299,5 +299,6 @@ Append each RED and GREEN command here with exit code and concise result.
 - Task 4 residual-only historical backfill is committed at `cc1b84d72`;
   implementation spec PASS, with `240` state tests and `266` combined focused
   tests green. Code-quality review is the remaining gate.
-- Next action: complete Task 4 quality review, then execute Task 5 event-derived
-  read models using RED-GREEN-REFACTOR.
+- Task 5 is the active implementation task. Before its first production-code
+  change, complete Task 4's code-quality gate; then begin Task 5 RED tests for
+  event-derived read models.
