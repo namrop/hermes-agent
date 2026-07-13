@@ -45,6 +45,15 @@ def test_setup_wizard_codex_import_resolves():
     assert callable(setup_import)
 
 
+def test_model_switch_result_repr_redacts_api_key():
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    result = ModelSwitchResult(success=True, api_key="secret-token", new_model="gpt-5.6-sol")
+
+    assert "secret-token" not in repr(result)
+    assert "api_key" not in repr(result)
+
+
 def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir(parents=True, exist_ok=True)
@@ -53,6 +62,7 @@ def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatc
     models = get_codex_model_ids()
 
     assert models[: len(DEFAULT_CODEX_MODELS)] == DEFAULT_CODEX_MODELS
+    assert models[:3] == ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
     assert "gpt-5.4" in models
     assert "gpt-5.3-codex-spark" in models
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, NamedTuple, Optional
 
 from hermes_cli.providers import (
@@ -268,7 +268,7 @@ class ModelSwitchResult:
     new_model: str = ""
     target_provider: str = ""
     provider_changed: bool = False
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     base_url: str = ""
     api_mode: str = ""
     error_message: str = ""

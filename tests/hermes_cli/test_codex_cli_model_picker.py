@@ -98,11 +98,14 @@ def test_codex_picker_uses_live_codex_catalog(hermes_auth_only_env, tmp_path, mo
 
     providers = list_authenticated_providers(
         current_provider="openai-codex",
-        max_models=10,
+        max_models=20,
     )
 
     codex = next(p for p in providers if p["slug"] == "openai-codex")
     assert "gpt-5.3-codex-spark" in codex["models"]
+    assert "gpt-5.6-sol" in codex["models"]
+    assert "gpt-5.6-terra" in codex["models"]
+    assert "gpt-5.6-luna" in codex["models"]
     assert codex["total_models"] == len(codex["models"])
 
 
