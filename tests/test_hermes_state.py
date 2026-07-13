@@ -2530,6 +2530,22 @@ class TestSchemaInit:
         version = cursor.fetchone()[0]
         assert version == SCHEMA_VERSION
 
+    def test_schema_version_advances_past_preexisting_v14(self, tmp_path):
+        from hermes_state import SCHEMA_VERSION, SessionDB
+
+        db_path = tmp_path / "preexisting-v14.db"
+        initial = SessionDB(db_path=db_path)
+        initial._conn.execute("UPDATE schema_version SET version = 14")
+        initial._conn.commit()
+        initial.close()
+
+        reopened = SessionDB(db_path=db_path)
+        version = reopened._conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        reopened.close()
+
+        assert SCHEMA_VERSION > 14
+        assert version == SCHEMA_VERSION
+
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
         cursor = db._conn.execute("PRAGMA table_info(sessions)")

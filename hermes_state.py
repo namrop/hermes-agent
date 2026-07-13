@@ -57,7 +57,7 @@ _LLM_USAGE_ACCOUNTING_COLUMNS = (
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
