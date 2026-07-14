@@ -4,15 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.redact import _PREFIX_RE
 from agent.web_search_provider import WebSearchProvider
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
+
+
+logger = logging.getLogger(__name__)
+
+_TARGET_LIST_ATTEMPTS = 5
+_TARGET_LIST_RETRY_SECONDS = 0.05
+
+
+@dataclass(frozen=True)
+class ResolvedCdpTarget:
+    """A CDP page target plus the ownership needed for deterministic cleanup."""
+
+    websocket_url: str
+    target_id: Optional[str] = None
+    browser_websocket_url: Optional[str] = None
+    owned: bool = False
 
 
 _CAPTURE_EXPR = r"""
@@ -112,6 +130,10 @@ class CdpRenderedExtractProvider(WebSearchProvider):
     env_names: List[str] = []
     config_paths: List[List[str]] = []
     default_endpoint: str = ""
+    capture_timeout_seconds: float = 45.0
+    total_extract_timeout_seconds: float = 120.0
+    cdp_command_timeout_seconds: float = 15.0
+    cdp_close_timeout_seconds: float = 5.0
 
     @property
     def display_name(self) -> str:
@@ -193,13 +215,26 @@ class CdpRenderedExtractProvider(WebSearchProvider):
             ]
 
         results: List[Dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.total_extract_timeout_seconds
         for url in urls:
-            validation_error = self._validate_url(url)
-            if validation_error is not None:
-                results.append(validation_error)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                results.append(
+                    self._safe_error(
+                        url,
+                        f"Total extraction deadline of {self.total_extract_timeout_seconds:g} seconds exceeded before URL started",
+                    )
+                )
                 continue
+
             try:
-                captured = await self._capture_url(url, format=fmt, use_active_tab=use_active_tab)
+                async with asyncio.timeout(remaining):
+                    validation_error = await asyncio.to_thread(self._validate_url, url)
+                    if validation_error is not None:
+                        results.append(validation_error)
+                        continue
+                    captured = await self._capture_url(url, format=fmt, use_active_tab=use_active_tab)
                 content = self._select_content(captured, fmt)
                 final_url = captured.get("final_url") or captured.get("url") or url
                 title = captured.get("title", "")
@@ -218,6 +253,14 @@ class CdpRenderedExtractProvider(WebSearchProvider):
                         },
                     }
                 )
+            except TimeoutError as exc:
+                if loop.time() >= deadline:
+                    message = (
+                        f"Total extraction deadline of {self.total_extract_timeout_seconds:g} seconds exceeded"
+                    )
+                else:
+                    message = str(exc) or "Rendered extraction timed out"
+                results.append(self._safe_error(url, message))
             except Exception as exc:  # noqa: BLE001 - per-URL extraction failure
                 results.append(self._safe_error(url, str(exc)))
         return results
@@ -228,111 +271,310 @@ class CdpRenderedExtractProvider(WebSearchProvider):
         return str(captured.get("text") or captured.get("html") or "")
 
     async def _capture_url(self, url: str, *, format: str, use_active_tab: bool = False) -> Dict[str, Any]:
-        websocket_url = await self._resolve_target_websocket(url, use_active_tab=use_active_tab)
-        last_value: Dict[str, Any] | None = None
-        for attempt in range(20):
-            value = await self._evaluate(websocket_url, _CAPTURE_EXPR)
-            if not isinstance(value, dict):
-                raise RuntimeError("CDP Runtime.evaluate did not return an object")
-            value.setdefault("final_url", value.get("url", url))
-            last_value = value
-            current_url = str(value.get("final_url") or value.get("url") or "")
-            has_loaded_content = bool(value.get("title") or value.get("text") or value.get("html"))
-            if use_active_tab or (current_url != "about:blank" and has_loaded_content):
-                return value
-            await asyncio.sleep(0.25)
-        if last_value is not None:
-            return last_value
-        raise RuntimeError("CDP Runtime.evaluate returned no capture data")
+        resolved_target: Optional[ResolvedCdpTarget] = None
+        primary_error: BaseException | None = None
+        try:
+            try:
+                async with asyncio.timeout(self.capture_timeout_seconds):
+                    resolved_target = await self._resolve_target_websocket(
+                        url,
+                        use_active_tab=use_active_tab,
+                    )
+                    websocket_url = (
+                        resolved_target
+                        if isinstance(resolved_target, str)
+                        else str(resolved_target.websocket_url)
+                    )
+                    last_value: Dict[str, Any] | None = None
+                    for attempt in range(20):
+                        value = await self._evaluate(websocket_url, _CAPTURE_EXPR)
+                        if not isinstance(value, dict):
+                            raise RuntimeError("CDP Runtime.evaluate did not return an object")
+                        value.setdefault("final_url", value.get("url", url))
+                        last_value = value
+                        current_url = str(value.get("final_url") or value.get("url") or "")
+                        has_loaded_content = bool(
+                            value.get("title") or value.get("text") or value.get("html")
+                        )
+                        if use_active_tab or (current_url != "about:blank" and has_loaded_content):
+                            return value
+                        await asyncio.sleep(0.25)
+                    if last_value is not None:
+                        return last_value
+                    raise RuntimeError("CDP Runtime.evaluate returned no capture data")
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"Timed out capturing {url} after {self.capture_timeout_seconds:g} seconds"
+                ) from exc
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if resolved_target is not None and bool(getattr(resolved_target, "owned", False)):
+                try:
+                    await self._close_target_bounded(resolved_target)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as close_exc:
+                    if primary_error is None:
+                        raise
+                    logger.warning(
+                        "Failed to close owned CDP target %s after capture error: %s",
+                        getattr(resolved_target, "target_id", ""),
+                        close_exc,
+                    )
 
-    async def _resolve_target_websocket(self, url: str, *, use_active_tab: bool) -> str:
+    async def _close_target_bounded(self, target: ResolvedCdpTarget) -> None:
+        """Shield owned-target cleanup while honoring an independent hard deadline."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.cdp_close_timeout_seconds
+        close_task = asyncio.create_task(self._close_target(target))
+        caller_cancellation: asyncio.CancelledError | None = None
+        close_error: BaseException | None = None
+
+        while not close_task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                close_error = TimeoutError(
+                    f"Timed out closing CDP target {getattr(target, 'target_id', '')}"
+                )
+                close_task.cancel()
+                break
+            try:
+                await asyncio.wait_for(asyncio.shield(close_task), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    caller_cancellation = exc
+                    continue
+                close_error = exc
+                break
+            except TimeoutError:
+                close_error = TimeoutError(
+                    f"Timed out closing CDP target {getattr(target, 'target_id', '')}"
+                )
+                close_task.cancel()
+                break
+            except BaseException as exc:
+                close_error = exc
+                break
+
+        if close_task.done() and close_error is None:
+            try:
+                close_task.result()
+            except BaseException as exc:
+                close_error = exc
+        elif not close_task.done():
+            # Retrieve a late cancellation/exception without extending the hard deadline.
+            def consume_result(done_task: asyncio.Task[None]) -> None:
+                try:
+                    done_task.result()
+                except BaseException:
+                    pass
+
+            close_task.add_done_callback(consume_result)
+
+        if caller_cancellation is not None:
+            raise caller_cancellation
+        if close_error is not None:
+            raise close_error
+
+    async def _resolve_target_websocket(
+        self,
+        url: str,
+        *,
+        use_active_tab: bool,
+    ) -> ResolvedCdpTarget:
         endpoint = self.endpoint
         if endpoint.startswith(("ws://", "wss://")):
-            return endpoint
+            return ResolvedCdpTarget(websocket_url=endpoint)
 
         if use_active_tab:
             targets = await fetch_json(build_cdp_list_url(endpoint))
             if isinstance(targets, list):
                 for target in targets:
-                    ws_url = target.get("webSocketDebuggerUrl") if isinstance(target, dict) else None
-                    if ws_url:
-                        return ws_url
-            raise RuntimeError("No active CDP page target with webSocketDebuggerUrl")
-
-        if urllib.parse.urlparse(endpoint).query:
-            browser_info = await fetch_json(build_cdp_discovery_url(endpoint))
-            browser_ws = browser_info.get("webSocketDebuggerUrl") if isinstance(browser_info, dict) else None
-            if not browser_ws:
-                raise RuntimeError("CDP /json/version did not return browser webSocketDebuggerUrl")
-            target_id = await self._create_target_via_browser_websocket(str(browser_ws), url)
-            targets = await fetch_json(build_cdp_list_url(endpoint))
-            if isinstance(targets, list):
-                for target in targets:
                     if not isinstance(target, dict):
                         continue
-                    if target.get("id") == target_id and target.get("webSocketDebuggerUrl"):
-                        return str(target["webSocketDebuggerUrl"])
-            raise RuntimeError("Created CDP target was not visible in /json target list")
+                    ws_url = target.get("webSocketDebuggerUrl")
+                    if ws_url:
+                        target_id = target.get("id") or target.get("targetId")
+                        return ResolvedCdpTarget(
+                            websocket_url=str(ws_url),
+                            target_id=str(target_id) if target_id else None,
+                            owned=False,
+                        )
+            raise RuntimeError("No active CDP page target with webSocketDebuggerUrl")
 
-        new_target_url = build_cdp_new_target_url(endpoint, url)
+        browser_info = await fetch_json(build_cdp_discovery_url(endpoint))
+        browser_ws = browser_info.get("webSocketDebuggerUrl") if isinstance(browser_info, dict) else None
+        if not browser_ws:
+            raise RuntimeError("CDP /json/version did not return browser webSocketDebuggerUrl")
+
+        target_id = await self._create_target_via_browser_websocket(str(browser_ws), url)
+        unresolved_target = ResolvedCdpTarget(
+            websocket_url="",
+            target_id=target_id,
+            browser_websocket_url=str(browser_ws),
+            owned=True,
+        )
         try:
-            target = await fetch_json(new_target_url, method="PUT")
-        except Exception:
-            target = await fetch_json(new_target_url, method="GET")
-        if isinstance(target, dict) and target.get("webSocketDebuggerUrl"):
-            return str(target["webSocketDebuggerUrl"])
-        raise RuntimeError("CDP /json/new did not return webSocketDebuggerUrl")
+            target = await self._wait_for_created_target(endpoint, target_id=target_id)
+        except BaseException:
+            await self._close_target_after_resolution_failure(unresolved_target)
+            raise
+
+        websocket_url = target.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            await self._close_target_after_resolution_failure(unresolved_target)
+            raise RuntimeError("Created CDP target did not expose webSocketDebuggerUrl")
+        return ResolvedCdpTarget(
+            websocket_url=str(websocket_url),
+            target_id=target_id,
+            browser_websocket_url=str(browser_ws),
+            owned=True,
+        )
+
+    async def _wait_for_created_target(
+        self,
+        endpoint: str,
+        *,
+        target_id: str,
+    ) -> Dict[str, Any]:
+        last_fetch_error: Exception | None = None
+        for attempt in range(_TARGET_LIST_ATTEMPTS):
+            try:
+                targets = await fetch_json(build_cdp_list_url(endpoint))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_fetch_error = exc
+            else:
+                if isinstance(targets, list):
+                    for target in targets:
+                        if not isinstance(target, dict):
+                            continue
+                        candidate_id = target.get("id") or target.get("targetId")
+                        if str(candidate_id) == target_id:
+                            return target
+            if attempt + 1 < _TARGET_LIST_ATTEMPTS:
+                await asyncio.sleep(_TARGET_LIST_RETRY_SECONDS)
+
+        if last_fetch_error is not None:
+            raise RuntimeError("Could not read the CDP target list after target creation") from last_fetch_error
+        raise RuntimeError("Created CDP target was not visible in /json target list")
+
+    async def _close_target_after_resolution_failure(self, target: ResolvedCdpTarget) -> None:
+        try:
+            await self._close_target_bounded(target)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as close_exc:
+            logger.warning(
+                "Failed to close CDP target %s after target-resolution failure: %s",
+                target.target_id,
+                close_exc,
+            )
+
+    async def _cdp_command(
+        self,
+        websocket_url: str,
+        method: str,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        import websockets
+
+        timeout = self.cdp_command_timeout_seconds
+        try:
+            async with websockets.connect(
+                websocket_url,
+                max_size=50 * 1024 * 1024,
+                open_timeout=timeout,
+                close_timeout=min(5.0, timeout),
+                ping_interval=None,
+            ) as ws:
+                await asyncio.wait_for(
+                    ws.send(
+                        json.dumps(
+                            {
+                                "id": 1,
+                                "method": method,
+                                "params": params,
+                            }
+                        )
+                    ),
+                    timeout=timeout,
+                )
+                deadline = asyncio.get_running_loop().time() + timeout
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError(f"Timed out waiting for response to {method}")
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                    message = json.loads(raw)
+                    if message.get("id") != 1:
+                        continue
+                    if "error" in message:
+                        raise RuntimeError(json.dumps(message["error"], ensure_ascii=False))
+                    result = message.get("result", {})
+                    return result if isinstance(result, dict) else {}
+        except TimeoutError as exc:
+            raise TimeoutError(f"Timed out waiting for response to {method}") from exc
 
     async def _create_target_via_browser_websocket(self, browser_websocket_url: str, url: str) -> str:
-        import websockets
+        result = await self._cdp_command(
+            browser_websocket_url,
+            "Target.createTarget",
+            {"url": url},
+        )
+        target_id = result.get("targetId")
+        if not target_id:
+            raise RuntimeError("CDP Target.createTarget did not return targetId")
+        return str(target_id)
 
-        async with websockets.connect(browser_websocket_url, max_size=50 * 1024 * 1024) as ws:
-            await ws.send(
-                json.dumps(
-                    {
-                        "id": 1,
-                        "method": "Target.createTarget",
-                        "params": {"url": url},
-                    }
-                )
+    async def _close_target(self, target: ResolvedCdpTarget) -> None:
+        if not target.owned:
+            return
+        if not target.target_id:
+            raise RuntimeError("Owned CDP target is missing targetId")
+
+        browser_websocket_url = target.browser_websocket_url
+        if not browser_websocket_url:
+            browser_info = await fetch_json(
+                build_cdp_discovery_url(self.endpoint),
+                timeout=self.cdp_close_timeout_seconds,
             )
-            while True:
-                message = json.loads(await ws.recv())
-                if message.get("id") != 1:
-                    continue
-                if "error" in message:
-                    raise RuntimeError(json.dumps(message["error"], ensure_ascii=False))
-                target_id = message.get("result", {}).get("targetId")
-                if not target_id:
-                    raise RuntimeError("CDP Target.createTarget did not return targetId")
-                return str(target_id)
+            browser_websocket_url = (
+                browser_info.get("webSocketDebuggerUrl")
+                if isinstance(browser_info, dict)
+                else None
+            )
+        if not browser_websocket_url:
+            raise RuntimeError("CDP /json/version did not return browser webSocketDebuggerUrl for cleanup")
+
+        result = await self._cdp_command(
+            str(browser_websocket_url),
+            "Target.closeTarget",
+            {"targetId": target.target_id},
+        )
+        if result.get("success") is not True:
+            raise RuntimeError(f"CDP Target.closeTarget refused target {target.target_id}")
 
     async def _evaluate(self, websocket_url: str, expression: str) -> Any:
-        import websockets
-
-        async with websockets.connect(websocket_url, max_size=50 * 1024 * 1024) as ws:
-            await ws.send(
-                json.dumps(
-                    {
-                        "id": 1,
-                        "method": "Runtime.evaluate",
-                        "params": {
-                            "expression": expression,
-                            "awaitPromise": True,
-                            "returnByValue": True,
-                        },
-                    }
-                )
-            )
-            while True:
-                message = json.loads(await ws.recv())
-                if message.get("id") != 1:
-                    continue
-                if "exceptionDetails" in message:
-                    raise RuntimeError(json.dumps(message["exceptionDetails"], ensure_ascii=False))
-                result = message.get("result", {}).get("result", {})
-                if "value" in result:
-                    return result["value"]
-                if result.get("type") == "undefined":
-                    return None
-                return result
+        response = await self._cdp_command(
+            websocket_url,
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+        if "exceptionDetails" in response:
+            raise RuntimeError(json.dumps(response["exceptionDetails"], ensure_ascii=False))
+        result = response.get("result", {})
+        if "value" in result:
+            return result["value"]
+        if result.get("type") == "undefined":
+            return None
+        return result
