@@ -1160,6 +1160,55 @@ class TestAuxiliaryFallbackLayering:
         exc.status_code = 402
         return exc
 
+    def test_configured_chain_passes_explicit_overrides_to_provider_resolver(self, monkeypatch):
+        """Configured fallback entries must use the resolver's current override keywords."""
+        import agent.auxiliary_client as auxiliary_client
+
+        fallback_client = MagicMock()
+
+        def fake_resolve_provider_client(
+            provider,
+            model=None,
+            async_mode=False,
+            raw_codex=False,
+            explicit_base_url=None,
+            explicit_api_key=None,
+            api_mode=None,
+            main_runtime=None,
+            is_vision=False,
+        ):
+            assert provider == "zai"
+            assert model == "glm-5.2"
+            assert explicit_base_url == "https://api.z.ai/api/coding/paas/v4"
+            assert explicit_api_key == "test-key"
+            return fallback_client, model
+
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_get_auxiliary_task_config",
+            lambda task: {
+                "fallback_chain": [{
+                    "provider": "zai",
+                    "model": "glm-5.2",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                    "api_key": "test-key",
+                }]
+            },
+        )
+        monkeypatch.setattr(
+            auxiliary_client,
+            "resolve_provider_client",
+            fake_resolve_provider_client,
+        )
+
+        client, model, label = auxiliary_client._try_configured_fallback_chain(
+            "compression", "openai-codex", reason="timeout"
+        )
+
+        assert client is fallback_client
+        assert model == "glm-5.2"
+        assert label == "fallback_chain[0](zai)"
+
     def test_explicit_provider_uses_configured_chain_first(self, monkeypatch, caplog):
         """When a user has fallback_chain configured, it's tried BEFORE the main agent model."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")

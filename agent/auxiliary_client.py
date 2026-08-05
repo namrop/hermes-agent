@@ -2868,12 +2868,14 @@ def _resolve_single_provider(
     Uses the existing provider resolution infrastructure where possible.
     """
     # Reuse resolve_provider_client which handles provider→client mapping
-    client, resolved_model = resolve_provider_client(
-        provider=provider,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-    )
+    resolver_kwargs: Dict[str, Any] = {"provider": provider}
+    if model is not None:
+        resolver_kwargs["model"] = model
+    if base_url is not None:
+        resolver_kwargs["explicit_base_url"] = base_url
+    if api_key is not None:
+        resolver_kwargs["explicit_api_key"] = api_key
+    client, resolved_model = resolve_provider_client(**resolver_kwargs)
     return client
 
 def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
