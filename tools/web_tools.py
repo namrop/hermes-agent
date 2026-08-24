@@ -279,8 +279,14 @@ def _get_backend() -> str:
     # providers via their own is_available() gate. We hold the provider
     # object already, so probe it directly rather than round-tripping through
     # _is_backend_available() (which would re-do the registry lookup).
+    # Providers that declared ``auto_detect = False`` describe explicit
+    # operator-designated lanes — they stay out of implicit selection and
+    # remain reachable only via their dedicated tools or an explicit
+    # backend config key.
     for provider in _list_registered_web_providers():
         if provider.name in _LEGACY_WEB_BACKENDS:
+            continue
+        if not getattr(provider, "auto_detect", True):
             continue
         try:
             if provider.is_available():

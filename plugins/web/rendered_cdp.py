@@ -123,7 +123,15 @@ async def fetch_json(url: str, *, method: str = "GET", timeout: float = 20) -> A
 
 
 class CdpRenderedExtractProvider(WebSearchProvider):
-    """Base provider for rendered extraction through a CDP browser."""
+    """Base provider for rendered extraction through a CDP browser.
+
+    Never participates in implicit backend selection: these lanes describe
+    an explicit, operator-designated capture surface (signed-in browser,
+    stealth browser), so they are reachable only via their dedicated tools
+    or an explicit ``web.extract_backend`` / ``web.backend`` selection.
+    """
+
+    auto_detect = False
 
     lane: str = "rendered"
     authenticated: bool = False

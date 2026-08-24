@@ -547,3 +547,52 @@ async def test_explicit_tools_route_to_separate_lanes(monkeypatch):
     assert json.loads(stealth_raw)["results"][0]["metadata"]["backend"] == "cloakbrowser-acubens"
     assert calls[0][0] == "earthglass"
     assert calls[1][0] == "cloakbrowser-acubens"
+
+
+@pytest.mark.asyncio
+async def test_rendered_lanes_never_auto_selected_as_ordinary_backend(monkeypatch):
+    """The auto-detect ladder must not route ordinary web_search/web_extract
+    through the explicit rendered lanes, even when the lane is available on
+    this host (script present) and nothing else is configured."""
+    from agent import web_search_registry
+    from plugins.web.earthglass.provider import EarthglassWebExtractProvider
+    from tools import web_tools
+
+    monkeypatch.setenv("EARTHGLASS_CDP_URL", "http://127.0.0.1:9223")
+    monkeypatch.setattr(
+        EarthglassWebExtractProvider, "is_available", lambda self: True, raising=True
+    )
+    for key in (
+        "BRAVE_SEARCH_API_KEY",
+        "SEARXNG_URL",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+        "PARALLEL_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+        "FIRECRAWL_GATEWAY_URL",
+        "TOOL_GATEWAY_DOMAIN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    web_search_registry._reset_for_tests()
+    web_search_registry.register_provider(EarthglassWebExtractProvider())
+    try:
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
+        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
+        monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
+        monkeypatch.setattr(web_tools, "_firecrawl_client", None, raising=False)
+        monkeypatch.setattr(web_tools, "_firecrawl_client_config", None, raising=False)
+        monkeypatch.setattr(web_search_registry, "_keyless_tier_enabled", lambda: False)
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+
+        assert web_tools._get_search_backend() != "earthglass"
+        assert web_tools._get_extract_backend() != "earthglass"
+
+        # Explicit selection remains strict and unaffected by the opt-out.
+        monkeypatch.setattr(
+            web_tools, "_load_web_config", lambda: {"extract_backend": "earthglass"}
+        )
+        assert web_tools._get_extract_backend() == "earthglass"
+    finally:
+        web_search_registry._reset_for_tests()

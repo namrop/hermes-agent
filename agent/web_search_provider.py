@@ -97,6 +97,15 @@ class WebSearchProvider(abc.ABC):
     single class.
     """
 
+    # Opt-out for the never-configured auto-detect ladder. Providers that
+    # describe an explicit, operator-designated lane (e.g. a signed-in
+    # authenticated browser or a stealth browser) must never be silently
+    # auto-selected as the ordinary web_search/web_extract backend — they
+    # are reachable only through their dedicated tools or an explicit
+    # ``web.backend`` / ``web.{search,extract}_backend`` selection, which
+    # this flag does not affect.
+    auto_detect: bool = True
+
     @property
     @abc.abstractmethod
     def name(self) -> str:
