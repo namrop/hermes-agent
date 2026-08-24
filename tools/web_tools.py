@@ -416,6 +416,15 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
+    if backend == "zai":
+        # Z.AI Coding Plan MCP servers. The provider opts out of implicit
+        # auto-detect (see ZaiWebSearchProvider.auto_detect) — this branch
+        # only powers explicit config validation and `hermes tools` checks.
+        try:
+            from plugins.web.zai.provider import _resolve_api_key
+            return bool(_resolve_api_key())
+        except Exception:
+            return False
     return False
 
 
