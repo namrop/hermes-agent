@@ -3635,6 +3635,7 @@ class AIAgent:
         if not targets:
             return
         landed = file_mutation_result_landed(tool_name, result)
+        landed_paths: List[str] = []
         if landed:
             landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
             changed = getattr(self, "_turn_file_mutation_paths", None)
@@ -3661,8 +3662,32 @@ class AIAgent:
                         "error_preview": preview,
                     }
         else:
-            for path in targets:
-                state.pop(path, None)
+            # Clear by alias, not by exact spelling: a failed V4A patch can
+            # record a repo-relative target while the later successful write
+            # reports absolute resolved paths (files_modified / resolved_path).
+            # Those are the same mutation target; normalize both sides through
+            # expanduser/abspath/realpath so recovery clears the stale failure.
+            paths_to_clear = set(targets)
+            if landed:
+                paths_to_clear.update(landed_paths)
+            clear_aliases: set[str] = set(paths_to_clear)
+            for path in list(paths_to_clear):
+                try:
+                    expanded = os.path.expanduser(str(path))
+                    clear_aliases.add(os.path.abspath(expanded))
+                    clear_aliases.add(os.path.realpath(expanded))
+                except Exception:
+                    pass
+            for path in list(state.keys()):
+                aliases = {path}
+                try:
+                    expanded = os.path.expanduser(str(path))
+                    aliases.add(os.path.abspath(expanded))
+                    aliases.add(os.path.realpath(expanded))
+                except Exception:
+                    pass
+                if aliases.intersection(clear_aliases):
+                    state.pop(path, None)
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.

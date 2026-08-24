@@ -227,6 +227,42 @@ class TestRecordFileMutationResult:
         # the initial root cause.
         assert "first error" in agent._turn_failed_file_mutations["/tmp/a.md"]["error_preview"]
 
+    def test_success_with_absolute_result_clears_prior_relative_failure(self, tmp_path, monkeypatch):
+        """A failed V4A patch may record repo-relative paths, then a later
+        successful replace call may report absolute resolved paths.  Those are
+        the same mutation target and must not leave a stale footer warning."""
+        monkeypatch.chdir(tmp_path)
+        rel = "tools/file_tools.py"
+        absolute = tmp_path / rel
+        absolute.parent.mkdir(parents=True)
+        absolute.write_text("old")
+        agent = _bare_agent()
+
+        body = (
+            "*** Begin Patch\n"
+            f"*** Update File: {rel}\n"
+            "@@\n-old\n+new\n"
+            "*** End Patch"
+        )
+        agent._record_file_mutation_result(
+            "patch", {"mode": "patch", "patch": body},
+            json.dumps({"error": "Patch validation failed"}), is_error=True,
+        )
+        assert rel in agent._turn_failed_file_mutations
+
+        agent._record_file_mutation_result(
+            "patch", {"mode": "replace", "path": str(absolute)},
+            json.dumps({
+                "success": True,
+                "diff": "---",
+                "files_modified": [str(absolute)],
+                "resolved_path": str(absolute),
+            }),
+            is_error=False,
+        )
+
+        assert agent._turn_failed_file_mutations == {}
+
 
 
 
