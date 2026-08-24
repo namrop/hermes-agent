@@ -117,7 +117,7 @@ class TestPreflightAcceptsArrayOutput:
         assert out["output"][1]["type"] == "input_image"
         assert out["output"][1]["image_url"] == "data:image/png;base64,ABC"
 
-    def test_preflight_drops_unknown_part_types(self):
+    def test_preflight_canonicalizes_chat_style_output_parts(self):
         raw = [
             {
                 "type": "function_call",
@@ -127,16 +127,23 @@ class TestPreflightAcceptsArrayOutput:
                 "type": "function_call_output",
                 "call_id": "call_abc",
                 "output": [
-                    {"type": "input_text", "text": "ok"},
+                    {"type": "text", "text": "chat-style text"},
+                    {"type": "output_text", "text": "assistant-style text"},
+                    "bare string text",
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZ"}},
                     {"type": "garbage", "data": "nope"},  # unknown — should be dropped
-                    {"type": "input_image", "image_url": "data:image/png;base64,ZZ"},
                 ],
             },
         ]
         normalized = _preflight_codex_input_items(raw)
         out = [it for it in normalized if it.get("type") == "function_call_output"][0]
-        # The "garbage" part is dropped; valid parts remain
+        # The "garbage" part is dropped; every textual variant canonicalizes
+        # to input_text, and chat-style dict-wrapped image urls unwrap.
         types = [p.get("type") for p in out["output"]]
-        assert types == ["input_text", "input_image"]
+        assert types == ["input_text", "input_text", "input_text", "input_image"]
+        assert out["output"][0]["text"] == "chat-style text"
+        assert out["output"][1]["text"] == "assistant-style text"
+        assert out["output"][2]["text"] == "bare string text"
+        assert out["output"][3]["image_url"] == "data:image/png;base64,ZZ"
 
 

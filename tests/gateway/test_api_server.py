@@ -1291,6 +1291,161 @@ class TestChatCompletionsEndpoint:
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
 
+    @staticmethod
+    def _collect_tool_progress_payloads(body: str) -> list[dict]:
+        """Collect parsed ``hermes.tool.progress`` data payloads from an SSE body."""
+        import json as _json
+
+        payloads = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    try:
+                        payloads.append(_json.loads(follow[len("data: "):]))
+                    except _json.JSONDecodeError:
+                        pass
+                    break
+        return payloads
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_completed_carries_result_preview(self, adapter):
+        """Completed lifecycle events must carry the bounded tool result.
+
+        Without it, clients rendering tool lifecycle UI see a bare status
+        flip and never learn what the tool actually did.
+        """
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_search_1", "web_search", {"query": "hermes"})
+                if tc_cb:
+                    tc_cb("call_search_1", "web_search", {"query": "hermes"}, "found 3 results")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "search"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        completed = [
+            p for p in self._collect_tool_progress_payloads(body)
+            if p.get("status") == "completed"
+        ]
+        assert len(completed) == 1, completed
+        assert completed[0]["preview"] == "found 3 results"
+        assert completed[0]["output"] == "found 3 results"
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_completed_preview_is_bounded(self, adapter):
+        """Huge tool results must be truncated, never streamed unbounded."""
+        import asyncio
+
+        huge = "x" * 9000
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_term_1", "terminal", {"command": "cat big.log"})
+                if tc_cb:
+                    tc_cb("call_term_1", "terminal", {"command": "cat big.log"}, huge)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "run"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        completed = [
+            p for p in self._collect_tool_progress_payloads(body)
+            if p.get("status") == "completed"
+        ]
+        assert len(completed) == 1, completed
+        preview = completed[0]["preview"]
+        assert preview.startswith("xxxx")
+        assert "truncated" in preview
+        assert len(preview) <= 4100, len(preview)
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_completed_none_result_omits_preview(self, adapter):
+        """A null tool result must not emit empty preview/output fields."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_none_1", "cronjob", {"action": "list"})
+                if tc_cb:
+                    tc_cb("call_none_1", "cronjob", {"action": "list"}, None)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        completed = [
+            p for p in self._collect_tool_progress_payloads(body)
+            if p.get("status") == "completed"
+        ]
+        assert len(completed) == 1, completed
+        assert "preview" not in completed[0]
+        assert "output" not in completed[0]
+
 
 # ---------------------------------------------------------------------------
 # _derive_chat_session_id unit tests

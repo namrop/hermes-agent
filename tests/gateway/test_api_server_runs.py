@@ -333,6 +333,151 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @staticmethod
+    def _parse_stream_events(body: str) -> list[dict]:
+        """Parse JSON event objects from the runs events stream body."""
+        import json as _json
+
+        events = []
+        for line in body.splitlines():
+            line = line.strip()
+            if line.startswith("data: "):
+                line = line[len("data: "):]
+            if not line.startswith("{"):
+                continue
+            try:
+                events.append(_json.loads(line))
+            except _json.JSONDecodeError:
+                continue
+        return events
+
+    @pytest.mark.asyncio
+    async def test_events_stream_includes_tool_completed_output_preview(self, adapter):
+        """Runs tool.completed events should carry bounded tool output for UIs."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _run_conversation(*args, **kwargs):
+                    cb = mock_create.call_args.kwargs["tool_progress_callback"]
+                    cb("tool.started", "terminal", 'terminal(command="date")', {"command": "date"})
+                    cb(
+                        "tool.completed",
+                        "terminal",
+                        None,
+                        None,
+                        duration=0.1,
+                        is_error=False,
+                        result='{"ok":true}',
+                    )
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_resp.status == 200
+                body = await events_resp.text()
+
+        completed = [
+            e for e in self._parse_stream_events(body)
+            if e.get("event") == "tool.completed"
+        ]
+        assert len(completed) == 1, completed
+        assert completed[0]["output"] == '{"ok":true}'
+        assert completed[0]["result_preview"] == '{"ok":true}'
+        assert completed[0]["error"] is False
+
+    @pytest.mark.asyncio
+    async def test_events_stream_tool_completed_accepts_legacy_output_kwarg(self, adapter):
+        """Legacy ``output=``/``result_preview=`` spellings still reach the event."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _run_conversation(*args, **kwargs):
+                    cb = mock_create.call_args.kwargs["tool_progress_callback"]
+                    cb("tool.started", "terminal", None, None)
+                    cb(
+                        "tool.completed",
+                        "terminal",
+                        None,
+                        None,
+                        duration=0.2,
+                        is_error=False,
+                        output="legacy spelling",
+                    )
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_resp.status == 200
+                body = await events_resp.text()
+
+        completed = [
+            e for e in self._parse_stream_events(body)
+            if e.get("event") == "tool.completed"
+        ]
+        assert len(completed) == 1, completed
+        assert completed[0]["output"] == "legacy spelling"
+
+    @pytest.mark.asyncio
+    async def test_events_stream_tool_completed_without_result_omits_output(self, adapter):
+        """No result kwarg -> no empty output/result_preview fields on the event."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _run_conversation(*args, **kwargs):
+                    cb = mock_create.call_args.kwargs["tool_progress_callback"]
+                    cb("tool.started", "terminal", None, None)
+                    cb("tool.completed", "terminal", None, None, duration=0.3, is_error=False)
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_resp.status == 200
+                body = await events_resp.text()
+
+        completed = [
+            e for e in self._parse_stream_events(body)
+            if e.get("event") == "tool.completed"
+        ]
+        assert len(completed) == 1, completed
+        assert "output" not in completed[0]
+        assert "result_preview" not in completed[0]
+
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):

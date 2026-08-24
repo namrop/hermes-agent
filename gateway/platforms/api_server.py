@@ -445,6 +445,27 @@ def _is_compressed_summary_message(message: Any) -> bool:
     return prefix.startswith("[CONTEXT COMPACTION") or prefix.startswith("[CONTEXT SUMMARY]:")
 
 
+def _bounded_tool_preview(function_result, limit: int = 4000) -> str:
+    """Return a bounded text preview of a tool result for SSE event payloads.
+
+    Tool results can be structured, huge, or non-string. Keep the stream
+    event inspectable without shipping unbounded stdout or binary-like
+    payloads through every OpenAI-compatible client.
+    """
+    if function_result is None:
+        return ""
+    if isinstance(function_result, str):
+        text = function_result
+    else:
+        try:
+            text = json.dumps(function_result, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(function_result)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… truncated {len(text) - limit} chars"
+
+
 def _auto_truncate_response_history(
     conversation_history: List[Dict[str, Any]],
     *,
@@ -4372,15 +4393,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 Dropped if the start was filtered (internal tool, missing
                 id, or never seen) so clients never get an orphaned
                 ``completed`` they can't correlate to a prior ``running``.
+
+                Carries a bounded ``preview``/``output`` of the tool result
+                so lifecycle clients can see what the tool actually did
+                instead of a bare status flip.
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put_threadsafe(("__tool_progress__", {
+                _bounded = _bounded_tool_preview(function_result)
+                event = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
-                }))
+                }
+                if _bounded:
+                    event["preview"] = _bounded
+                    event["output"] = _bounded
+                _stream_q.put_threadsafe(("__tool_progress__", event))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -6612,14 +6642,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
-                _push({
+                event = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
-                })
+                }
+                # ``result`` is the canonical kwarg ``tool_executor`` ships
+                # (display_function_result); accept the legacy ``output`` /
+                # ``result_preview`` spellings other producers may use.
+                result_output = kwargs.get("result")
+                if result_output is None:
+                    result_output = kwargs.get("output")
+                if result_output is None:
+                    result_output = kwargs.get("result_preview")
+                bounded_output = _bounded_tool_preview(result_output)
+                if bounded_output:
+                    event["output"] = bounded_output
+                    event["result_preview"] = bounded_output
+                _push(event)
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",

@@ -833,17 +833,32 @@ def _preflight_codex_input_items(
             if isinstance(output, list):
                 # Validate each item is a recognised content shape; drop
                 # anything else to avoid 4xx from the API.
+                #
+                # Chat-style tool result parts commonly arrive as
+                # ``{"type": "text"}``; the Codex/ChatGPT Responses backend
+                # rejects that shape inside function_call_output.output with
+                # HTTP 400 "Unsupported content type". Canonicalize all
+                # textual variants to input_text here so preflight is safe
+                # even when callers pass an already-built Responses input
+                # array — matching the wider part sets the sibling helpers
+                # in this module already accept.
                 cleaned: List[Dict[str, Any]] = []
                 for part in output:
+                    if isinstance(part, str):
+                        if part:
+                            cleaned.append({"type": "input_text", "text": sanitize_text(part)})
+                        continue
                     if not isinstance(part, dict):
                         continue
-                    ptype = part.get("type")
-                    if ptype == "input_text":
+                    ptype = str(part.get("type") or "").strip().lower()
+                    if ptype in {"text", "input_text", "output_text"}:
                         text = part.get("text")
                         if isinstance(text, str) and text:
                             cleaned.append({"type": "input_text", "text": sanitize_text(text)})
-                    elif ptype == "input_image":
+                    elif ptype in {"image_url", "input_image"}:
                         url = part.get("image_url")
+                        if isinstance(url, dict):
+                            url = url.get("url")
                         if isinstance(url, str) and url:
                             entry: Dict[str, Any] = {"type": "input_image", "image_url": url}
                             detail = part.get("detail")
