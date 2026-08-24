@@ -15382,7 +15382,28 @@ def _is_default_local_cdp(parsed) -> bool:
         and parsed.hostname in {"127.0.0.1", "localhost"}
         and port == 9222
         and discovery_path
+        and not parsed.query
     )
+
+
+
+def _with_cdp_discovery_path(parsed, path: str) -> str:
+    """Build a CDP discovery URL while preserving query parameters.
+
+    Hosted/managed CDP endpoints can attach authentication or browser-profile
+    selection to the discovery endpoint via query params. Insert the discovery
+    path before the query string rather than appending after it.
+    """
+    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+    return parsed._replace(scheme=scheme, path=path, params="", fragment="").geturl()
+
+
+
+def _probe_urls(parsed) -> list[str]:
+    return [
+        _with_cdp_discovery_path(parsed, "/json/version"),
+        _with_cdp_discovery_path(parsed, "/json"),
+    ]
 
 
 def _http_ok(url: str, timeout: float) -> bool:
@@ -15395,20 +15416,15 @@ def _http_ok(url: str, timeout: float) -> bool:
         return False
 
 
-def _probe_urls(parsed) -> list[str]:
-    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
-    root = f"{scheme}://{parsed.netloc}".rstrip("/")
-    return [f"{root}/json/version", f"{root}/json"]
-
-
 def _normalize_cdp_url(parsed) -> str:
     # Concrete ``/devtools/browser/<id>`` endpoints (Browserbase et al.)
     # are connectable as-is. Discovery-style inputs collapse to bare
-    # ``scheme://host:port`` so ``_resolve_cdp_override`` can append
-    # ``/json/version`` later without doubling the path.
+    # ``scheme://host:port`` while preserving query params, so
+    # ``_resolve_cdp_override`` can insert ``/json/version`` before the query
+    # string later without doubling the path or dropping auth/profile params.
     if parsed.path.startswith("/devtools/browser/"):
         return parsed.geturl()
-    return parsed._replace(path="", params="", query="", fragment="").geturl()
+    return parsed._replace(path="", params="", fragment="").geturl()
 
 
 def _failure_messages(url: str, port: int, system: str) -> list[str]:

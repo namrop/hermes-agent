@@ -652,7 +652,7 @@ _SENSITIVE_PATH_PREFIXES = (
     # write, because $TMPDIR, /tmp, and /var/folders all realpath() into
     # /private/var/folders/... on macOS (and _resolve_path_for_task resolves
     # symlinks), and /private/var/tmp is a normal temp dir.
-    "/private/var/db/", "/private/var/root/",
+    "/private/var/db/", "/private/var/log/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 

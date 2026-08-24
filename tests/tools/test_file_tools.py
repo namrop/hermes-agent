@@ -474,6 +474,7 @@ class TestSensitivePathCheck:
         assert _check_sensitive_path("/private/var/tmp/build.log") is None
         # Sensitive subtrees remain blocked.
         assert _check_sensitive_path("/private/var/db/secret") is not None
+        assert _check_sensitive_path("/private/var/log/system.log") is not None
         assert _check_sensitive_path("/private/var/root/x") is not None
         # /etc (and its macOS /private/etc mirror) stay blocked.
         assert _check_sensitive_path("/private/etc/hosts") is not None
