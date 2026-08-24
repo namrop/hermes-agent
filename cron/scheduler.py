@@ -355,7 +355,15 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
-def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
+# Narrow per-job escape hatch: trusted local notifier jobs may opt back into
+# ``messaging`` so they can post bounded notifications into existing
+# channels/threads. Nothing else can be re-enabled from persisted job data —
+# ``clarify`` would block a non-interactive run, and ``cronjob`` re-enable
+# stays with the owner-level ``cron.allow_agent_scheduling`` config gate.
+_CRON_TOOLSET_EXCEPTION_ALLOWLIST = frozenset({"messaging"})
+
+
+def _resolve_cron_disabled_toolsets(cfg: dict | None, job: dict | None = None) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
     Two toolsets are always disabled in cron context regardless of config:
@@ -372,6 +380,11 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
+
+    Per-job ``cron_toolset_exceptions`` (trusted notifier jobs) may lift only
+    the *cron-context* automatic denial, only for toolsets in
+    ``_CRON_TOOLSET_EXCEPTION_ALLOWLIST``, and never past the user-level
+    denylist — owner config outranks persisted job data.
     """
     cron_cfg = (cfg or {}).get("cron") or {}
     if cron_cfg.get("allow_agent_scheduling"):
@@ -382,10 +395,21 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     from agent.skill_utils import parse_config_string_list
 
     user_disabled = parse_config_string_list(agent_cfg.get("disabled_toolsets"))
+    user_disabled_set = {str(name).strip() for name in user_disabled}
     for name in user_disabled:
         name = str(name).strip()
         if name and name not in disabled:
             disabled.append(name)
+    raw_exceptions = (job or {}).get("cron_toolset_exceptions") or []
+    if isinstance(raw_exceptions, str):
+        requested = {raw_exceptions}
+    elif isinstance(raw_exceptions, (list, tuple, set)):
+        requested = {str(item) for item in raw_exceptions}
+    else:
+        requested = set()
+    for name in requested & _CRON_TOOLSET_EXCEPTION_ALLOWLIST:
+        if name not in user_disabled_set:
+            disabled.remove(name)
     return disabled
 
 
@@ -5804,7 +5828,7 @@ def run_job(
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg, job),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
