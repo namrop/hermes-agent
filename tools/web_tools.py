@@ -153,7 +153,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = _normalize_backend_name(_load_web_config().get("backend"))
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "earthglass", "cloakbrowser-acubens"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "zai", "earthglass", "cloakbrowser-acubens"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -240,6 +240,16 @@ def _is_backend_available(backend: str) -> bool:
         try:
             from tools.xai_http import has_xai_credentials
             return has_xai_credentials()
+        except Exception:
+            return False
+    if backend == "zai":
+        # Z.AI Coding Plan MCP servers. Explicit-selection only — NOT part
+        # of the auto-detect ladder below, because ZAI_API_KEY is shared
+        # with the Z.AI model provider and key presence alone must not
+        # route web traffic into subscription-credit draws.
+        try:
+            from plugins.web.zai.provider import _resolve_api_key
+            return bool(_resolve_api_key())
         except Exception:
             return False
     return False
@@ -1614,7 +1624,7 @@ async def web_crawl_tool(
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai", "zai"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)

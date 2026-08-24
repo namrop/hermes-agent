@@ -1,0 +1,7 @@
+name: web-zai
+version: 1.0.0
+description: "Z.AI Web Search + Web Reader — search and page extraction via the GLM Coding Plan MCP servers (1.2 credits/call, included with subscription). Requires ZAI_API_KEY (https://z.ai)."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - zai
