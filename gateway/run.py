@@ -2717,6 +2717,62 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _blocking_attention_prefix(source: Optional[SessionSource]) -> str:
+    """Return a safe platform-native attention prefix for blocking prompts.
+
+    Used by the clarify callback so interactive prompts actually notify the
+    person who must answer them. Empty (no ping) for DMs — the user is
+    already looking at the chat — and for platforms without a safe
+    same-message mention syntax in plain text.
+    """
+    if source is None:
+        return ""
+
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    if platform is None:
+        platform = str(getattr(source, "platform", "") or "").lower()
+    else:
+        platform = str(platform).lower()
+
+    chat_type = str(getattr(source, "chat_type", "") or "").lower()
+    if chat_type == "dm":
+        return ""
+
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    if not user_id:
+        return ""
+
+    if platform in {"discord", "slack"}:
+        return f"<@{user_id}> "
+    return ""
+
+
+def _clarify_metadata_with_ping(
+    metadata: Optional[dict],
+    source: Optional[SessionSource],
+) -> Optional[dict]:
+    """Copy clarify send metadata and add same-thread requester ping hints.
+
+    Adapters that support native mentions (Discord) read
+    ``clarify_ping_user_id`` to put a direct mention in the prompt message
+    itself; the default text fallback prepends ``clarify_attention_prefix``.
+    Returns the original object unchanged when there is nothing to add, so
+    untouched platforms keep byte-identical sends.
+    """
+    attention = _blocking_attention_prefix(source)
+    if not attention:
+        return metadata
+
+    out = dict(metadata or {})
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    out["clarify_ping_user_id"] = user_id
+    out["clarify_attention_prefix"] = attention
+    if platform is not None:
+        out["clarify_ping_platform"] = str(platform).lower()
+    return out
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -6006,7 +6062,10 @@ class TurnRunner:
                     choices=list(choices) if choices else None,
                     clarify_id=clarify_id,
                     session_key=ctx.session_key or "",
-                    metadata=ctx._status_thread_metadata,
+                    metadata=_clarify_metadata_with_ping(
+                        ctx._status_thread_metadata,
+                        ctx.source,
+                    ),
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -20390,6 +20449,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    api_calls=_api_calls,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

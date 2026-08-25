@@ -4303,6 +4303,11 @@ class BasePlatformAdapter(ABC):
         Adapters with native button UIs (Telegram, Discord) SHOULD
         override this for a richer UX.
         """
+        # Same-message requester ping (group chats on platforms with a safe
+        # plain-text mention syntax; empty for DMs/unsupported platforms).
+        attention = ""
+        if metadata:
+            attention = str(metadata.get("clarify_attention_prefix", "") or "")
         if choices:
             # Multi-select clarifies register their flag on the pending entry;
             # look it up by id so the signature stays adapter-compatible.
@@ -4314,7 +4319,7 @@ class BasePlatformAdapter(ABC):
                 _is_multi = bool(_entry and getattr(_entry, "multi_select", False))
             except Exception:
                 _is_multi = False
-            lines = [f"❓ {question}", ""]
+            lines = [f"{attention}❓ {question}", ""]
             for i, choice in enumerate(choices, start=1):
                 lines.append(f"  {i}. {choice}")
             lines.append("")
@@ -4332,7 +4337,7 @@ class BasePlatformAdapter(ABC):
             from tools.clarify_gateway import mark_awaiting_text
             mark_awaiting_text(clarify_id)
         else:
-            text = f"❓ {question}"
+            text = f"{attention}❓ {question}"
         return await self.send(
             chat_id=chat_id,
             content=text,

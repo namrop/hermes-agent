@@ -15,10 +15,11 @@ Available fields:
     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
+    api_calls    — model API calls made during the turn (``12 calls``)
     cwd          — home-relative working dir (``~``)
 
-``latency`` is opt-in: it is NOT in the default field set, so a footer whose
-``fields`` are unset renders exactly as before.
+``latency`` and ``api_calls`` are opt-in: they are NOT in the default field
+set, so a footer whose ``fields`` are unset renders exactly as before.
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -115,6 +116,7 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    api_calls: Optional[int] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -137,6 +139,11 @@ def format_runtime_footer(
             # timing (call sites that don't measure) or the value is negative.
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
+        elif field in ("api_calls", "calls"):
+            # Model API calls made during the turn. Skipped when the caller
+            # supplied no count (call sites that don't track it).
+            if api_calls is not None and api_calls >= 0:
+                parts.append(f"{api_calls} calls")
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
@@ -157,6 +164,7 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    api_calls: Optional[int] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -165,8 +173,9 @@ def build_footer_line(
     line of separation.
 
     ``turn_seconds`` is the wall-clock duration of the agent run, measured by
-    the caller with ``time.monotonic()``.  Callers that don't measure it leave
-    it ``None`` and the ``latency`` field is skipped.
+    the caller with ``time.monotonic()``.  ``api_calls`` is the model API
+    call count for the turn.  Callers that don't measure either leave them
+    ``None`` and the corresponding fields are skipped.
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
@@ -177,5 +186,6 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        api_calls=api_calls,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

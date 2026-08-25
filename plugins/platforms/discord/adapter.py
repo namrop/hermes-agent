@@ -548,6 +548,22 @@ def _build_allowed_mentions():
     )
 
 
+def _clarify_ping_content(metadata: Optional[dict]) -> Optional[str]:
+    """Return same-message Discord mention content for clarify prompts.
+
+    The gateway attaches ``clarify_ping_user_id`` (the requesting user in a
+    non-DM chat) when a native same-message ping is safe. Only a plausible
+    Discord snowflake is accepted — anything else renders no mention rather
+    than echoing unvalidated metadata into message content.
+    """
+    if not metadata:
+        return None
+    raw_user_id = str(metadata.get("clarify_ping_user_id", "") or "").strip()
+    if not re.fullmatch(r"\d{5,25}", raw_user_id):
+        return None
+    return f"<@{raw_user_id}> 🔔"
+
+
 def _discord_ready_timeout_seconds() -> float:
     """Return the Discord ready wait timeout during gateway startup."""
     raw = os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
@@ -7712,7 +7728,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 "❓ **Hermes needs your input**", str(question or "").strip(),
                 tail=clarify_tail,
             )
-            msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
+            ping = _clarify_ping_content(metadata)
+            if ping:
+                content = f"{ping}\n{content}"
+            send_kwargs: Dict[str, Any] = {"content": content, "embed": embed}
+            if view:
+                send_kwargs["view"] = view
+            if ping:
+                # Requester mention rides the same message; keep the safe
+                # allowed-mentions envelope so only user pings resolve.
+                send_kwargs["allowed_mentions"] = _build_allowed_mentions()
+            msg = await channel.send(**send_kwargs)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
