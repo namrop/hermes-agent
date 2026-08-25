@@ -104,15 +104,10 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     # this is pure attack behavior (Brainworm sub-session bypass).
     (r'unset\s+\w*(?:CLAUDE|CODEX|HERMES|AGENT|OPENAI|ANTHROPIC)\w*', "env_var_unset_agent", "context"),
 
-    # ── Known C2 / red-team framework names (near-zero false positive
-    #    outside security research; warn-only by default) ─────────────
-    # NOTE: do not add common English words here. Every token must be a
-    # distinctive offensive-security tool brand, otherwise legitimate
-    # AGENTS.md / SOUL.md content false-positives and the whole file is
-    # blocked. "praxis" was removed for exactly this reason — it's a common
-    # word and a legitimate agent name (Greek for practice/action), not a
-    # C2-specific tell like the brands below.
-    (r'\b(?:cobalt\s*strike|sliver|havoc|mythic|metasploit|brainworm)\b', "known_c2_framework", "context"),
+    # ── Known C2 / red-team framework names: see _C2_BRANDS below. The
+    #    brand pattern is assembled in _compile() so individual brands can
+    #    be exempted per-deployment via config (several are ordinary
+    #    English words that collide with legitimate vocabulary). ─────────
     (r'\bc2\s+(?:server|channel|infrastructure|beacon)\b', "c2_explicit", "context"),
     (r'\bcommand\s+and\s+control\b', "c2_explicit_long", "context"),
 
@@ -159,6 +154,72 @@ INVISIBLE_CHARS = frozenset({
 })
 
 
+# ── Known C2 / red-team framework brands (context scope, id
+#    "known_c2_framework") ──────────────────────────────────────────────
+# NOTE: do not add common English words here. Every token must be a
+# distinctive offensive-security tool brand, otherwise legitimate
+# AGENTS.md / SOUL.md content false-positives and the whole file is
+# blocked. "praxis" was removed unconditionally for exactly this reason —
+# it's a common word and a legitimate agent name (Greek for
+# practice/action), not a C2-specific tell.
+#
+# Some remaining brands are STILL ordinary words in particular deployments
+# ("mythic" is the Mythic C2 framework — and also a load-bearing term in
+# some users' own writing, where it blocked SOUL.md wholesale). Rather than
+# litigate each brand globally, individual brands are exemptable per
+# deployment via config:
+#
+#     security:
+#       threat_scan_brand_exceptions: ["mythic"]
+#
+# Exceptions match the display name (first tuple element), case-insensitive.
+# Unknown names are ignored. The exception list is read once per process at
+# pattern-compile time (config.yaml changes need a restart, like most
+# security config). Brands with no exception keep exact upstream behavior.
+_C2_BRANDS: Tuple[Tuple[str, str], ...] = (
+    ("cobalt strike", r"cobalt\s*strike"),
+    ("sliver", r"sliver"),
+    ("havoc", r"havoc"),
+    ("mythic", r"mythic"),
+    ("metasploit", r"metasploit"),
+    ("brainworm", r"brainworm"),
+)
+
+
+def _brand_exceptions() -> "frozenset[str]":
+    """Best-effort read of ``security.threat_scan_brand_exceptions``.
+
+    Fail-open to the empty set: a missing/unreadable config must never
+    disable the scanner, only an explicit exception list may narrow it.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config() or {}
+        security = cfg.get("security") or {}
+        raw = security.get("threat_scan_brand_exceptions") or []
+        if not isinstance(raw, list):
+            return frozenset()
+        return frozenset(
+            str(item).strip().lower() for item in raw if str(item).strip()
+        )
+    except Exception:
+        return frozenset()
+
+
+def _c2_brand_pattern() -> Optional[str]:
+    """Assemble the known_c2_framework regex minus configured exceptions.
+
+    Returns None when every brand is excepted (the pattern is dropped
+    entirely rather than compiled to match nothing).
+    """
+    exceptions = _brand_exceptions()
+    parts = [regex for name, regex in _C2_BRANDS if name not in exceptions]
+    if not parts:
+        return None
+    return r"\b(?:" + "|".join(parts) + r")\b"
+
+
 # Compiled pattern sets, indexed by scope.  Compiled once at import time;
 # scan_for_threats() looks them up.
 _COMPILED: dict[str, List[Tuple[re.Pattern, str]]] = {}
@@ -179,7 +240,15 @@ def _compile() -> None:
     context_patterns: List[Tuple[re.Pattern, str]] = []
     strict_patterns: List[Tuple[re.Pattern, str]] = []
 
-    for pattern, pid, scope in _PATTERNS:
+    # The C2 brand pattern is assembled at compile time so per-deployment
+    # exceptions (security.threat_scan_brand_exceptions) can subtract
+    # individual brands; None means every brand was excepted.
+    patterns: List[Tuple[str, str, str]] = list(_PATTERNS)
+    brand_pattern = _c2_brand_pattern()
+    if brand_pattern is not None:
+        patterns.append((brand_pattern, "known_c2_framework", "context"))
+
+    for pattern, pid, scope in patterns:
         compiled = re.compile(pattern, re.IGNORECASE)
         entry = (compiled, pid)
         if scope == "all":
