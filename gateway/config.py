@@ -588,15 +588,26 @@ class SessionResetPolicy:
 @dataclass
 class ChannelOverride:
     """
-    Per-channel override for model, provider, and system prompt.
+    Per-channel override for model, provider, system prompt, and personality.
 
     Used in config under platforms.<name>.channel_overrides[channel_id].
     Enables different channels (e.g. Discord #daily vs #dev) to use different
     models and personas without running separate gateway instances.
+
+    ``personality`` names an entry from the shared personality registry
+    (built-ins overlaid by ``agent.personalities`` — see
+    ``hermes_cli.personality``, the single owner of personality state).
+    Precedence within an override mirrors the global contract, where
+    ``display.personality`` outranks ``agent.system_prompt``: a known
+    personality name wins over ``system_prompt``; a neutral name
+    (none/default/neutral) explicitly suppresses the gateway-global overlay
+    for the channel (``system_prompt`` still applies if set); an unknown
+    name fails open to ``system_prompt``, then the global overlay.
     """
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    personality: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -606,6 +617,8 @@ class ChannelOverride:
             out["provider"] = self.provider
         if self.system_prompt is not None:
             out["system_prompt"] = self.system_prompt
+        if self.personality is not None:
+            out["personality"] = self.personality
         return out
 
     @classmethod
@@ -616,6 +629,7 @@ class ChannelOverride:
             model=data.get("model"),
             provider=data.get("provider"),
             system_prompt=data.get("system_prompt"),
+            personality=data.get("personality"),
         )
 
 

@@ -3883,6 +3883,48 @@ def _get_channel_override(
     return None
 
 
+#: Unknown channel_overrides personality names already warned about, so a
+#: config typo logs once per process instead of once per message.
+_WARNED_OVERRIDE_PERSONALITIES: "set[str]" = set()
+
+
+def _resolve_override_personality(name: str) -> Optional[str]:
+    """Render a ``channel_overrides`` ``personality`` name to prompt text.
+
+    All resolution goes through ``hermes_cli.personality`` (the single owner
+    of personality state); definitions come from the built-ins overlaid by
+    ``agent.personalities`` in the mtime-cached gateway config.
+
+    Returns:
+        ``str`` (non-empty) — the rendered persona overlay for a known name.
+        ``""`` — the name is explicitly neutral (none/default/neutral): the
+            channel opts out of the gateway-global overlay.
+        ``None`` — unknown name; caller must fail open to ``system_prompt``
+            and then the global overlay. Warns once per name per process.
+    """
+    from hermes_cli.personality import (
+        normalize_personality_name,
+        resolve_personality,
+    )
+
+    normalized = normalize_personality_name(name)
+    if not normalized:
+        return ""
+    try:
+        _, text = resolve_personality(normalized, _load_gateway_config())
+    except ValueError:
+        if normalized not in _WARNED_OVERRIDE_PERSONALITIES:
+            _WARNED_OVERRIDE_PERSONALITIES.add(normalized)
+            logger.warning(
+                "channel_overrides personality %r is not a built-in or "
+                "agent.personalities entry; falling back to system_prompt/"
+                "global overlay for this channel",
+                name,
+            )
+        return None
+    return text
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -9446,6 +9488,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Ephemeral system prompt for this channel/thread.
 
         Uses ``channel_overrides`` when set, else the global gateway prompt.
+        Within an override, ``personality`` (a name from the shared registry)
+        outranks ``system_prompt`` — mirroring the global contract where
+        ``display.personality`` outranks ``agent.system_prompt``. A neutral
+        personality name (none/default/neutral) opts the channel out of the
+        global overlay; an unknown name fails open to ``system_prompt``.
         Legacy ``channel_prompts`` are applied separately via ``event.channel_prompt``
         in ``run_sync`` (adapter ``resolve_channel_prompt``), so they are not
         duplicated here.
@@ -9459,8 +9506,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id=thread_id,
                 parent_id=parent_id,
             )
-            if override and override.system_prompt:
-                return (override.system_prompt or "").strip()
+            if override is not None:
+                if override.personality is not None:
+                    resolved = _resolve_override_personality(override.personality)
+                    if resolved:
+                        return resolved
+                    if resolved == "":
+                        # Explicit neutral: system_prompt (if any) still
+                        # applies, but the global overlay does not.
+                        return (override.system_prompt or "").strip()
+                    # resolved is None — unknown name, fail open below.
+                if override.system_prompt:
+                    return (override.system_prompt or "").strip()
         return getattr(self, "_ephemeral_system_prompt", None) or ""
 
     @staticmethod
