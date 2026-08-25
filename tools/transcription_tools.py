@@ -115,7 +115,7 @@ DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest"
 DEFAULT_ELEVENLABS_STT_MODEL = os.getenv("STT_ELEVENLABS_MODEL", "scribe_v2")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
-COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/run/current-system/sw/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -208,6 +208,36 @@ def _resolve_stt_language(
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
+
+
+DEFAULT_OPENAI_STT_TIMEOUT_SECONDS = 120
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    """Coerce *value* to a positive int, falling back to *default*."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _get_openai_timeout_seconds(stt_config: Optional[Dict[str, Any]] = None) -> int:
+    """Resolve the OpenAI-compatible STT client timeout.
+
+    ``stt.openai.timeout_seconds`` in config.yaml (default 120). Long clips
+    exceed the old hardcoded 30s client timeout, surfacing as opaque
+    ``Request timeout`` errors on otherwise-healthy requests.
+    """
+    if stt_config is None:
+        stt_config = _load_stt_config()
+    openai_cfg = stt_config.get("openai", {}) if isinstance(stt_config, dict) else {}
+    if not isinstance(openai_cfg, dict):
+        openai_cfg = {}
+    return _coerce_positive_int(
+        openai_cfg.get("timeout_seconds"),
+        DEFAULT_OPENAI_STT_TIMEOUT_SECONDS,
+    )
 
 
 def _has_openai_audio_backend() -> bool:
@@ -2290,7 +2320,12 @@ def _transcribe_openai(
             APITimeoutError,
             BadRequestError,
         )
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=_get_openai_timeout_seconds(),
+            max_retries=0,
+        )
 
         def _create_transcription(path: str):
             with open(path, "rb") as audio_file:
