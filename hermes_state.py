@@ -7674,7 +7674,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         via :meth:`record_auxiliary_usage` (issue #23270).
         """
         row = conn.execute(
-            "SELECT model, billing_provider, billing_base_url, billing_mode "
+            "SELECT model, billing_provider, billing_base_url, billing_mode, source "
             "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
@@ -7682,6 +7682,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         sess_provider = row["billing_provider"] if row is not None else None
         sess_base_url = row["billing_base_url"] if row is not None else None
         sess_billing_mode = row["billing_mode"] if row is not None else None
+        sess_source = row["source"] if row is not None else None
 
         # Aux-task rows (task != '') must NOT inherit the session's main-loop
         # route: an aux call may use a completely different provider/model
@@ -7740,6 +7741,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 now,
             ),
         )
+
+        # Event-spine sidecar (contract v1, `usage_events.db`): append-only
+        # mirror of this accounted delta. Own file and connection — a ledger
+        # failure must never touch the state.db write transaction. Lazy
+        # import keeps agent-layer deps out of module import time.
+        try:
+            from agent.usage_events import record_model_delta_event
+
+            record_model_delta_event(
+                session_id=session_id,
+                source=sess_source,
+                model=eff_model,
+                provider=eff_provider,
+                api_mode=None,
+                billing_base_url=eff_base_url,
+                billing_mode=eff_billing_mode,
+                task=task or "",
+                input_tokens=input_tokens or 0,
+                output_tokens=output_tokens or 0,
+                cache_read_tokens=cache_read_tokens or 0,
+                cache_write_tokens=cache_write_tokens or 0,
+                reasoning_tokens=reasoning_tokens or 0,
+                estimated_cost_usd=estimated_cost_usd,
+                actual_cost_usd=actual_cost_usd,
+                cost_status=cost_status,
+                cost_source=cost_source,
+                api_call_count=api_call_count or 0,
+            )
+        except Exception:
+            pass
 
     def ensure_session(
         self,
