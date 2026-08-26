@@ -2928,17 +2928,81 @@ class SessionStore:
                     display_name=entry.display_name,
                 )
             except Exception as e:
-                # The row will be self-healed with full identity by the next
-                # per-turn peer refresh (record_gateway_session_peer now
-                # INSERTs on missing row, #82616) — but the failure itself is
-                # a routing hazard and must be visible, not a bare print.
-                logger.warning(
-                    "Failed to create session row %s for %s: %s — deferring "
-                    "to the self-healing peer refresh on the next turn",
-                    db_create_kwargs.get("session_id"), session_key, e,
+                # Deferring to the next-turn peer refresh fails exactly when
+                # there is no next turn: a first-message session whose row
+                # never lands leaves every message insert FK-orphaned and the
+                # turn dies silently (2026-08-26 incident). The dominant FK
+                # parent failure is parent_session_id referencing a predecessor
+                # absent from the DB (fresh-DB cutovers; pruned rows), so heal
+                # SYNCHRONOUSLY: retry once without the lineage pointer.
+                # Lost parent lineage is recoverable from origin_json/logs;
+                # a missing session row is a silent-no-response.
+                healed = self._retry_create_session_without_lineage(
+                    db_create_kwargs, session_key, e,
                 )
+                if healed:
+                    self._record_gateway_session_peer(
+                        session_id,
+                        session_key,
+                        source,
+                        display_name=entry.display_name,
+                    )
 
         return entry
+
+    def _retry_create_session_without_lineage(
+        self,
+        db_create_kwargs: dict,
+        session_key: str,
+        original_exc: Exception,
+        *,
+        context: str = "spawn",
+    ) -> bool:
+        """One synchronous retry of a failed session-row insert, sans lineage.
+
+        The dominant create_session FK failure is ``parent_session_id``
+        referencing a predecessor row absent from the DB — routine after a
+        fresh-DB cutover (the gateway session store carries prior lineage the
+        new DB has never seen) and possible after pruning. Deferring the row
+        to "the next turn's peer refresh" strands first-message sessions:
+        every message insert is FK-orphaned and the turn dies with no
+        user-visible error (2026-08-26 silent-no-response incident).
+
+        Returns True when the retry landed the row (caller re-records the
+        gateway peer); False when there was no lineage to drop or the retry
+        failed too (original deferred behavior, loudly).
+        """
+        dropped_parent = db_create_kwargs.get("parent_session_id")
+        if not dropped_parent or self._db is None:
+            logger.warning(
+                "Failed to create session row %s for %s (%s): %s — no "
+                "lineage to drop; deferring to the self-healing peer "
+                "refresh on the next turn",
+                db_create_kwargs.get("session_id"), session_key, context,
+                original_exc,
+            )
+            return False
+        retry_kwargs = dict(db_create_kwargs)
+        retry_kwargs["parent_session_id"] = None
+        try:
+            self._db.create_session(**retry_kwargs)
+        except Exception as retry_exc:
+            logger.warning(
+                "Failed to create session row %s for %s (%s) even without "
+                "parent lineage: first %s, then %s — deferring to the "
+                "self-healing peer refresh on the next turn",
+                db_create_kwargs.get("session_id"), session_key, context,
+                original_exc, retry_exc,
+            )
+            return False
+        logger.warning(
+            "Session row %s for %s (%s) created WITHOUT parent lineage %s "
+            "after FK failure (%s) — predecessor row absent (fresh-DB "
+            "cutover or pruned); lineage recoverable from origin_json",
+            retry_kwargs.get("session_id"), session_key, context,
+            dropped_parent, original_exc,
+        )
+        return True
 
     def update_session(
         self,
@@ -3420,12 +3484,20 @@ class SessionStore:
                     display_name=new_entry.display_name if new_entry else None,
                 )
             except Exception as e:
-                logger.warning(
-                    "Failed to create session row %s for %s during reset: %s "
-                    "— deferring to the self-healing peer refresh on the next "
-                    "turn",
-                    session_id, session_key, e,
+                # Same synchronous heal as the spawn path (2026-08-26
+                # incident): a reset that fails its row insert leaves the new
+                # session unroutable in SQLite until a next turn that may not
+                # come.
+                healed = self._retry_create_session_without_lineage(
+                    db_create_kwargs, session_key, e, context="reset",
                 )
+                if healed:
+                    self._record_gateway_session_peer(
+                        session_id,
+                        session_key,
+                        old_entry.origin,
+                        display_name=new_entry.display_name if new_entry else None,
+                    )
 
         return new_entry
 
