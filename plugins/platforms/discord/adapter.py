@@ -3999,6 +3999,40 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
         filename = file_name or os.path.basename(file_path)
+
+        # Pre-flight size check (2026-08-26): without it, oversized files ride
+        # into a 413 Payload Too Large from Discord and the failure surfaces
+        # only as an adapter log line — the agent (and the user) never learn
+        # the delivery silently died (55 historical occurrences, mostly large
+        # PDF renders). Fail loud and BEFORE the upload, with the actual
+        # limit in the error so the agent can react (smaller render, path
+        # handoff, external link). guild.filesize_limit tracks boost tier;
+        # guildless channels (DMs) fall back to the 8 MiB floor.
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            file_size = 0
+        size_limit = getattr(
+            getattr(channel, "guild", None), "filesize_limit", 8 * 1024 * 1024
+        ) or 8 * 1024 * 1024
+        if file_size > size_limit:
+            size_mb = file_size / (1024 * 1024)
+            limit_mb = size_limit / (1024 * 1024)
+            logger.warning(
+                "[%s] Refusing to upload %s to %s: %.1f MiB exceeds the "
+                "channel's %.0f MiB attachment limit",
+                self.name, filename, chat_id, size_mb, limit_mb,
+            )
+            return SendResult(
+                success=False,
+                error=(
+                    f"File {filename} is {size_mb:.1f} MiB — over this "
+                    f"channel's {limit_mb:.0f} MiB upload limit. Not "
+                    "uploaded. Deliver a smaller render, or hand off the "
+                    f"local path instead: {file_path}"
+                ),
+            )
+
         logger.info(
             "[%s] Sending file attachment %s (%s) to %s",
             self.name,
