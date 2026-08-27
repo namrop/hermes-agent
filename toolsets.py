@@ -289,6 +289,19 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
+
+    # Sol fork (2026-08-26 keeper ruling): agent-callable cross-channel
+    # messaging, restored as an OPT-IN toolset. Deliberately absent from
+    # every default platform bundle below — it mounts only where
+    # platform_toolsets explicitly lists it (single-operator deployment;
+    # upstream's generic-guild concern does not apply here). Cron context
+    # still denies it by default with the per-job cron_toolset_exceptions
+    # escape hatch (see cron/scheduler.py).
+    "messaging": {
+        "description": "Cross-channel messaging (send_message: send/list/react to any connected platform target)",
+        "tools": ["send_message"],
+        "includes": []
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",

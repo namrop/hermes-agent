@@ -2272,3 +2272,27 @@ from tools.registry import tool_error
 #   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
 # Those callers import the helpers directly; none of them need the registry
 # entry.
+
+
+# ── Agent-callable registration (Sol fork, 2026-08-26 keeper ruling) ─────
+# Upstream deliberately removed the agent-callable send_message ("outbound
+# platform messaging is handled outside the agent loop, not by the model
+# deciding to send on its own") — a control sized for generic multi-user
+# guilds. This deployment is a single-operator guild; the keeper ruled the
+# capability restored (incident:
+# hermes_discord_tool_write_surface_loss_empty_anchor_thread_incident_2026-08-26).
+# Restoration is OPT-IN: the "messaging" toolset (toolsets.py) is not part
+# of any default platform bundle — it mounts only where platform_toolsets
+# explicitly lists it. Cron context keeps its deny-by-default with the
+# per-job cron_toolset_exceptions allowlist (trusted notifier jobs)
+# unchanged. Same approval posture as every tool; no gate bypass.
+from tools.registry import registry as _registry
+
+_registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=lambda args, **kw: send_message_tool(args, **kw),
+    check_fn=_check_send_message,
+    emoji="📨",
+)
