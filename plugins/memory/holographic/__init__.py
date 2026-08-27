@@ -212,6 +212,12 @@ class HolographicMemoryProvider(MemoryProvider):
             for r in results:
                 trust = r.get("trust_score", r.get("trust", 0))
                 lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
+            # Point-of-use reminder: the only natural moment to rate a fact is
+            # when it is injected. The system-prompt block alone never surfaced
+            # the instruction where the behavior fires, so the trust trainer
+            # stayed dormant (live db: zero ratings ever). One line, at the
+            # injection site, closes that gap.
+            lines.append("Rate facts you actually used: fact_feedback(action=helpful|unhelpful, fact_id)")
             return "## Holographic Memory\n" + "\n".join(lines)
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
