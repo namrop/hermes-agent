@@ -52,9 +52,89 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
+class _BackgroundReviewPassState:
+    """Shared, lock-guarded state for ONE background-review/curator pass.
+
+    WHY A MUTABLE OBJECT BEHIND THE ContextVar (not a frozenset value):
+    ``agent.tool_executor`` dispatches EVERY tool call through
+    ``tools.thread_context.propagate_context_to_thread``, which snapshots the
+    parent context with ``contextvars.copy_context()`` and runs the tool
+    inside that COPY. A ``ContextVar.set()`` performed inside the copy is
+    discarded when the tool returns — it never propagates to the parent, so
+    the next tool call (a fresh copy of the parent) starts from the old
+    value. The previous frozenset-valued design therefore recorded
+    ``skill_view`` read-marks into a context copy and threw them away,
+    making the read-before-write guard structurally unsatisfiable: it
+    refused with "call skill_view(name)... then retry", advice that could
+    never work (observed: 17 identical refusals in a row; ~790 refusals in
+    one 4-day denial window).
+
+    Copying a context copies the *reference* to this object, so in-place,
+    lock-guarded mutation made inside one tool call's copy is visible to the
+    parent context and to every later tool call's copy — while distinct
+    passes still get distinct stores via
+    ``_reset_background_review_read_marks()`` (called by both spawn sites on
+    the review thread before ``run_conversation``, so all of that pass's
+    tool-worker copies inherit the same fresh store).
+    """
+
+    __slots__ = ("_lock", "_read_paths", "_refusal_counts", "_skipped")
+
+    def __init__(self) -> None:
+        import threading as _threading
+
+        self._lock = _threading.Lock()
+        self._read_paths: set[str] = set()
+        self._refusal_counts: Dict[str, int] = {}
+        self._skipped: set[str] = set()
+
+    def add_read(self, resolved: str) -> None:
+        with self._lock:
+            self._read_paths.add(resolved)
+
+    def has_read(self, resolved: str) -> bool:
+        with self._lock:
+            return resolved in self._read_paths
+
+    def record_read_refusal(self, name: str) -> int:
+        """Count one read-before-write refusal for *name*; return the total."""
+        with self._lock:
+            count = self._refusal_counts.get(name, 0) + 1
+            self._refusal_counts[name] = count
+            return count
+
+    def is_skipped(self, name: str) -> bool:
+        with self._lock:
+            return name in self._skipped
+
+    def mark_skipped(self, name: str) -> bool:
+        """Mark *name* skipped for the rest of the pass. True only the first
+        time, so the caller can log exactly once."""
+        with self._lock:
+            if name in self._skipped:
+                return False
+            self._skipped.add(name)
+            return True
+
+
+_background_review_pass_state: "_ctxvars.ContextVar[_BackgroundReviewPassState]" = (
+    _ctxvars.ContextVar(
+        "background_review_pass_state", default=_BackgroundReviewPassState()
+    )
 )
+
+# Circuit breaker: after this many identical read-before-write refusals for
+# one skill in one pass, the skill is skipped for the remainder of the pass.
+# Cheap insurance against mechanical retry loops — with read-mark propagation
+# fixed this should never trip in practice.
+_READ_BEFORE_WRITE_BREAKER_THRESHOLD = 3
+
+
+def _resolve_mark_path(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -65,6 +145,11 @@ def mark_background_review_skill_read(path: Path) -> None:
     skill_view tool calls this after returning file content to the model; write
     paths below require the corresponding target path to be present when the
     current origin is ``background_review``.
+
+    Mutates the shared per-pass store in place — see
+    :class:`_BackgroundReviewPassState` for why a ``ContextVar.set()`` here
+    would be silently discarded by the tool executor's per-call
+    ``copy_context()`` dispatch.
     """
     try:
         from tools.skill_provenance import is_background_review
@@ -73,26 +158,23 @@ def mark_background_review_skill_read(path: Path) -> None:
     except Exception:
         return
 
-    try:
-        resolved = str(path.resolve())
-    except Exception:
-        resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    _background_review_pass_state.get().add_read(_resolve_mark_path(path))
 
 
 def _background_review_has_read(path: Path) -> bool:
-    try:
-        resolved = str(path.resolve())
-    except Exception:
-        resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    return _background_review_pass_state.get().has_read(_resolve_mark_path(path))
 
 
 def _reset_background_review_read_marks() -> None:
-    """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    """Begin a fresh background-review pass for the current context.
+
+    Installs a new shared store (read-marks, refusal counters, circuit-breaker
+    skips) on the calling thread's context. Both review spawn sites
+    (``agent/background_review.py`` and ``agent/curator.py``) call this on the
+    review thread before ``run_conversation`` so every tool-worker context
+    copy of that pass shares one fresh store; also used by tests.
+    """
+    _background_review_pass_state.set(_BackgroundReviewPassState())
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
@@ -421,13 +503,33 @@ def _background_review_write_guard(
     return None
 
 
+def _breaker_skip_response(name: str, action: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": (
+            f"Skipping skill '{name}' for the remainder of this review pass: "
+            f"{_READ_BEFORE_WRITE_BREAKER_THRESHOLD} read-before-write "
+            f"refusals tripped the circuit breaker (attempted: {action}). "
+            "Do NOT retry writes to this skill in this pass — move on to "
+            "the next skill or finish the review."
+        ),
+        "_circuit_breaker_skipped": True,
+    }
+
+
 def _background_review_read_before_write_guard(
     name: str,
     target: Path,
     action: str,
     file_label: str,
 ) -> Optional[Dict[str, Any]]:
-    """Require review forks to load the exact target before mutating it."""
+    """Require review forks to load the exact target before mutating it.
+
+    Carries a per-pass circuit breaker: once a skill has accumulated
+    ``_READ_BEFORE_WRITE_BREAKER_THRESHOLD`` read-before-write refusals in
+    one pass, it is skipped for the remainder of the pass (logged once) so a
+    retry loop can never grind out dozens of identical refusals again.
+    """
     try:
         from tools.skill_provenance import is_background_review
         if not is_background_review():
@@ -435,8 +537,25 @@ def _background_review_read_before_write_guard(
     except Exception:
         return None
 
+    state = _background_review_pass_state.get()
+    if state.is_skipped(name):
+        return _breaker_skip_response(name, action)
+
     if _background_review_has_read(target):
         return None
+
+    refusals = state.record_read_refusal(name)
+    if refusals >= _READ_BEFORE_WRITE_BREAKER_THRESHOLD:
+        if state.mark_skipped(name):
+            logger.warning(
+                "background-review circuit breaker: skill %r skipped for the "
+                "remainder of this pass after %d read-before-write refusals "
+                "(last action: %s)",
+                name,
+                refusals,
+                action,
+            )
+        return _breaker_skip_response(name, action)
 
     return {
         "success": False,

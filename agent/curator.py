@@ -1962,6 +1962,18 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # start (see agent/turn_context.py).
         review_agent._memory_write_origin = "background_review"
 
+        # Begin a fresh read-before-write pass store on THIS thread before
+        # run_conversation: tool workers copy this thread's context, so they
+        # all share the store installed here (see _BackgroundReviewPassState
+        # in tools/skill_manager_tool.py). Mirrors the reset the session-end
+        # review spawn site performs in agent/background_review.py.
+        try:
+            from tools.skill_manager_tool import _reset_background_review_read_marks
+
+            _reset_background_review_read_marks()
+        except Exception:
+            pass
+
         # Redirect the forked agent's stdout/stderr to /dev/null while it
         # runs so its tool-call chatter doesn't pollute the foreground
         # terminal. The background-thread runner also hides it; this

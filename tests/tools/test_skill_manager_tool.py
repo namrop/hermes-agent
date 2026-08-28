@@ -947,3 +947,166 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+class TestReadMarkSurvivesExecutorDispatch:
+    """The read-before-write guard must be satisfiable through the REAL tool
+    dispatch path.
+
+    agent/tool_executor.py submits every tool call through
+    ``tools.thread_context.propagate_context_to_thread``, which does
+    ``contextvars.copy_context()`` and runs the tool inside the COPY. A
+    ``ContextVar.set()`` made inside the copy is discarded when the call
+    returns, so a read-mark recorded by ``skill_view`` never reached the
+    next ``skill_manage`` call's (fresh) context copy. The guard then
+    refused with "call skill_view(name)... then retry" — advice that could
+    never work (observed: 17 identical refusals in a row, ~790 refusals in
+    a 4-day denial window).
+    """
+
+    @staticmethod
+    def _dispatch(fn, *args, **kwargs):
+        """Run one tool call exactly the way the tool executor does: on a
+        worker thread, inside a copy of the calling thread's context."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from tools.thread_context import propagate_context_to_thread
+
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(
+                propagate_context_to_thread(fn), *args, **kwargs
+            ).result()
+
+    def test_write_permitted_after_read_across_dispatch_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skills_tool import skill_view
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("dispatched", _skill_content("dispatched"))
+
+            viewed = json.loads(self._dispatch(skill_view, "dispatched"))
+            assert viewed["success"] is True, viewed
+
+            result = json.loads(self._dispatch(
+                skill_manage,
+                action="patch",
+                name="dispatched",
+                old_string="Do the thing.",
+                new_string="Do the improved thing.",
+            ))
+        _reset_background_review_read_marks()
+        assert result["success"] is True, (
+            "skill_view's read-mark did not survive the executor's "
+            f"copy_context() dispatch: {result}"
+        )
+
+    def test_mark_recorded_inside_context_copy_is_visible_to_parent(
+        self, tmp_path, monkeypatch
+    ):
+        """Unit-level shape of the same bug, without the tool plumbing."""
+        import contextvars
+
+        from tools.skill_manager_tool import (
+            _background_review_has_read,
+            _reset_background_review_read_marks,
+            mark_background_review_skill_read,
+        )
+
+        _reset_background_review_read_marks()
+        target = tmp_path / "some-skill" / "SKILL.md"
+        with patch(
+            "tools.skill_provenance.is_background_review", return_value=True
+        ):
+            ctx = contextvars.copy_context()
+            ctx.run(mark_background_review_skill_read, target)
+            # A SECOND copy (the next tool call) must see the mark too.
+            ctx2 = contextvars.copy_context()
+            assert ctx2.run(_background_review_has_read, target) is True
+        _reset_background_review_read_marks()
+
+
+class TestReadBeforeWriteCircuitBreaker:
+    """N identical read-before-write refusals for one skill in one pass trip
+    a circuit breaker (N=3): the skill is skipped for the remainder of the
+    pass and the trip is logged once. Insurance against the observed
+    mechanical retry loop (17 identical refusals in a row)."""
+
+    @staticmethod
+    def _attempt(name):
+        return json.loads(skill_manage(
+            action="patch",
+            name=name,
+            old_string="Do the thing.",
+            new_string="Changed.",
+        ))
+
+    def test_third_identical_refusal_trips_breaker(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("loopy", _skill_content("loopy"))
+            with caplog.at_level(logging.WARNING, logger="tools.skill_manager_tool"):
+                first = self._attempt("loopy")
+                second = self._attempt("loopy")
+                third = self._attempt("loopy")
+                fourth = self._attempt("loopy")
+        _reset_background_review_read_marks()
+
+        # First two refusals keep the retryable shape.
+        for r in (first, second):
+            assert r["success"] is False
+            assert r.get("_read_before_write_required") is True
+        # Third identical refusal trips the breaker; later attempts stay skipped.
+        for r in (third, fourth):
+            assert r["success"] is False, r
+            assert r.get("_circuit_breaker_skipped") is True, r
+            assert "_read_before_write_required" not in r
+        # Logged exactly once.
+        trips = [
+            rec for rec in caplog.records if "circuit breaker" in rec.getMessage()
+        ]
+        assert len(trips) == 1
+
+    def test_skip_persists_even_after_a_later_read(self, tmp_path, monkeypatch):
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skills_tool import skill_view
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("tripped", _skill_content("tripped"))
+            for _ in range(3):
+                self._attempt("tripped")
+            # Reading now does not re-arm writes for this pass.
+            assert json.loads(skill_view("tripped"))["success"] is True
+            late = self._attempt("tripped")
+        _reset_background_review_read_marks()
+        assert late["success"] is False
+        assert late.get("_circuit_breaker_skipped") is True
+        # Content untouched.
+        assert "Do the thing." in (
+            tmp_path / ".hermes" / "skills" / "tripped" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+    def test_fresh_pass_clears_the_breaker(self, tmp_path, monkeypatch):
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skills_tool import skill_view
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("next-pass", _skill_content("next-pass"))
+            for _ in range(3):
+                self._attempt("next-pass")
+            # New pass: breaker and marks are gone; read-then-write works.
+            _reset_background_review_read_marks()
+            assert json.loads(skill_view("next-pass"))["success"] is True
+            result = self._attempt("next-pass")
+        _reset_background_review_read_marks()
+        assert result["success"] is True, result
