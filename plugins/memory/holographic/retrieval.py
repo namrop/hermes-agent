@@ -116,6 +116,23 @@ class FactRetriever:
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
+        # Count what was actually surfaced, not every keyword candidate:
+        # this is the door both prefetch and explicit fact_store(search)
+        # actually use — search_facts()'s increment never fires because
+        # nothing calls it. Guarded: bookkeeping must never fail a recall.
+        if results:
+            try:
+                with self.store._lock:
+                    ids = [f["fact_id"] for f in results]
+                    placeholders = ", ".join("?" * len(ids))
+                    self.store._conn.execute(
+                        f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                        f"WHERE fact_id IN ({placeholders})",
+                        ids,
+                    )
+                    self.store._conn.commit()
+            except Exception:
+                pass
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
