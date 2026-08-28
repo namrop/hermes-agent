@@ -311,6 +311,55 @@ def _is_gateway_approval_context() -> bool:
     return bool(_get_session_platform())
 
 
+def _no_approver_in_subagent_result(
+    pattern_key: str, description: str,
+) -> Optional[dict]:
+    """Fail fast when a consent ask cannot reach any human in a subagent.
+
+    Delegated subagent contexts (delegate_task children, in-process or
+    subprocess) have no gateway notify callback of their own; queuing a
+    pending approval there produces an "Asking the user for approval" message
+    that no human ever sees — the 2026-08-28 audit showed 5/5 such asks
+    erroring with no prompt delivered, after which subagents routed around the
+    gate via /tmp scripts. Returns an honest BLOCKED result instead of a
+    structurally unanswerable pending entry, or None outside subagent context.
+
+    This never auto-approves. A parent turn's already-granted session
+    approval still inherits normally: delegated children share the parent's
+    approval session key (contextvars are copied into the child), so
+    ``is_approved(session_key, pattern_key)`` passes before this is reached.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+        if not is_delegated_child_process_context():
+            return None
+    except Exception:
+        return None
+    logger.warning(
+        "Approval required (%s) in a subagent context with no reachable "
+        "approver — failing fast instead of queuing an unanswerable pending "
+        "approval (pattern: %s)", description, pattern_key,
+    )
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: this action requires approval ({description}), but no "
+            "approver is reachable in this subagent context — the approval "
+            "prompt cannot reach a human here. Do NOT retry, and do NOT "
+            "route around this via /tmp scripts, alternate tools, or "
+            "rephrased commands. Either return this work to the parent "
+            "agent (which has an approval surface), or report that the "
+            "action needs the operator to run or approve it from the parent "
+            "session or terminal."
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": "no_approver",
+        "user_consent": False,
+        "subagent_no_approver": True,
+    }
+
+
 def _resolve_cli_approval_callback(approval_callback=None):
     """Return an interactive CLI approval callback when one is available.
 
@@ -3693,6 +3742,13 @@ def _run_approval_gate(
             approval_callback=approval_callback,
             notify_cb=notify_cb,
         ):
+            # Subagent context: a pending approval here is structurally
+            # unanswerable — fail fast with an honest message instead.
+            _subagent_block = _no_approver_in_subagent_result(
+                pattern_key, description,
+            )
+            if _subagent_block is not None:
+                return _subagent_block
             # No notify callback (e.g. API server without an attached chat):
             # queue for /approve /deny review, agent sees approval_required.
             submit_pending(session_key, {
@@ -4946,6 +5002,13 @@ def check_all_command_guards(command: str, env_type: str,
             approval_callback=approval_callback,
             notify_cb=notify_cb,
         ):
+            # Subagent context: a pending approval here is structurally
+            # unanswerable — fail fast with an honest message instead.
+            _subagent_block = _no_approver_in_subagent_result(
+                primary_key, combined_desc,
+            )
+            if _subagent_block is not None:
+                return _subagent_block
             # Return approval_required for backward compat. Redact secrets in the
             # user-facing copy — the raw `command` is preserved for execution and
             # the allowlist keys off pattern_key, so redaction is display-only.
@@ -5381,6 +5444,12 @@ def check_execute_code_guard(code: str, env_type: str,
                 "user_approved": True,
                 "description": description,
             }
+
+        # Subagent context: a pending approval here is structurally
+        # unanswerable — fail fast with an honest message instead.
+        _subagent_block = _no_approver_in_subagent_result(pattern_key, description)
+        if _subagent_block is not None:
+            return _subagent_block
 
         # No gateway callback registered (e.g. ask-mode without a notifier):
         # surface a pending approval for backward compatibility.
