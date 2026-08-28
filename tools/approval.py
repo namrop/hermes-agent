@@ -3344,6 +3344,29 @@ def _get_smart_policy() -> str:
     return policy.strip()
 
 
+# One retry after this backoff when the auxiliary approval chain fails
+# transiently (rate limit / connection). Module-level so tests can shrink it.
+_SMART_APPROVE_RETRY_BACKOFF_SECONDS = 2.0
+
+
+def _aux_failure_is_retryable(err: Exception) -> bool:
+    """True when a failed auxiliary approval call is worth one retry.
+
+    Rate-limit and connection exhaustion (the aux client re-raises the
+    original error after its fallback chain is spent) are transient by
+    nature; auth/payment/model errors are not — retrying those just doubles
+    the latency before the manual-approval fallback.
+    """
+    try:
+        from agent.auxiliary_client import (
+            _is_connection_error,
+            _is_rate_limit_error,
+        )
+        return _is_rate_limit_error(err) or _is_connection_error(err)
+    except Exception:
+        return False
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -3413,15 +3436,34 @@ def _smart_approve(command: str, description: str) -> str:
             "Respond with exactly one word: APPROVE, DENY, or ESCALATE"
         )
 
-        response = call_llm(
-            task="approval",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-            max_tokens=16,
-        )
+        def _guard_call():
+            return call_llm(
+                task="approval",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                max_tokens=16,
+            )
+
+        try:
+            response = _guard_call()
+        except Exception as first_err:
+            # The auxiliary chain can die transiently (rate limit on the
+            # approval provider AND its fallbacks — the 2026-08-28 denial
+            # storm). Rate-limit/connection exhaustion is often short-lived,
+            # so retry the whole chain once after a brief backoff before
+            # degrading to manual approval.
+            if not _aux_failure_is_retryable(first_err):
+                raise
+            logger.info(
+                "Smart approvals: auxiliary chain failed transiently (%s) — "
+                "retrying once after %.1fs backoff",
+                first_err, _SMART_APPROVE_RETRY_BACKOFF_SECONDS,
+            )
+            time.sleep(_SMART_APPROVE_RETRY_BACKOFF_SECONDS)
+            response = _guard_call()
 
         answer = (response.choices[0].message.content or "").strip().upper()
 
@@ -3433,7 +3475,13 @@ def _smart_approve(command: str, description: str) -> str:
             return "escalate"
 
     except Exception as e:
-        logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
+        # Degradation is operator-relevant: every escalate here becomes a
+        # manual prompt (and, unattended, a timeout denial). Warn — a debug
+        # line hid the 2026-08-28 denial storm's root cause.
+        logger.warning(
+            "Smart approvals: auxiliary LLM unavailable (%s) — degrading to "
+            "manual approval for this request", e,
+        )
         return "escalate"
 
 
