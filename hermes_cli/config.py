@@ -1386,7 +1386,7 @@ def _normalize_custom_provider_entry(
         # configs don't warn on every load.
         "provider",
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
-        "key_cmd",
+        "key_cmd", "auth", "no_auth",
         "api_mode", "transport", "model", "default_model", "models",
         "models_discovered",
         "context_length", "rate_limit_delay",
@@ -1466,6 +1466,16 @@ def _normalize_custom_provider_entry(
         normalized["key_env"] = key_env.strip()
         if entry.get("api_key_env") and not entry.get("key_env"):
             normalized["api_key_env"] = key_env.strip()
+
+    # Explicit no-auth marker for local inference hosts (``auth: none`` /
+    # ``no_auth: true``). Passed through verbatim so the auxiliary resolver
+    # can tell an intentionally keyless endpoint from a misconfigured one.
+    auth = entry.get("auth")
+    if isinstance(auth, str) and auth.strip():
+        normalized["auth"] = auth.strip()
+    no_auth = entry.get("no_auth")
+    if no_auth is not None:
+        normalized["no_auth"] = no_auth
 
     api_mode = entry.get("api_mode") or entry.get("transport")
     if isinstance(api_mode, str) and api_mode.strip():

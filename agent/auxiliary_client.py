@@ -6211,6 +6211,25 @@ def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optio
         return model_name
 
 
+def _custom_entry_declares_no_auth(entry: Dict[str, Any]) -> bool:
+    """True when a ``custom_providers`` entry explicitly declares a no-auth endpoint.
+
+    Local inference hosts (mlx/llama.cpp/vLLM on a tailnet box) legitimately
+    have no api_key/key_env/key_cmd. Without an explicit marker we cannot tell
+    "intentionally keyless" apart from "misconfigured", so the resolver warns
+    on every call — pure noise for a local host, and it makes a healthy
+    fallback provider look broken in denial audits. Accepted spellings:
+
+        auth: none          (canonical)
+        no_auth: true       (alias)
+    """
+    auth = str(entry.get("auth", "") or "").strip().lower()
+    if auth in {"none", "no", "off", "false"}:
+        return True
+    no_auth = entry.get("no_auth")
+    return str(no_auth).strip().lower() in {"true", "1", "yes"} if no_auth is not None else False
+
+
 def resolve_provider_client(
     provider: str,
     model: str = None,
@@ -6635,12 +6654,23 @@ def resolve_provider_client(
                 ) or custom_key
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
-                logger.warning(
-                    "resolve_provider_client: named custom provider %r has no resolvable "
-                    "api_key — request will be sent with placeholder no-key-required "
-                    "and will 401 on auth-required endpoints",
-                    custom_entry.get("name") or provider,
-                )
+                if _custom_entry_declares_no_auth(custom_entry):
+                    # Declared no-auth endpoint (auth: none) — the placeholder
+                    # key is intentional, not a misconfiguration. Debug only.
+                    logger.debug(
+                        "resolve_provider_client: named custom provider %r is "
+                        "declared auth:none — using placeholder no-key-required",
+                        custom_entry.get("name") or provider,
+                    )
+                else:
+                    logger.warning(
+                        "resolve_provider_client: named custom provider %r has no resolvable "
+                        "api_key — request will be sent with placeholder no-key-required "
+                        "and will 401 on auth-required endpoints. If this endpoint "
+                        "intentionally has no auth (local inference host), declare "
+                        "`auth: none` on its custom_providers entry to silence this warning.",
+                        custom_entry.get("name") or provider,
+                    )
             # An explicit per-task api_mode override (from _resolve_task_provider_model)
             # wins; otherwise fall back to what the provider entry declared.
             entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()

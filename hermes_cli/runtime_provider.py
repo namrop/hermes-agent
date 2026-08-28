@@ -792,6 +792,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     key_cmd = str(entry.get("key_cmd", "") or "").strip()
                     if key_cmd:
                         result["key_cmd"] = key_cmd
+                    # Explicit no-auth marker (auth: none / no_auth: true) —
+                    # lifted so the auxiliary resolver can tell intentionally
+                    # keyless local endpoints from misconfigured ones.
+                    for _na_key in ("auth", "no_auth"):
+                        if entry.get(_na_key) is not None:
+                            result[_na_key] = entry.get(_na_key)
                     # The v11→v12 migration writes the API mode under the new
                     # ``transport`` field, but hand-edited configs may still
                     # use the legacy ``api_mode`` spelling.  Accept both —
@@ -839,6 +845,11 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             result["key_env"] = key_env
         if provider_key:
             result["provider_key"] = provider_key
+        # Explicit no-auth marker (auth: none / no_auth: true) — see the
+        # providers-dict branch above.
+        for _na_key in ("auth", "no_auth"):
+            if entry.get(_na_key) is not None:
+                result[_na_key] = entry.get(_na_key)
         extra_body = entry.get("extra_body")
         if isinstance(extra_body, dict):
             result["extra_body"] = dict(extra_body)
