@@ -99,11 +99,94 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
 
+# ssh-remote launchctl exemption (2026-08-28 denial audit): launchctl inside
+# an ssh remote-command payload registers the launchd job on the REMOTE macOS
+# host — it cannot touch this process's supervisor, so blocking it was pure
+# false positive (every audited firing). The mask rewrites only the literal
+# word "launchctl" inside the ssh payload span (quoted, unquoted, or heredoc
+# body), so every other branch (systemctl/hermes/pkill) still fires on ssh
+# payloads — a self-ssh systemctl restart stays blocked. Local launchctl —
+# before the ssh word, or after the top-level separator that ends the ssh
+# command — is untouched.
+_SSH_COMMAND_WORD = re.compile(r"(?:^|[\s;&|(`])ssh\s")
+_LAUNCHCTL_WORD = re.compile(r"\blaunchctl\b", re.IGNORECASE)
+_HEREDOC_OPERATOR = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+# Replacement deliberately does NOT contain the substring "launchctl": the
+# lifecycle regex branches are not left-anchored, so a substring-preserving
+# placeholder would still match.
+_SSH_REMOTE_LAUNCHCTL_PLACEHOLDER = "ssh-remote-cmd"
+
+
+def _unquoted_separator_end(line: str, start: int) -> int:
+    """Index of the first top-level ``;``/``&``/``|`` at or after *start*."""
+    quote: Optional[str] = None
+    i = start
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(line):
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "\\" and i + 1 < len(line):
+            i += 2
+            continue
+        elif ch in ";&|":
+            return i
+        i += 1
+    return len(line)
+
+
+def _mask_ssh_remote_launchctl(text: str) -> str:
+    """Neutralize ``launchctl`` words that sit inside ssh remote payloads."""
+    lowered = text.lower()
+    if "ssh" not in lowered or "launchctl" not in lowered:
+        return text
+    lines_out: list[str] = []
+    heredoc_terminator: Optional[str] = None
+    for line in text.splitlines() or [text]:
+        if heredoc_terminator is not None:
+            # Inside the heredoc body feeding ssh's stdin: remote input.
+            if line.strip() == heredoc_terminator:
+                heredoc_terminator = None
+                lines_out.append(line)
+            else:
+                lines_out.append(
+                    _LAUNCHCTL_WORD.sub(_SSH_REMOTE_LAUNCHCTL_PLACEHOLDER, line)
+                )
+            continue
+        rebuilt: list[str] = []
+        pos = 0
+        while True:
+            match = _SSH_COMMAND_WORD.search(line, pos)
+            if match is None:
+                rebuilt.append(line[pos:])
+                break
+            end = _unquoted_separator_end(line, match.end())
+            heredoc = _HEREDOC_OPERATOR.search(line, match.end(), end)
+            if heredoc is not None:
+                heredoc_terminator = heredoc.group(2)
+            rebuilt.append(line[pos:match.end()])
+            rebuilt.append(
+                _LAUNCHCTL_WORD.sub(
+                    _SSH_REMOTE_LAUNCHCTL_PLACEHOLDER, line[match.end():end]
+                )
+            )
+            pos = end
+        lines_out.append("".join(rebuilt))
+    return "\n".join(lines_out)
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    normalized = _mask_ssh_remote_launchctl(
+        _SHELL_LINE_CONTINUATION.sub(" ", text)
+    )
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
 
 
@@ -245,7 +328,11 @@ def contains_launchctl_submit_command(command: str) -> bool:
     register a NEW persistent launchd job (``submit`` jobs get KeepAlive
     semantics; ``bootstrap`` loads an arbitrary plist), which is never safe to
     do from inside the gateway process.
+
+    ssh-wrapped launchctl is exempt (see ``_mask_ssh_remote_launchctl``):
+    the submitted job lands on the REMOTE host's launchd.
     """
+    command = _mask_ssh_remote_launchctl(command.replace("\\\n", ""))
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -346,7 +433,12 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> Optional[str]:
     """
     if not contains_gateway_lifecycle_command(text):
         return None
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    # Mirror contains_gateway_lifecycle_command's normalization (line
+    # continuations + ssh-remote launchctl mask) so the second pass cannot
+    # re-find a match the first pass already exempted.
+    normalized = _mask_ssh_remote_launchctl(
+        _SHELL_LINE_CONTINUATION.sub(" ", text)
+    )
     match = _GATEWAY_LIFECYCLE_PATTERN.search(_mask_data_sink_arguments(normalized))
     if match is None:
         return None
