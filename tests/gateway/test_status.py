@@ -173,6 +173,10 @@ class TestGatewayPidState:
 class TestGatewayRuntimeStatus:
     def test_clear_profile_platforms_preserves_primary_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Pin the boot-configured set: since #607 the startup write also
+        # scrubs plain rows for platforms NOT starting this boot, so this
+        # test's preservation claim now holds for configured platforms only.
+        monkeypatch.setattr(status, "_configured_platform_keys", lambda: {"telegram"})
         (tmp_path / "gateway_state.json").write_text(
             json.dumps({
                 "platforms": {
@@ -195,6 +199,7 @@ class TestGatewayRuntimeStatus:
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_configured_platform_keys", lambda: {"telegram"})
         (tmp_path / "gateway_state.json").write_text(
             json.dumps({
                 "platforms": {
@@ -240,6 +245,7 @@ class TestGatewayRuntimeStatus:
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_configured_platform_keys", lambda: set())
         (tmp_path / "gateway_state.json").write_text(
             json.dumps({"platforms": ["not", "a", "mapping"]}),
             encoding="utf-8",
@@ -248,6 +254,80 @@ class TestGatewayRuntimeStatus:
         status.write_runtime_status(clear_profile_platforms=True)
 
         assert status.read_runtime_status()["platforms"] == {}
+
+    def test_startup_scrub_removes_platform_rows_not_starting_this_boot(
+        self, tmp_path, monkeypatch
+    ):
+        """Vikunja #607: dead platform rows must not survive a fresh boot.
+
+        feishu reported state=connected frozen at 2026-05-19 with no env vars
+        and no adapter process — the persisted row simply never expired.  The
+        startup write (clear_profile_platforms=True is only passed by the
+        fresh-process boot write) now REMOVES plain rows whose platform is not
+        among the platforms configured to start this boot.  Removal rather
+        than marking: a marked row's timestamp only refreshes at boot, so it
+        would re-trip dashboard staleness pills after >24h of gateway uptime.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_configured_platform_keys", lambda: {"telegram"})
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({
+                "platforms": {
+                    "feishu": {"state": "connected", "updated_at": "2026-05-19T00:00:00+00:00"},
+                    "telegram": {"state": "connected"},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(gateway_state="starting", clear_profile_platforms=True)
+
+        platforms = status.read_runtime_status()["platforms"]
+        assert "feishu" not in platforms
+        assert platforms["telegram"] == {"state": "connected"}
+
+    def test_startup_scrub_skips_when_config_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        """Config-resolution failure must fail open (rows preserved)."""
+        import gateway.config as gateway_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        def _boom():
+            raise RuntimeError("config unavailable")
+
+        monkeypatch.setattr(gateway_config, "load_gateway_config", _boom)
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({"platforms": {"feishu": {"state": "connected"}}}),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(clear_profile_platforms=True)
+
+        platforms = status.read_runtime_status()["platforms"]
+        assert platforms["feishu"] == {"state": "connected"}
+
+    def test_startup_scrub_only_runs_on_the_boot_write(
+        self, tmp_path, monkeypatch
+    ):
+        """Ordinary per-platform writes never scrub (and never load config)."""
+        monkeypatch.setattr(
+            status,
+            "_configured_platform_keys",
+            lambda: (_ for _ in ()).throw(AssertionError("scrub ran outside boot write")),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({"platforms": {"feishu": {"state": "connected"}}}),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(platform="telegram", platform_state="connected")
+
+        platforms = status.read_runtime_status()["platforms"]
+        assert platforms["feishu"] == {"state": "connected"}
+        assert platforms["telegram"]["state"] == "connected"
 
 
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):

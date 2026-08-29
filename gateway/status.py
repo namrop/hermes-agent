@@ -1059,6 +1059,25 @@ def write_pid_file() -> None:
         raise
 
 
+def _configured_platform_keys() -> Optional[set]:
+    """Platform keys (``Platform.value`` strings) enabled+configured this boot.
+
+    Used by the startup scrub in :func:`write_runtime_status` to decide which
+    persisted plain platform rows belong to this gateway process.  Returns
+    ``None`` when the gateway config cannot be resolved — callers must treat
+    that as "unknown" and skip the scrub (fail open: preserving a stale row
+    beats deleting a live one on a transient config error).
+    """
+    try:
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+        return {p.value for p in config.get_connected_platforms()}
+    except Exception:
+        logger.debug("configured-platform resolution failed; skipping scrub", exc_info=True)
+        return None
+
+
 def write_runtime_status(
     *,
     gateway_state: Any = _UNSET,
@@ -1094,6 +1113,25 @@ def write_runtime_status(
             for key, value in platforms.items()
             if not isinstance(key, str) or ":" not in key
         }
+        # Startup scrub for plain (primary-profile) rows: drop entries for
+        # platforms that are NOT among the platforms starting this boot
+        # (Vikunja #607 — feishu reported "connected" frozen at 2026-05-19
+        # long after its env vars and adapter were gone).  Removal, not
+        # marking: a marked row's ``updated_at`` only refreshes at boot, so
+        # any gateway uptime past the dashboard's staleness window would
+        # re-trip the stale pill — an absent row is the only shape that
+        # reads as definitively not-running.  Rows for platforms that ARE
+        # configured are deliberately preserved (last-known state while
+        # adapters reconnect); a removed-but-live row self-heals seconds
+        # later when its adapter writes "connected".  Config-resolution
+        # failure skips the scrub entirely (fail open).
+        configured = _configured_platform_keys()
+        if configured is not None:
+            payload["platforms"] = {
+                key: value
+                for key, value in payload["platforms"].items()
+                if not isinstance(key, str) or key in configured
+            }
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
