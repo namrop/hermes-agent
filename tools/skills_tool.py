@@ -836,13 +836,55 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         except Exception:
             logger.debug("Plugin skill listing failed", exc_info=True)
 
+        # Background-curation candidate pre-filter: the autonomous review /
+        # curator fork may only WRITE curator-managed skills — skill_manage's
+        # ownership guard refuses everything else (user-owned created_by=None,
+        # bundled, hub, external). Listing those skills to the review LLM only
+        # invites it to target them and grind out policy refusals (~130
+        # identical "not curator-managed" refusals in one 4-day denial window,
+        # e.g. repeated attempts on a user-owned skill). Exclude them from the
+        # candidate list BEFORE the LLM sees it. This filters DISCOVERY for
+        # the autonomous pass only — the ownership policy itself is unchanged,
+        # foreground listings are unchanged, and skill_view (reads) is
+        # unchanged.
+        hidden_unmanaged = 0
+        try:
+            from tools.skill_provenance import is_background_review
+            if is_background_review() and all_skills:
+                from tools import skill_usage
+                usage_data = skill_usage.load_usage()
+                managed = [
+                    s for s in all_skills
+                    if skill_usage._is_curator_managed_record(
+                        usage_data.get(s.get("name"))
+                    )
+                ]
+                hidden_unmanaged = len(all_skills) - len(managed)
+                all_skills = managed
+        except Exception:
+            logger.debug(
+                "background-review skills_list candidate pre-filter failed; "
+                "returning unfiltered list",
+                exc_info=True,
+            )
+
         if not all_skills:
+            if hidden_unmanaged:
+                message = (
+                    f"No curator-managed skills to list. {hidden_unmanaged} "
+                    "skill(s) exist but are hidden from this autonomous "
+                    "review pass because they are not curator-managed "
+                    "(user-owned, bundled, hub-installed, or plugin skills "
+                    "are not curation candidates)."
+                )
+            else:
+                message = "No skills found in skills/ directory."
             return json.dumps(
                 {
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": "No skills found in skills/ directory.",
+                    "message": message,
                 },
                 ensure_ascii=False,
             )
@@ -859,16 +901,21 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             {s.get("category") for s in all_skills if s.get("category")}
         )
 
-        return json.dumps(
-            {
-                "success": True,
-                "skills": all_skills,
-                "categories": categories,
-                "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
-            },
-            ensure_ascii=False,
-        )
+        payload = {
+            "success": True,
+            "skills": all_skills,
+            "categories": categories,
+            "count": len(all_skills),
+            "hint": "Use skill_view(name) to see full content, tags, and linked files",
+        }
+        if hidden_unmanaged:
+            payload["note"] = (
+                f"{hidden_unmanaged} skill(s) hidden from this autonomous "
+                "review pass: not curator-managed (user-owned, bundled, "
+                "hub-installed, or plugin) — they are not curation "
+                "candidates and writes to them would be refused."
+            )
+        return json.dumps(payload, ensure_ascii=False)
 
     except Exception as e:
         return tool_error(str(e), success=False)

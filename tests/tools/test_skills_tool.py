@@ -296,6 +296,59 @@ class TestSkillsList:
         assert result["skills"][0]["name"] == "knowledge-brain"
 
 
+
+class TestSkillsListBackgroundReviewPreFilter:
+    """Autonomous review/curator passes must not be offered skills they are
+    forbidden to write. skill_manage refuses non-curator-managed skills by
+    policy; listing them to the review LLM anyway produced ~130 identical
+    ownership refusals in one 4-day denial window (repeated targeting of a
+    user-owned skill). The candidate list is filtered BEFORE the LLM sees it;
+    the ownership policy itself is unchanged."""
+
+    @staticmethod
+    def _usage():
+        # 'managed-skill' is curator-managed; 'external-link-intake' is the
+        # user-owned created_by=None shape from the denial audit.
+        return {
+            "managed-skill": {"created_by": "agent"},
+            "external-link-intake": {"created_by": None},
+        }
+
+    def test_unmanaged_skills_hidden_from_background_review(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), \
+             patch("tools.skill_usage.load_usage", return_value=self._usage()), \
+             patch("tools.skill_provenance.is_background_review", return_value=True):
+            _make_skill(tmp_path, "managed-skill")
+            _make_skill(tmp_path, "external-link-intake")
+            result = json.loads(skills_list())
+
+        assert result["success"] is True
+        assert [s["name"] for s in result["skills"]] == ["managed-skill"]
+        assert result["count"] == 1
+        assert "1 skill(s) hidden" in result.get("note", "")
+
+    def test_foreground_listing_is_unfiltered(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), \
+             patch("tools.skill_usage.load_usage", return_value=self._usage()):
+            _make_skill(tmp_path, "managed-skill")
+            _make_skill(tmp_path, "external-link-intake")
+            result = json.loads(skills_list())
+
+        assert result["count"] == 2
+        assert "note" not in result
+
+    def test_all_unmanaged_yields_empty_list_with_explanation(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), \
+             patch("tools.skill_usage.load_usage", return_value=self._usage()), \
+             patch("tools.skill_provenance.is_background_review", return_value=True):
+            _make_skill(tmp_path, "external-link-intake")
+            result = json.loads(skills_list())
+
+        assert result["success"] is True
+        assert result["skills"] == []
+        assert "not curator-managed" in result["message"]
+
+
 # ---------------------------------------------------------------------------
 # skill_view
 # ---------------------------------------------------------------------------
