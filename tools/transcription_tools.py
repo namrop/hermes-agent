@@ -125,7 +125,7 @@ ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elev
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".oga", ".opus", ".aac", ".flac", ".caf"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB — DEFAULT remote-upload cap; see stt.max_upload_mb
 
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"}
@@ -1517,17 +1517,39 @@ def _apply_pre_transcription_hook(
 # ---------------------------------------------------------------------------
 
 
+def _get_stt_max_upload_bytes(stt_config: Optional[Dict[str, Any]] = None) -> int:
+    """Resolve the remote-STT upload cap in bytes.
+
+    ``stt.max_upload_mb`` in config.yaml (default 25 — OpenAI's cloud limit).
+    Self-hosted OpenAI-compatible gateways routinely accept far larger bodies:
+    on 2026-08-28 an 80-minute 28.8MB voice memo was rejected client-side by
+    the hardcoded constant for 32 hours of hourly retries while the local
+    gateway accepted the same upload without complaint. Raise the cap
+    per-deployment in config instead of editing code.
+    """
+    if stt_config is None:
+        stt_config = _load_stt_config()
+    cfg = stt_config if isinstance(stt_config, dict) else {}
+    mb = _coerce_positive_int(cfg.get("max_upload_mb"), MAX_FILE_SIZE // (1024 * 1024))
+    return mb * 1024 * 1024
+
+
 def _validate_audio_file_size(audio_path: Path) -> Optional[Dict[str, Any]]:
     """Return an error when *audio_path* exceeds the remote upload cap."""
     try:
         file_size = audio_path.stat().st_size
     except OSError as e:
         return {"success": False, "transcript": "", "error": f"Failed to access file: {e}"}
-    if file_size > MAX_FILE_SIZE:
+    max_bytes = _get_stt_max_upload_bytes()
+    if file_size > max_bytes:
         return {
             "success": False,
             "transcript": "",
-            "error": f"File too large: {file_size / (1024*1024):.1f}MB (max {MAX_FILE_SIZE / (1024*1024):.0f}MB)",
+            "error": (
+                f"File too large: {file_size / (1024*1024):.1f}MB "
+                f"(max {max_bytes / (1024*1024):.0f}MB; raise stt.max_upload_mb in config.yaml "
+                "if your STT endpoint accepts larger uploads)"
+            ),
         }
     return None
 
