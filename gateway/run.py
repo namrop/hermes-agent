@@ -5484,6 +5484,7 @@ class TurnRunner:
             ctx.source.chat_id or "",
             thread_id=getattr(ctx.source, "thread_id", None),
             parent_id=getattr(ctx.source, "parent_chat_id", None),
+            session_key=ctx.session_key,
         )
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
@@ -9484,19 +9485,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         thread_id: Optional[str] = None,
         parent_id: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> str:
-        """Ephemeral system prompt for this channel/thread.
+        """Ephemeral system prompt for this channel/thread/session.
 
-        Uses ``channel_overrides`` when set, else the global gateway prompt.
-        Within an override, ``personality`` (a name from the shared registry)
-        outranks ``system_prompt`` — mirroring the global contract where
-        ``display.personality`` outranks ``agent.system_prompt``. A neutral
-        personality name (none/default/neutral) opts the channel out of the
-        global overlay; an unknown name fails open to ``system_prompt``.
-        Legacy ``channel_prompts`` are applied separately via ``event.channel_prompt``
-        in ``run_sync`` (adapter ``resolve_channel_prompt``), so they are not
-        duplicated here.
+        Resolution ladder (first hit wins):
+
+        1. ``/personality <name> --once`` — one-shot, popped here.
+        2. ``/personality <name>`` — session-scoped override (a live keeper
+           command outranks a compiled binding). The "none" sentinel pins
+           the session neutral: no persona AND no global overlay.
+        3. ``channel_overrides`` — compiled channel/thread binding. Within
+           an override, ``personality`` outranks ``system_prompt``; a
+           neutral name opts the channel out of the global overlay; an
+           unknown name fails open to ``system_prompt``.
+        4. The gateway-global overlay (``display.personality`` /
+           ``agent.system_prompt``).
+
+        Session layers resolve only when ``session_key`` is provided (a
+        real gateway turn). Every resolution with a session_key is appended
+        to the overlay ledger (logs/personality_overlay.jsonl) — per-turn
+        provenance of which overlay was live and which layer won.
+        Legacy ``channel_prompts`` are applied separately via
+        ``event.channel_prompt`` in ``run_sync``, so not duplicated here.
         """
+        # Layers 1+2: session-scoped selections.
+        if session_key:
+            state = self._session_state(session_key)
+            once = state.conversation.personality_once
+            if once is not None:
+                state.conversation.personality_once = None  # consumed
+                resolved = _resolve_override_personality(once)
+                if resolved is not None:
+                    self._log_overlay_resolution(
+                        session_key, platform, chat_id, thread_id,
+                        name=once, scope="once",
+                    )
+                    return resolved
+                # Unknown name (e.g. persona removed since selection):
+                # fail open to the next layer.
+
+            session_name = state.conversation.personality_override
+            if session_name is None:
+                # Rehydrate the persisted override after a restart. Every
+                # non-once write mirrors memory<->store, so an empty store
+                # read is authoritative ("no override"), not a miss.
+                session_name = self._rehydrate_session_personality_override(
+                    session_key
+                )
+            if session_name is not None:
+                resolved = _resolve_override_personality(session_name)
+                if resolved is not None:
+                    self._log_overlay_resolution(
+                        session_key, platform, chat_id, thread_id,
+                        name=session_name,
+                        scope="session-neutral" if resolved == "" else "session",
+                    )
+                    return resolved
+                # Unknown persisted name — fail open, log once per name via
+                # _resolve_override_personality's warning.
+
+        # Layer 3: compiled channel/thread binding.
         config = getattr(self, "config", None)
         if config:
             override = _get_channel_override(
@@ -9510,15 +9559,113 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if override.personality is not None:
                     resolved = _resolve_override_personality(override.personality)
                     if resolved:
+                        self._log_overlay_resolution(
+                            session_key, platform, chat_id, thread_id,
+                            name=override.personality, scope="channel",
+                        )
                         return resolved
                     if resolved == "":
                         # Explicit neutral: system_prompt (if any) still
                         # applies, but the global overlay does not.
+                        self._log_overlay_resolution(
+                            session_key, platform, chat_id, thread_id,
+                            name=override.personality, scope="channel-neutral",
+                        )
                         return (override.system_prompt or "").strip()
                     # resolved is None — unknown name, fail open below.
                 if override.system_prompt:
+                    self._log_overlay_resolution(
+                        session_key, platform, chat_id, thread_id,
+                        name=None, scope="channel-system-prompt",
+                    )
                     return (override.system_prompt or "").strip()
+        # Layer 4: gateway-global overlay.
+        self._log_overlay_resolution(
+            session_key, platform, chat_id, thread_id,
+            name=self._active_global_personality_name(), scope="global",
+        )
         return getattr(self, "_ephemeral_system_prompt", None) or ""
+
+    def _rehydrate_session_personality_override(
+        self, session_key: str
+    ) -> Optional[str]:
+        """Read the persisted /personality override into SessionState.
+
+        Mirrors ``_rehydrate_session_model_override``: in-memory state wins;
+        the store is only consulted when memory holds nothing (fresh
+        process). Returns the rehydrated name, or None.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None
+        try:
+            persisted = store.get_personality_override(session_key)
+        except Exception:
+            logger.debug(
+                "Failed to read persisted session personality override",
+                exc_info=True,
+            )
+            return None
+        if persisted:
+            self._session_state(session_key).conversation.personality_override = (
+                persisted
+            )
+        return persisted or None
+
+    def _active_global_personality_name(self) -> Optional[str]:
+        """Best-effort name of the active gateway-global personality.
+
+        Reads the mtime-cached config; returns None when the global overlay
+        comes from ``agent.system_prompt`` (no personality selected) or the
+        config is unreadable. Used for overlay-ledger provenance only.
+        """
+        try:
+            from hermes_cli.personality import active_personality_name
+
+            return active_personality_name(_load_gateway_config()) or None
+        except Exception:
+            return None
+
+    def _log_overlay_resolution(
+        self,
+        session_key: Optional[str],
+        platform: Platform,
+        chat_id: str,
+        thread_id: Optional[str],
+        *,
+        name: Optional[str],
+        scope: str,
+    ) -> None:
+        """Append one overlay-resolution record to the provenance ledger.
+
+        One JSONL line per gateway turn (skipped when no session_key — CLI
+        probes and tests don't pollute the ledger). The ledger exists
+        because the ephemeral overlay is never persisted to transcripts:
+        without it, no historical turn can prove which persona was live
+        (persona-binding falsifiability gap, canon note
+        persona_binding_probe_dependence_working_hypothesis_2026-08-29).
+        Failures are swallowed — provenance must never break a turn.
+        """
+        if not session_key:
+            return
+        try:
+            import json as _json
+
+            path = _hermes_home / "logs" / "personality_overlay.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": time.time(),
+                "session_key": session_key,
+                "platform": getattr(platform, "value", str(platform)),
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "personality": name,
+                "scope": scope,
+            }
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(record) + "\n")
+        except Exception:
+            logger.debug("Overlay ledger write failed", exc_info=True)
 
     @staticmethod
     def _load_reasoning_config(model: str = "") -> dict | None:

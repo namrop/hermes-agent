@@ -2573,12 +2573,26 @@ class GatewaySlashCommandsMixin:
         return f"{prefix} {result.message}"
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
-        """Handle /personality command - list or set a personality.
+        """Handle /personality — scoped personality selection.
 
-        All resolution/persistence goes through hermes_cli.personality —
-        the single owner of personality state on every surface.
+        Grammar (mirrors /model's scope flags):
+          /personality                     — list + resolution for THIS thread
+          /personality <name>              — this session/thread only (default)
+          /personality <name> --once       — next turn only
+          /personality <name> --global     — gateway-wide, persisted to config
+          /personality none                — pin THIS session neutral (no overlay,
+                                             suppresses channel binding + global)
+          /personality clear               — remove the session override (fall
+                                             back to channel binding / global)
+          /personality none --global       — legacy global clear
+
+        Name resolution/persistence stays with hermes_cli.personality (the
+        single owner of personality state); this handler owns scope only.
         """
-        from gateway.run import _load_gateway_config
+        from gateway.run import (
+            _get_channel_override,
+            _load_gateway_config,
+        )
         from hermes_cli.personality import (
             active_personality_name,
             available_personalities,
@@ -2588,7 +2602,8 @@ class GatewaySlashCommandsMixin:
             resolve_personality,
         )
 
-        args = event.get_command_args().strip()
+        raw_args = event.get_command_args().strip()
+        source = event.source
 
         try:
             config = _load_gateway_config()
@@ -2596,12 +2611,74 @@ class GatewaySlashCommandsMixin:
             config = {}
         personalities = available_personalities(config)
 
-        if not args:
-            current = active_personality_name(config)
-            lines = [t("gateway.personality.header")]
+        # Session key — same normalization as a message turn so the
+        # override lands under the key the next turn reads (the /model
+        # precedent, #30479).
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, source
+        )
+        session_key = self._session_key_for_source(source)
+        state = self._session_state(session_key)
+
+        # ------ parse: flags + name word ------
+        tokens = raw_args.split()
+        is_once = "--once" in tokens
+        is_global = "--global" in tokens
+        is_session_flag = "--session" in tokens
+        words = [w for w in tokens if not w.startswith("--")]
+        if sum([is_once, is_global, is_session_flag]) > 1:
+            return "❌ Pick one scope: `--once`, `--session` (default), or `--global`."
+        if len(words) > 1:
+            return "❌ One personality name at a time."
+        name_word = words[0].strip().lower() if words else ""
+
+        # ------ no args: listing + this thread's resolution ------
+        if not name_word and not (is_once or is_global or is_session_flag):
+            lines = []
+            once_pending = state.conversation.personality_once
+            session_name = (
+                state.conversation.personality_override
+                or self._rehydrate_session_personality_override(session_key)
+            )
+            override = None
+            cfg_obj = getattr(self, "config", None)
+            if cfg_obj is not None:
+                override = _get_channel_override(
+                    cfg_obj,
+                    source.platform,
+                    source.chat_id or "",
+                    thread_id=getattr(source, "thread_id", None),
+                    parent_id=getattr(source, "parent_chat_id", None),
+                )
+            channel_name = override.personality if override is not None else None
+            global_name = active_personality_name(config)
+
+            if once_pending:
+                winning = (once_pending, "next turn only")
+            elif session_name == "none":
+                winning = ("neutral (pinned)", "this session")
+            elif session_name:
+                winning = (session_name, "this session")
+            elif channel_name:
+                winning = (channel_name, "channel binding")
+            elif global_name:
+                winning = (global_name, "global default")
+            else:
+                winning = ("neutral", "no overlay configured")
+            lines.append(f"**Active here: `{winning[0]}` ({winning[1]})**")
+            lines.append(
+                "Layers — once: {} · session: {} · channel: {} · global: {}".format(
+                    f"`{once_pending}`" if once_pending else "—",
+                    f"`{session_name}`" if session_name else "—",
+                    f"`{channel_name}`" if channel_name else "—",
+                    f"`{global_name}`" if global_name else "—",
+                )
+            )
+            lines.append("")
+            lines.append(t("gateway.personality.header"))
             lines.append(t("gateway.personality.none_option"))
             for name, prompt in personalities.items():
-                marker = " ✓" if name == current else ""
+                marker = " ✓" if name == winning[0] else ""
                 lines.append(
                     t(
                         "gateway.personality.item",
@@ -2609,29 +2686,101 @@ class GatewaySlashCommandsMixin:
                         preview=describe_personality(prompt),
                     )
                 )
-            lines.append(t("gateway.personality.usage"))
+            lines.append(
+                "Usage: `/personality <name>` (this thread) · `--once` "
+                "(next turn) · `--global` (everywhere) · `none` (pin this "
+                "thread neutral) · `clear` (drop thread override)"
+            )
             return "\n".join(lines)
 
-        try:
-            name, new_prompt = resolve_personality(args, config)
-        except ValueError:
-            available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
-            return t("gateway.personality.unknown", name=args.lower(), available=available)
-
-        # Persist the selection only — hermes_cli.personality never writes
-        # agent.system_prompt (user-owned manual overlay).
-        if not persist_personality(name):
-            return t("gateway.personality.save_failed", error="config write failed")
-
-        if not name:
-            self._ephemeral_system_prompt = prompt_text(
-                cfg_get(config, "agent", "system_prompt", default="")
+        # ------ clear: remove the session override ------
+        if name_word in {"clear", "default"} and not is_global:
+            state.conversation.personality_override = None
+            state.conversation.personality_once = None
+            try:
+                await self.async_session_store.set_personality_override(
+                    session_key, None
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to clear persisted personality override",
+                    exc_info=True,
+                )
+            return (
+                "🎭 Session personality override cleared — this thread falls "
+                "back to its channel binding / global default."
             )
-            return t("gateway.personality.cleared")
 
-        # Update in-memory so it takes effect on the very next message.
-        self._ephemeral_system_prompt = new_prompt
-        return t("gateway.personality.set_to", name=name)
+        # ------ neutral sentinel ------
+        is_neutral = name_word in {"none", "neutral"} or (
+            name_word == "default" and is_global
+        )
+
+        # ------ validate a real persona name ------
+        new_prompt = None
+        if not is_neutral:
+            try:
+                name_word, new_prompt = resolve_personality(name_word, config)
+            except ValueError:
+                available = "`none`, " + ", ".join(
+                    f"`{n}`" for n in personalities
+                )
+                return t(
+                    "gateway.personality.unknown",
+                    name=name_word,
+                    available=available,
+                )
+
+        # ------ global scope (legacy behavior, now explicit) ------
+        if is_global:
+            if not persist_personality("" if is_neutral else name_word):
+                return t(
+                    "gateway.personality.save_failed",
+                    error="config write failed",
+                )
+            if is_neutral:
+                self._ephemeral_system_prompt = prompt_text(
+                    cfg_get(config, "agent", "system_prompt", default="")
+                )
+                return t("gateway.personality.cleared")
+            self._ephemeral_system_prompt = new_prompt
+            return (
+                f"🎭 Personality set to **{name_word}** gateway-wide "
+                "(sessions with their own override or channel binding keep "
+                "theirs)."
+            )
+
+        # ------ once scope ------
+        if is_once:
+            state.conversation.personality_once = (
+                "none" if is_neutral else name_word
+            )
+            label = "neutral" if is_neutral else f"**{name_word}**"
+            return f"🎭 Next turn only: {label}. After that this thread falls back."
+
+        # ------ session scope (the new default) ------
+        stored = "none" if is_neutral else name_word
+        state.conversation.personality_override = stored
+        state.conversation.personality_once = None
+        try:
+            await self.async_session_store.set_personality_override(
+                session_key, stored
+            )
+        except Exception:
+            logger.debug(
+                "Failed to persist session personality override", exc_info=True
+            )
+        if is_neutral:
+            return (
+                "🎭 This thread pinned **neutral** — no persona overlay here "
+                "(channel binding and global default suppressed). "
+                "`/personality clear` to unpin."
+            )
+        return (
+            f"🎭 Personality for **this thread**: **{name_word}** "
+            "(survives restarts, ends with the conversation). "
+            "`--global` to set it everywhere."
+        )
 
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""

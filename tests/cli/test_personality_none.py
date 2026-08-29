@@ -105,7 +105,32 @@ class TestGatewayPersonalityNone:
         )
 
     @pytest.mark.asyncio
-    async def test_default_clears_ephemeral_prompt(self, tmp_path):
+    async def test_default_global_clears_ephemeral_prompt(self, tmp_path):
+        # Scope grammar (2026-08-29): global clear now requires --global;
+        # a bare `default` is session-scoped and leaves config untouched.
+        runner = self._make_runner()
+        config_data = {
+            "agent": {
+                "system_prompt": "manual forever",
+                "personalities": {"helpful": "You are helpful."},
+            },
+            "display": {"personality": "helpful"},
+        }
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump(config_data))
+
+        p1, p2 = self._gateway_env(tmp_path)
+        with p1, p2:
+            event = self._make_event("default --global")
+            result = await runner._handle_personality_command(event)
+
+        saved = yaml.safe_load(config_file.read_text())
+        assert saved["agent"]["system_prompt"] == "manual forever"
+        assert saved.get("display", {}).get("personality", None) == ""
+        assert runner._ephemeral_system_prompt == "manual forever"
+
+    @pytest.mark.asyncio
+    async def test_bare_default_is_session_scoped_config_untouched(self, tmp_path):
         runner = self._make_runner()
         config_data = {
             "agent": {
@@ -123,12 +148,38 @@ class TestGatewayPersonalityNone:
             result = await runner._handle_personality_command(event)
 
         saved = yaml.safe_load(config_file.read_text())
-        assert saved["agent"]["system_prompt"] == "manual forever"
-        assert saved.get("display", {}).get("personality", None) == ""
-        assert runner._ephemeral_system_prompt == "manual forever"
+        # Global slot untouched; the global overlay text is also untouched.
+        assert saved["display"]["personality"] == "helpful"
+        assert runner._ephemeral_system_prompt == "You are kawaii~"
+        assert "session" in result.lower() or "thread" in result.lower()
 
     @pytest.mark.asyncio
     async def test_set_persists_display_personality_not_system_prompt(self, tmp_path):
+        runner = self._make_runner()
+        config_data = {
+            "agent": {
+                "system_prompt": "manual forever",
+                "personalities": {"helpful": "You are helpful."},
+            }
+        }
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump(config_data))
+
+        p1, p2 = self._gateway_env(tmp_path)
+        with p1, p2:
+            # Scope grammar (2026-08-29): global persistence requires --global.
+            event = self._make_event("helpful --global")
+            result = await runner._handle_personality_command(event)
+
+        saved = yaml.safe_load(config_file.read_text())
+        assert saved["agent"]["system_prompt"] == "manual forever"
+        assert saved["display"]["personality"] == "helpful"
+        assert runner._ephemeral_system_prompt == "You are helpful."
+        assert "helpful" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_bare_set_is_session_scoped(self, tmp_path):
+        """Bare `/personality <name>` stores a session override, not config."""
         runner = self._make_runner()
         config_data = {
             "agent": {
@@ -145,10 +196,56 @@ class TestGatewayPersonalityNone:
             result = await runner._handle_personality_command(event)
 
         saved = yaml.safe_load(config_file.read_text())
-        assert saved["agent"]["system_prompt"] == "manual forever"
-        assert saved["display"]["personality"] == "helpful"
-        assert runner._ephemeral_system_prompt == "You are helpful."
-        assert "helpful" in result.lower()
+        assert saved.get("display", {}).get("personality") is None
+        # Global overlay untouched; session override recorded in state.
+        assert runner._ephemeral_system_prompt == "You are kawaii~"
+        session_key = runner._session_key_for_source(
+            runner._normalize_source_for_session_key(event.source)
+        )
+        state = runner._session_state(session_key)
+        assert state.conversation.personality_override == "helpful"
+        assert "thread" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_once_sets_one_shot_only(self, tmp_path):
+        runner = self._make_runner()
+        (tmp_path / "config.yaml").write_text(
+            yaml.dump({"agent": {"personalities": {"helpful": "You are helpful."}}})
+        )
+        p1, p2 = self._gateway_env(tmp_path)
+        with p1, p2:
+            event = self._make_event("helpful --once")
+            result = await runner._handle_personality_command(event)
+        session_key = runner._session_key_for_source(
+            runner._normalize_source_for_session_key(event.source)
+        )
+        state = runner._session_state(session_key)
+        assert state.conversation.personality_once == "helpful"
+        assert state.conversation.personality_override is None
+        assert "next turn" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_session_none_pins_neutral_and_clear_unpins(self, tmp_path):
+        runner = self._make_runner()
+        (tmp_path / "config.yaml").write_text(
+            yaml.dump({"agent": {"personalities": {"helpful": "You are helpful."}}})
+        )
+        p1, p2 = self._gateway_env(tmp_path)
+        with p1, p2:
+            event = self._make_event("none")
+            result = await runner._handle_personality_command(event)
+            session_key = runner._session_key_for_source(
+                runner._normalize_source_for_session_key(event.source)
+            )
+            state = runner._session_state(session_key)
+            assert state.conversation.personality_override == "none"
+            assert "neutral" in result.lower()
+
+            event2 = self._make_event("clear")
+            event2.source = event.source  # same thread
+            result = await runner._handle_personality_command(event2)
+            assert state.conversation.personality_override is None
+            assert "cleared" in result.lower()
 
     @pytest.mark.asyncio
     async def test_unknown_shows_none_in_available(self, tmp_path):

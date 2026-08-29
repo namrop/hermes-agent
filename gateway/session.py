@@ -871,6 +871,13 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Session-scoped /personality override: a persona name from the shared
+    # registry, or the "none" sentinel (pinned neutral).  Mirrors
+    # ``model_override``'s restart story: the in-memory SessionState field
+    # is rehydrated from this on first use after a gateway restart.  A
+    # ``--once`` selection is never written here.
+    personality_override: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -914,6 +921,8 @@ class SessionEntry:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.personality_override:
+            result["personality_override"] = self.personality_override
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -1003,6 +1012,11 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
+            personality_override=(
+                str(data["personality_override"]).strip().lower() or None
+                if data.get("personality_override")
+                else None
+            ),
         )
 
 
@@ -2295,6 +2309,8 @@ class SessionStore:
                 # persisted /model override too so a later message doesn't
                 # rehydrate it after the in-memory override was popped.
                 entry.model_override = None
+                # Same boundary contract for the /personality override.
+                entry.personality_override = None
             self._save()
         if self._db:
             setter = getattr(self._db, "set_expiry_finalized", None)
@@ -3112,6 +3128,36 @@ class SessionStore:
             if entry is None:
                 return None
             return dict(entry.model_override) if entry.model_override else None
+
+    def set_personality_override(
+        self, session_key: str, name: Optional[str]
+    ) -> None:
+        """Persist (or clear) the session-scoped /personality override.
+
+        ``name`` is a persona name from the shared registry or the "none"
+        sentinel (pinned neutral).  Pass ``None`` to clear (fall back to
+        channel binding / global default).  ``--once`` selections must not
+        be written here — a one-shot never survives a restart.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            cleaned = str(name).strip().lower() if name else None
+            if entry.personality_override == cleaned:
+                return
+            entry.personality_override = cleaned
+            self._save()
+
+    def get_personality_override(self, session_key: str) -> Optional[str]:
+        """Return the persisted /personality override for *session_key*."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            return entry.personality_override or None
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.

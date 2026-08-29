@@ -160,3 +160,117 @@ class TestResolveOverridePersonality:
     def test_neutral_spellings_return_empty_string(self):
         for name in ("none", "default", "neutral", "", "  None  "):
             assert _resolve_override_personality(name) == ""
+
+
+class TestSessionScopeLadder:
+    """Resolution ladder (2026-08-29 scope grammar): once > session >
+    channel binding > global. Session layers require a session_key."""
+
+    def _runner(self, override=None, tmp_path=None):
+        runner = _runner_with_override(
+            override or ChannelOverride(personality="pirate")
+        )
+        runner.session_store = None  # no durable store in these tests
+        return runner
+
+    def test_session_override_beats_channel_binding(self, tmp_path):
+        runner = self._runner()
+        cfg = {"agent": {"personalities": {"skippy": "SKIPPY TEXT"}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=cfg),
+            patch("gateway.run._hermes_home", tmp_path),
+        ):
+            key = "agent:test:discord:thread:1:1"
+            runner._session_state(key).conversation.personality_override = "skippy"
+            prompt = runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_1", session_key=key
+            )
+        assert prompt == "SKIPPY TEXT"
+
+    def test_once_beats_session_and_is_consumed(self, tmp_path):
+        runner = self._runner()
+        cfg = {
+            "agent": {
+                "personalities": {"skippy": "SKIPPY TEXT", "data": "DATA TEXT"}
+            }
+        }
+        with (
+            patch("gateway.run._load_gateway_config", return_value=cfg),
+            patch("gateway.run._hermes_home", tmp_path),
+        ):
+            key = "agent:test:discord:thread:2:2"
+            state = runner._session_state(key)
+            state.conversation.personality_override = "skippy"
+            state.conversation.personality_once = "data"
+            first = runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_1", session_key=key
+            )
+            second = runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_1", session_key=key
+            )
+        assert first == "DATA TEXT"
+        assert second == "SKIPPY TEXT"  # once consumed, session wins again
+
+    def test_session_none_pins_neutral_over_channel_and_global(self, tmp_path):
+        runner = self._runner()
+        with (
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("gateway.run._hermes_home", tmp_path),
+        ):
+            key = "agent:test:discord:thread:3:3"
+            runner._session_state(key).conversation.personality_override = "none"
+            prompt = runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_1", session_key=key
+            )
+        assert prompt == ""
+
+    def test_no_session_key_preserves_channel_then_global(self, tmp_path):
+        runner = self._runner()
+        with (
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("gateway.run._hermes_home", tmp_path),
+        ):
+            prompt = runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_1"
+            )
+            unbound = runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_other"
+            )
+        assert "buccaneer" in prompt
+        assert unbound == "Global prompt"
+
+    def test_overlay_ledger_written_per_turn(self, tmp_path):
+        import json
+
+        runner = self._runner()
+        cfg = {"agent": {"personalities": {"skippy": "SKIPPY TEXT"}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=cfg),
+            patch("gateway.run._hermes_home", tmp_path),
+        ):
+            key = "agent:test:discord:thread:4:4"
+            runner._session_state(key).conversation.personality_override = "skippy"
+            runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_1", session_key=key
+            )
+        ledger = tmp_path / "logs" / "personality_overlay.jsonl"
+        assert ledger.exists()
+        rec = json.loads(ledger.read_text().strip().splitlines()[-1])
+        assert rec["personality"] == "skippy"
+        assert rec["scope"] == "session"
+        assert rec["session_key"] == key
+
+    def test_unknown_session_name_fails_open_to_channel(self, tmp_path):
+        runner = self._runner()
+        with (
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("gateway.run._hermes_home", tmp_path),
+        ):
+            key = "agent:test:discord:thread:5:5"
+            runner._session_state(key).conversation.personality_override = (
+                "ghost_persona"
+            )
+            prompt = runner._get_system_prompt_for_channel(
+                Platform.DISCORD, "chan_1", session_key=key
+            )
+        assert "buccaneer" in prompt  # fell through to the channel binding

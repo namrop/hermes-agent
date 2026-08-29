@@ -97,6 +97,13 @@ class ConversationState:
     one_turn_restore: Optional[Dict[str, Any]] = None
     # /reasoning per-session override.
     reasoning_override: Optional[Dict[str, Any]] = None
+    # /personality per-session override: a persona name, or the "none"
+    # sentinel (pinned neutral — suppresses channel binding AND the global
+    # overlay for this conversation). None = no session override.
+    personality_override: Optional[str] = None
+    # /personality --once: consumed (popped) by the next turn's overlay
+    # resolution. Never persisted — a one-shot must not survive a restart.
+    personality_once: Optional[str] = None
     # /fast per-session override: "priority" or None; _UNSET_TIER = absent.
     service_tier_override: Any = _UNSET_TIER
     # Last successfully-resolved non-empty model (#35314 recovery).
@@ -120,6 +127,8 @@ class ConversationState:
         self.model_override = None
         self.one_turn_restore = None
         self.reasoning_override = None
+        self.personality_override = None
+        self.personality_once = None
         self.service_tier_override = _UNSET_TIER
         self.last_resolved_model = ""
         self.queued_events = []
