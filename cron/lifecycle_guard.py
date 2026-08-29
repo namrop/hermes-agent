@@ -76,9 +76,13 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # Branch C: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
-    # token orders because real reproductions show both.
-    r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # token orders because real reproductions show both. The windows are
+    # bounded (<=120 chars between tokens): a real kill invocation keeps its
+    # target tokens close, while `[^\n]*` spanned kilobytes of unrelated
+    # prose on single-line files — a one-line JSON mentioning "killed",
+    # "hermes", and "gateway" far apart matched (2026-08-28 denial audit).
+    r"|(?:p?kill\b[^\n]{0,120}\bhermes\b[^\n]{0,120}\bgateway)"
+    r"|(?:p?kill\b[^\n]{0,120}\bgateway\b[^\n]{0,120}\bhermes)"
 )
 
 
@@ -95,11 +99,94 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
 
+# ssh-remote launchctl exemption (2026-08-28 denial audit): launchctl inside
+# an ssh remote-command payload registers the launchd job on the REMOTE macOS
+# host — it cannot touch this process's supervisor, so blocking it was pure
+# false positive (every audited firing). The mask rewrites only the literal
+# word "launchctl" inside the ssh payload span (quoted, unquoted, or heredoc
+# body), so every other branch (systemctl/hermes/pkill) still fires on ssh
+# payloads — a self-ssh systemctl restart stays blocked. Local launchctl —
+# before the ssh word, or after the top-level separator that ends the ssh
+# command — is untouched.
+_SSH_COMMAND_WORD = re.compile(r"(?:^|[\s;&|(`])ssh\s")
+_LAUNCHCTL_WORD = re.compile(r"\blaunchctl\b", re.IGNORECASE)
+_HEREDOC_OPERATOR = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+# Replacement deliberately does NOT contain the substring "launchctl": the
+# lifecycle regex branches are not left-anchored, so a substring-preserving
+# placeholder would still match.
+_SSH_REMOTE_LAUNCHCTL_PLACEHOLDER = "ssh-remote-cmd"
+
+
+def _unquoted_separator_end(line: str, start: int) -> int:
+    """Index of the first top-level ``;``/``&``/``|`` at or after *start*."""
+    quote: Optional[str] = None
+    i = start
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(line):
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "\\" and i + 1 < len(line):
+            i += 2
+            continue
+        elif ch in ";&|":
+            return i
+        i += 1
+    return len(line)
+
+
+def _mask_ssh_remote_launchctl(text: str) -> str:
+    """Neutralize ``launchctl`` words that sit inside ssh remote payloads."""
+    lowered = text.lower()
+    if "ssh" not in lowered or "launchctl" not in lowered:
+        return text
+    lines_out: list[str] = []
+    heredoc_terminator: Optional[str] = None
+    for line in text.splitlines() or [text]:
+        if heredoc_terminator is not None:
+            # Inside the heredoc body feeding ssh's stdin: remote input.
+            if line.strip() == heredoc_terminator:
+                heredoc_terminator = None
+                lines_out.append(line)
+            else:
+                lines_out.append(
+                    _LAUNCHCTL_WORD.sub(_SSH_REMOTE_LAUNCHCTL_PLACEHOLDER, line)
+                )
+            continue
+        rebuilt: list[str] = []
+        pos = 0
+        while True:
+            match = _SSH_COMMAND_WORD.search(line, pos)
+            if match is None:
+                rebuilt.append(line[pos:])
+                break
+            end = _unquoted_separator_end(line, match.end())
+            heredoc = _HEREDOC_OPERATOR.search(line, match.end(), end)
+            if heredoc is not None:
+                heredoc_terminator = heredoc.group(2)
+            rebuilt.append(line[pos:match.end()])
+            rebuilt.append(
+                _LAUNCHCTL_WORD.sub(
+                    _SSH_REMOTE_LAUNCHCTL_PLACEHOLDER, line[match.end():end]
+                )
+            )
+            pos = end
+        lines_out.append("".join(rebuilt))
+    return "\n".join(lines_out)
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    normalized = _mask_ssh_remote_launchctl(
+        _SHELL_LINE_CONTINUATION.sub(" ", text)
+    )
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
 
 
@@ -177,8 +264,18 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
-def _iter_command_segments(command: str) -> Iterator[list[str]]:
-    """Yield shell-tokenized command segments, honoring quotes and comments."""
+def _iter_command_segments_with_openers(
+    command: str,
+) -> Iterator[tuple[Optional[str], list[str]]]:
+    """Yield ``(opener, segment)`` pairs, honoring quotes and comments.
+
+    ``opener`` is the control token that introduced the segment (``None`` at
+    start of line). Callers that need to distinguish real shell command
+    position (line start, ``;``, ``&``, ``|``) from a paren-introduced
+    pseudo-segment — python function-call syntax like ``open('path')``
+    tokenized as shell — use the opener; see
+    ``_iter_referenced_shell_scripts``.
+    """
     normalized = command.replace("\\\n", "")
     for line in normalized.splitlines() or [normalized]:
         try:
@@ -193,16 +290,24 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
         except ValueError:
             continue
 
+        opener: Optional[str] = None
         segment: list[str] = []
         for token in tokens:
             if token and set(token) <= _CONTROL_CHARS:
                 if segment:
-                    yield segment
+                    yield opener, segment
                     segment = []
+                opener = token
                 continue
             segment.append(token)
         if segment:
-            yield segment
+            yield opener, segment
+
+
+def _iter_command_segments(command: str) -> Iterator[list[str]]:
+    """Yield shell-tokenized command segments, honoring quotes and comments."""
+    for _opener, segment in _iter_command_segments_with_openers(command):
+        yield segment
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -223,7 +328,11 @@ def contains_launchctl_submit_command(command: str) -> bool:
     register a NEW persistent launchd job (``submit`` jobs get KeepAlive
     semantics; ``bootstrap`` loads an arbitrary plist), which is never safe to
     do from inside the gateway process.
+
+    ssh-wrapped launchctl is exempt (see ``_mask_ssh_remote_launchctl``):
+    the submitted job lands on the REMOTE host's launchd.
     """
+    command = _mask_ssh_remote_launchctl(command.replace("\\\n", ""))
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -310,25 +419,43 @@ def _mask_data_sink_arguments(text: str) -> str:
     return "\n".join(lines_out)
 
 
-def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
+def _lifecycle_command_scan_with_data_exemption(text: str) -> Optional[str]:
     """Lifecycle-regex scan that exempts matches living inside data arguments.
 
     Two-pass: the cheap regex first (the overwhelmingly common no-match case
     pays nothing extra); on a raw match, re-scan with data-sink arguments
     masked out. Only a match that survives masking — i.e. one in actual
     command position — blocks.
+
+    Returns the matched text (truncated) so callers can NAME what fired —
+    blind block messages left agents retrying the same command (2026-08-28
+    denial audit) — or ``None`` when nothing survives masking.
     """
     if not contains_gateway_lifecycle_command(text):
-        return False
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
+        return None
+    # Mirror contains_gateway_lifecycle_command's normalization (line
+    # continuations + ssh-remote launchctl mask) so the second pass cannot
+    # re-find a match the first pass already exempted.
+    normalized = _mask_ssh_remote_launchctl(
+        _SHELL_LINE_CONTINUATION.sub(" ", text)
+    )
+    match = _GATEWAY_LIFECYCLE_PATTERN.search(_mask_data_sink_arguments(normalized))
+    if match is None:
+        return None
+    return match.group(0)[:120]
 
 
-def _direct_lifecycle_scan(command: str) -> bool:
-    """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
-    return _lifecycle_command_scan_with_data_exemption(
-        command
-    ) or contains_launchctl_submit_command(command)
+def _direct_lifecycle_scan(command: str) -> Optional[str]:
+    """Pure-string direct scans: lifecycle regex (data-exempted) + submit.
+
+    Returns a human-readable reason naming the match, or ``None``.
+    """
+    matched = _lifecycle_command_scan_with_data_exemption(command)
+    if matched is not None:
+        return f"lifecycle command {matched!r}"
+    if contains_launchctl_submit_command(command):
+        return "launchctl submit/bootstrap in command position"
+    return None
 
 
 def _expand_candidate_path(candidate: str) -> Optional[Path]:
@@ -375,7 +502,7 @@ def _iter_referenced_shell_scripts(
     cwd: Optional[str] = None,
 ) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell."""
-    for segment in _iter_command_segments(command):
+    for opener, segment in _iter_command_segments_with_openers(command):
         index = _command_token_index(segment)
         if index is None:
             continue
@@ -420,6 +547,18 @@ def _iter_referenced_shell_scripts(
         # Resolving it walks to the filesystem root and fails the
         # regular-file check below, hard-blocking innocent .py scripts
         # (#77131). Skip pure-separator tokens.
+        #
+        # The bare-path branch only applies in real shell command position
+        # (line start, `;`, `&`, `|`). A `(`/`)`-introduced segment is not
+        # one: it is python call syntax — `open('path')`, `json.load(...)` —
+        # tokenized as shell, which put READ operands in command position,
+        # resolved them, and content-scanned them. That was the whole 22/22
+        # false-positive class in the 2026-08-28 denial audit (docstrings
+        # and data files merely QUOTING lifecycle commands, plus every >1MB
+        # data file). Shell/source execution shapes above keep their own
+        # branches regardless of opener.
+        if opener is not None and ("(" in opener or ")" in opener):
+            continue
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
                 resolved = _resolve_terminal_script_path(executable, cwd)
@@ -562,21 +701,26 @@ def _contains_unsafe_gateway_action(
     depth: int,
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
-) -> bool:
-    if _direct_lifecycle_scan(command):
-        return True
+) -> Optional[str]:
+    # Returns a reason string naming what matched (command text, file, or
+    # refused read), or None. Naming the trigger is part of the 2026-08-28
+    # audit fix: an unexplained block cannot be adapted to.
+    direct = _direct_lifecycle_scan(command)
+    if direct is not None:
+        return direct
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
-        return True
+        return f"referenced-script recursion exceeded depth {_MAX_REFERENCED_SCRIPT_DEPTH}"
 
     for payload in _iter_shell_command_payloads(command):
-        if _contains_unsafe_gateway_action(
+        nested = _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
-        ):
-            return True
+        )
+        if nested is not None:
+            return f"shell -c payload: {nested}"
 
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         # Do not touch a FileProvider path even to discover whether the file
@@ -586,7 +730,7 @@ def _contains_unsafe_gateway_action(
         # shared choke point, so every caller stays covered even if this
         # walk-level short-circuit is bypassed.
         if _is_cloud_placeholder_path(script_path):
-            return True
+            return f"cloud-synced referenced script {script_path} (refused unread)"
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -595,13 +739,16 @@ def _contains_unsafe_gateway_action(
             # guarded path must never crash the guard (#76762).
             resolved = script_path
         if _is_cloud_placeholder_path(resolved):
-            return True
+            return f"cloud-synced referenced script {resolved} (refused unread)"
         if resolved in visited:
             continue
         visited.add(resolved)
         script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
-            return True
+            return (
+                f"referenced script {script_path} refused unread "
+                "(oversized >1MiB or not a scannable regular file)"
+            )
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             # The callback's output crosses the same trust boundary as a
@@ -611,30 +758,39 @@ def _contains_unsafe_gateway_action(
                 read_remote_script(str(script_path))
             )
             if unsafe:
-                return True
+                return (
+                    f"referenced script {script_path} refused unread "
+                    "(remote read oversized >1MiB)"
+                )
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
         script_dir = _resolve_script_directory(str(resolved)) or cwd
-        if _contains_unsafe_gateway_action(
+        nested = _contains_unsafe_gateway_action(
             script_text,
             cwd=script_dir,
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
-        ):
-            return True
-    return False
+        )
+        if nested is not None:
+            return f"referenced script {resolved}: {nested}"
+    return None
 
 
-def contains_gateway_lifecycle_command_or_referenced_script(
+def gateway_lifecycle_block_reason(
     command: str,
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
-) -> bool:
+) -> Optional[str]:
     """Detect lifecycle/submit commands, including bounded nested scripts.
+
+    Returns a reason string NAMING the matched command text or file when
+    the command is unsafe, else ``None``. Callers surface the reason in
+    their block message (2026-08-28 denial audit: unexplained blocks were
+    blind-retried).
 
     Total by construction: this function returns a verdict for *every*
     input and never raises. The direct scans below are pure string
@@ -671,9 +827,26 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             # The data-argument masker tokenizes arbitrary text; if even
             # that fails, fall to the raw regex + submit scan so the guard
             # stays total.
-            return contains_gateway_lifecycle_command(
-                command
-            ) or contains_launchctl_submit_command(command)
+            if contains_gateway_lifecycle_command(command):
+                return "lifecycle command in command text"
+            if contains_launchctl_submit_command(command):
+                return "launchctl submit/bootstrap in command position"
+            return None
+
+
+def contains_gateway_lifecycle_command_or_referenced_script(
+    command: str,
+    *,
+    cwd: Optional[str] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+) -> bool:
+    """Boolean form of ``gateway_lifecycle_block_reason`` (same contract)."""
+    return (
+        gateway_lifecycle_block_reason(
+            command, cwd=cwd, read_remote_script=read_remote_script
+        )
+        is not None
+    )
 
 
 
@@ -784,18 +957,19 @@ def check_gateway_lifecycle(
         # `hermes gateway restart` embedded in a .py script is still
         # blocked. Non-regular/oversized script files still fail closed
         # via the lifecycle-shaped sentinel in _read_script_for_scanning.
-        unsafe = _lifecycle_command_scan_with_data_exemption(combined)
+        matched = _lifecycle_command_scan_with_data_exemption(combined)
+        reason = f"lifecycle command {matched!r}" if matched is not None else None
     else:
         script_dir = _resolve_script_directory(script) if script else None
-        unsafe = contains_gateway_lifecycle_command_or_referenced_script(
+        reason = gateway_lifecycle_block_reason(
             combined,
             cwd=script_dir,
         )
-    if unsafe:
+    if reason is not None:
         raise GatewayLifecycleBlocked(
             "Blocked: cron job contains a gateway lifecycle command or persistent "
             "launchctl submit operation. This is blocked to prevent agent-driven "
             "SIGTERM-respawn loops under launchd/systemd supervision "
             "(#30719). Run `hermes gateway restart` from a shell outside "
-            "the running gateway instead."
+            f"the running gateway instead. Matched: {reason}."
         )

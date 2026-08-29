@@ -608,10 +608,15 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
-    if malformed_grep:
-        return (True, _MALFORMED_EXEC_DESCRIPTION)
+    # An ambiguous grep parse is NOT hardline by itself. The fail-closed
+    # contract on _quoted_grep_pattern_spans is "mask nothing, scan the
+    # ORIGINAL command" — which the variants below already do (the grep-safe
+    # variant is byte-for-byte the original when the parse is malformed).
+    # The former unconditional block here went 14/14 false positives in the
+    # 2026-08-28 denial audit (short, read-only one-liners with a grep
+    # inside a double-quoted "$(...)" substitution) with zero true
+    # positives; every real hardline threat is still caught by the pattern
+    # scan over the unmasked text.
     for command_variant in _command_detection_variants(command):
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
@@ -730,21 +735,36 @@ def _hardline_block_result(description: str, command: str = "") -> dict:
     # back to the manual write_file recipe when saving fails.
     if description in (_PARSER_LIMIT_DESCRIPTION, _MALFORMED_EXEC_DESCRIPTION):
         saved = _save_blocked_payload(command) if command else None
+        # Name the actual trigger. The parser-limit block fires on payload
+        # SIZE/shape (heredocs, giant one-liners); the malformed-payload
+        # block fires on quoting/substitution the safety parser could not
+        # resolve. The old text blamed "heredocs, giant one-liners" for
+        # both — wrong in 14/14 audited malformed-parse firings
+        # (2026-08-28), and a wrong explanation prevents agent adaptation.
+        if description == _PARSER_LIMIT_DESCRIPTION:
+            cause = (
+                "this block fires on oversized/unparseable inline command "
+                "payloads (heredocs, giant one-liners), not on the "
+                "operation itself."
+            )
+        else:
+            cause = (
+                "this block fires when the command's quoting or \"$(...)\" "
+                "substitution could not be resolved by the safety parser, "
+                "not on the operation itself."
+            )
         if saved:
             message += (
-                " RECOVERY: this block fires on oversized/unparseable inline "
-                "command payloads (heredocs, giant one-liners), not on the "
-                f"operation itself. Your command was saved to {saved} — "
+                f" RECOVERY: {cause} Your command was saved to {saved} — "
                 f"review it, then run: terminal(command=\"bash {saved}\"). "
                 "Do not retry inline."
             )
         else:
             message += (
-                " RECOVERY: this block fires on oversized/unparseable inline "
-                "command payloads (heredocs, giant one-liners), not on the "
-                "operation itself. Write the script to a file with write_file, "
-                "then run it: terminal(command=\"bash /path/script.sh\") or "
-                "\"python3 /path/script.py\". Do not retry inline."
+                f" RECOVERY: {cause} Write the script to a file with "
+                "write_file, then run it: terminal(command=\"bash "
+                "/path/script.sh\") or \"python3 /path/script.py\". "
+                "Do not retry inline."
             )
     return {
         "approved": False,
@@ -1450,7 +1470,8 @@ def _shell_tokens_with_spans(segment: str, start: int):
     """
     tokens = []
     i = start
-    while i < len(segment):
+    at_substitution_end = False
+    while i < len(segment) and not at_substitution_end:
         while i < len(segment) and segment[i].isspace():
             i += 1
         if i >= len(segment):
@@ -1460,6 +1481,19 @@ def _shell_tokens_with_spans(segment: str, start: int):
         quote = None
         while i < len(segment) and (quote or not segment[i].isspace()):
             char = segment[i]
+            # A "$(...)" substitution is one opaque unit: its contents are a
+            # nested command, never grep operand text. Pre-fix, scanning
+            # character-wise into the substitution made the enclosing
+            # double quote read as an OPENER and the whole parse malformed —
+            # the 14/14-false-positive hardline block in the 2026-08-28
+            # denial audit. Single quotes still inhibit substitution.
+            if quote != "'" and segment.startswith("$(", i):
+                end = _scan_dollar_paren_end(segment, i)
+                if end is None:
+                    return None
+                value.append(segment[i:end])
+                i = end
+                continue
             if quote:
                 if char == quote:
                     quote = None
@@ -1478,11 +1512,19 @@ def _shell_tokens_with_spans(segment: str, start: int):
                     return None
                 value.append(segment[i + 1])
                 i += 2
+            elif char == ")":
+                # An unmatched unquoted ")" means this grep itself sits
+                # INSIDE a "$(...)" substitution: its argument list ends at
+                # the substitution's closing paren (same audit class).
+                at_substitution_end = True
+                break
             else:
                 value.append(char)
                 i += 1
         if quote:
             return None
+        if i == token_start:
+            break
         raw = segment[token_start:i]
         # Only a wholly single-quoted operand is inert shell data. Double
         # quotes still execute $() and backticks; unquoted substitutions do too.

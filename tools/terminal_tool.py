@@ -2856,8 +2856,8 @@ def terminal_tool(
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
-                contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
+                gateway_lifecycle_block_reason,
             )
             if contains_launchctl_submit_command(command):
                 return json.dumps({
@@ -2936,11 +2936,15 @@ def terminal_tool(
                     pass
                 return None
 
-            if contains_gateway_lifecycle_command_or_referenced_script(
+            lifecycle_block_reason = gateway_lifecycle_block_reason(
                 command,
                 cwd=guard_cwd,
                 read_remote_script=_read_script_in_env,
-            ):
+            )
+            if lifecycle_block_reason is not None:
+                # Name what matched: 2026-08-28 denial audit showed agents
+                # blind-retrying because the block never said which token
+                # or file tripped it.
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,
@@ -2949,7 +2953,8 @@ def terminal_tool(
                         "the gateway from inside the gateway process. The gateway would "
                         "kill this command before it could complete (SIGTERM propagates "
                         "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
+                        "separate shell outside the running gateway. "
+                        f"Matched: {lifecycle_block_reason}."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
