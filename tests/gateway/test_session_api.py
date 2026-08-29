@@ -47,6 +47,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+    app.router.add_get("/api/sessions/{session_id}/system_prompt", adapter._handle_session_system_prompt)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -891,3 +892,64 @@ async def test_patch_session_still_rejects_unknown_fields(adapter, session_db):
         resp = await cli.patch(f"/api/sessions/{session_id}", json={"nonsense": 1})
         assert resp.status == 400, await resp.text()
         assert (await resp.json())["error"]["code"] == "unsupported_session_field"
+
+
+@pytest.mark.asyncio
+async def test_session_system_prompt_returns_stored_text_and_hash(adapter, session_db):
+    """GET /api/sessions/{id}/system_prompt resolves the content-addressed prompt.
+
+    The generic session payload deliberately carries only has_system_prompt;
+    this sub-resource is the sanctioned full-text read (Vikunja #606), and the
+    hash must match the dedup store's sha256 addressing.
+    """
+    import hashlib
+
+    prompt = "You are Hermes. Keep the coherence well coherent."
+    session_id = session_db.create_session(
+        "sysprompt-session", "api_server", system_prompt=prompt
+    )
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/system_prompt")
+        assert resp.status == 200, await resp.text()
+        payload = await resp.json()
+
+    assert payload["object"] == "hermes.session.system_prompt"
+    assert payload["session_id"] == session_id
+    assert payload["system_prompt"] == prompt
+    assert payload["system_prompt_hash"] == hashlib.sha256(
+        prompt.encode("utf-8")
+    ).hexdigest()
+
+    # The generic session payload still exposes only the boolean.
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}")
+        session_payload = (await resp.json())["session"]
+    assert session_payload["has_system_prompt"] is True
+    assert "system_prompt" not in session_payload
+
+
+@pytest.mark.asyncio
+async def test_session_system_prompt_null_when_absent(adapter, session_db):
+    session_id = session_db.create_session("no-sysprompt-session", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/system_prompt")
+        assert resp.status == 200, await resp.text()
+        payload = await resp.json()
+
+    assert payload["session_id"] == session_id
+    assert payload["system_prompt"] is None
+    assert payload["system_prompt_hash"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_system_prompt_unknown_session_404s(adapter):
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/sessions/no-such-session/system_prompt")
+        assert resp.status == 404, await resp.text()
+        assert (await resp.json())["error"]["code"] == "session_not_found"

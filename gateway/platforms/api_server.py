@@ -2100,6 +2100,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("GET", "/api/sessions/{session_id}/system_prompt", self._handle_session_system_prompt),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3245,6 +3246,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_system_prompt": {"method": "GET", "path": "/api/sessions/{session_id}/system_prompt"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -3701,6 +3703,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 "order": order or ("latest" if default_page else "oldest"),
                 "returned": len(messages),
             },
+        })
+
+    async def _handle_session_system_prompt(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/system_prompt — stored base prompt text.
+
+        ``_session_response`` deliberately exposes only ``has_system_prompt``
+        on the generic session payload; this sub-resource is the sanctioned
+        read for the full text (Diadem option A, Vikunja #606).
+        ``SessionDB.get_session`` already resolves the content-addressed
+        prompt (``sessions.system_prompt_hash`` → ``system_prompts.prompt``),
+        so no extra store round-trip is needed here.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        if err:
+            return err
+        return web.json_response({
+            "object": "hermes.session.system_prompt",
+            "session_id": session.get("id"),
+            "system_prompt": session.get("system_prompt") or None,
+            "system_prompt_hash": session.get("system_prompt_hash") or None,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
