@@ -92,6 +92,9 @@ def adapter(monkeypatch, tmp_path):
     bot_user = SimpleNamespace(id=999, bot=True, display_name="Hermes", name="hermes")
     adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda _id: None)
     adapter._ready_event.set()
+    # Simulate the post-connect state: gates parsed (backfill only runs after
+    # on_ready, which itself only fires after connect() loaded the allowlist).
+    adapter._allowlist_gates_loaded = True
     adapter._handle_message = AsyncMock(return_value=True)
     monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")

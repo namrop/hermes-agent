@@ -1088,6 +1088,13 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
+        # False until connect() has parsed the allowlist gates from this
+        # profile's env/config. Inbound events that race that parse must not
+        # be adjudicated against the empty __init__ defaults: that both
+        # denies traffic the loaded config would admit AND fires the
+        # misleading "no allowlist is configured" warning at startup.
+        self._allowlist_gates_loaded: bool = False
+        self._warned_gates_not_loaded: bool = False
         # Per-adapter snapshot of authorization gate env vars, captured inside
         # the owning profile's runtime scope during connect(). None until then;
         # accessors fall back to live scope-aware reads (issue #72348).
@@ -1341,6 +1348,10 @@ class DiscordAdapter(BasePlatformAdapter):
             # Users with ANY of these roles can interact with the bot.
             self._allowed_role_ids = self._get_allowed_roles()
 
+            # Gates are now live: message admission may adjudicate against
+            # them (see _discord_message_admission's not-yet-loaded guard).
+            self._allowlist_gates_loaded = True
+
             # Set up intents.
             # Message Content is required for normal text replies.
             # Server Members is only needed when the allowlist contains usernames
@@ -1570,6 +1581,33 @@ class DiscordAdapter(BasePlatformAdapter):
         claim: bool,
     ) -> tuple[bool, bool]:
         """Return ``(admitted, role_authorized)`` for one Discord event."""
+        # Startup ordering: never adjudicate an event against the empty
+        # __init__ gate defaults before connect() has parsed the allowlist
+        # config. Refusing here (BEFORE the dedup claim) leaves the message
+        # recoverable by the missed-message backfill once gates are live,
+        # instead of denying it and warning "no allowlist is configured"
+        # when one merely hasn't loaded yet. Any resolvable gate signal —
+        # directly-assigned sets (tests, embedders), a channel allowlist, or
+        # an allow-all opt-in — counts as configuration; the guard only
+        # covers the population whose deny would fire the misleading
+        # fail-closed warning (mirrors _warn_if_fail_closed_default).
+        if not getattr(self, "_allowlist_gates_loaded", False) and not (
+            getattr(self, "_allowed_user_ids", None)
+            or getattr(self, "_allowed_role_ids", None)
+            or self._get_allowed_channels()
+            or self._discord_allow_all_users()
+            or self._gateway_allow_all_users()
+        ):
+            if not getattr(self, "_warned_gates_not_loaded", False):
+                self._warned_gates_not_loaded = True
+                logger.warning(
+                    "[%s] Inbound Discord event arrived before the allowlist "
+                    "configuration was loaded — not processing it (the "
+                    "missed-message backfill can recover it once gates are "
+                    "live).",
+                    self.name,
+                )
+            return False, False
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):

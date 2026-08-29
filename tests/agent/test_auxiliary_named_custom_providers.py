@@ -122,6 +122,70 @@ class TestResolveProviderClientNamedCustom:
         assert client is not None
         # no-key-required should be used
 
+    def test_named_custom_no_api_key_warns_without_no_auth_marker(self, tmp_path, caplog):
+        _write_config(tmp_path, {
+            "model": {"default": "test"},
+            "custom_providers": [
+                {"name": "local", "base_url": "http://localhost:8080/v1"},
+            ],
+        })
+        import logging
+        from agent.auxiliary_client import resolve_provider_client
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            client, _ = resolve_provider_client("local", "test")
+        assert client is not None
+        assert any(
+            "no resolvable api_key" in r.message for r in caplog.records
+        ), "keyless entry without auth:none should still warn"
+
+    def test_named_custom_auth_none_silences_no_key_warning(self, tmp_path, caplog):
+        """`auth: none` marks a local no-auth host as intentionally keyless."""
+        _write_config(tmp_path, {
+            "model": {"default": "test"},
+            "custom_providers": [
+                {"name": "omlx-local", "base_url": "http://localhost:8080/v1",
+                 "auth": "none"},
+            ],
+        })
+        import logging
+        from agent.auxiliary_client import resolve_provider_client
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            client, model = resolve_provider_client("omlx-local", "test")
+        assert client is not None
+        assert model == "test"
+        assert not any(
+            "no resolvable api_key" in r.getMessage() for r in caplog.records
+        ), "auth:none entry must not warn about a missing api_key"
+
+    def test_named_custom_no_auth_true_alias(self, tmp_path, caplog):
+        _write_config(tmp_path, {
+            "model": {"default": "test"},
+            "custom_providers": [
+                {"name": "ds4-local", "base_url": "http://localhost:9090/v1",
+                 "no_auth": True},
+            ],
+        })
+        import logging
+        from agent.auxiliary_client import resolve_provider_client
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            client, _ = resolve_provider_client("ds4-local", "test")
+        assert client is not None
+        assert not any(
+            "no resolvable api_key" in r.getMessage() for r in caplog.records
+        )
+
+    def test_no_auth_marker_helper_spellings(self):
+        from agent.auxiliary_client import _custom_entry_declares_no_auth
+        assert _custom_entry_declares_no_auth({"auth": "none"})
+        assert _custom_entry_declares_no_auth({"auth": "None"})
+        assert _custom_entry_declares_no_auth({"no_auth": True})
+        assert _custom_entry_declares_no_auth({"no_auth": "true"})
+        assert not _custom_entry_declares_no_auth({})
+        assert not _custom_entry_declares_no_auth({"auth": "bearer"})
+        assert not _custom_entry_declares_no_auth({"no_auth": False})
+        # An entry that HAS a key never needs the marker; helper is still inert
+        assert not _custom_entry_declares_no_auth({"api_key": "k"})
+
 
 
 class TestResolveProviderClientModelNormalization:

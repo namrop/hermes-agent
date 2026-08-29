@@ -240,9 +240,29 @@ _INJECTION_PATTERNS: list = [
     "forget your instructions",
     "new instructions:",
     "system prompt:",
-    "<system>",
     "]]>",
 ]
+
+# ``<system>`` needs context: as a bare substring it false-positives on the
+# Nix flake attribute-path idiom (``checks.<system>.router-fixtures``) and on
+# backtick-quoted mentions in legitimate skill docs. Only flag it when it is
+# NOT embedded in an identifier/path/code context — i.e. not preceded by a
+# word character, dot, backtick, or another ``<``. A prompt-shaped tag at
+# line start or after whitespace still matches. Warning-only, like the rest
+# of the pattern scan.
+_SYSTEM_TAG_INJECTION_RE = re.compile(r"(?<![\w.`<])<system>")
+
+
+def _scan_for_injection_patterns(content: str) -> bool:
+    """Return True when skill content matches a prompt-injection heuristic.
+
+    Substring patterns from ``_INJECTION_PATTERNS`` plus the
+    context-qualified ``<system>`` tag check above. Case-insensitive.
+    """
+    lower = content.lower()
+    if any(p in lower for p in _INJECTION_PATTERNS):
+        return True
+    return bool(_SYSTEM_TAG_INJECTION_RE.search(lower))
 
 
 def set_secret_capture_callback(callback) -> None:
@@ -1041,7 +1061,7 @@ def _serve_plugin_skill(
         )
 
     # Injection scan — log but still serve (matches local-skill behaviour)
-    if any(p in content.lower() for p in _INJECTION_PATTERNS):
+    if _scan_for_injection_patterns(content):
         logger.warning(
             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection",
             namespace, bare,
@@ -1505,9 +1525,9 @@ def skill_view(
                 continue
 
         # Security: detect common prompt injection patterns
-        # (pattern list at module level as _INJECTION_PATTERNS)
-        _content_lower = content.lower()
-        _injection_detected = any(p in _content_lower for p in _INJECTION_PATTERNS)
+        # (pattern list at module level as _INJECTION_PATTERNS; ``<system>``
+        # is context-qualified in _scan_for_injection_patterns)
+        _injection_detected = _scan_for_injection_patterns(content)
 
         if _outside_skills_dir or _injection_detected:
             _warnings = []
