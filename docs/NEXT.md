@@ -43,3 +43,40 @@ visible rather than papered over.
 **Downstream (not this repo):** once stamped, Diadem inherits per-message model
 verbatim immediately; a switch-seam row in the chat view (same grammar as the
 continuation seams) is a small frontend round.
+
+---
+
+## Session approval + stop API (Diadem β adjudication surface, Vikunja #613)
+
+**Problem (2026-08-30, Diadem lane):** Diadem can render a session but cannot
+*act* on one. A pending dangerous-command approval is reachable today only
+through a chat platform's button card or the TUI gateway's JSON-RPC method;
+the HTTP API exposes approval resolution only per-`/v1/runs/{run_id}`, which
+Diadem never owns. Likewise there is no way to stop an in-flight session turn
+from the API. The keeper-ruled β scope is therefore **session-scoped approval
++ stop**.
+
+**Shape (build to `f789ce4e`, the session sysprompt endpoint):**
+
+- `tools/approval.py` — enrich `_ApprovalEntry` payloads with `created_at`,
+  `expires_at` (created + configured approval timeout), and the enqueue-time
+  contextvars (`turn_id`, `tool_call_id`, `session_id`). Additive keys only:
+  the dict is copied into every platform approval card. Add
+  `list_all_gateway_approvals()` (under `_lock`) for the global read.
+- `GET /api/sessions/{session_id}/approvals` — redacted pending list.
+  **Never echo `session_key`** — it is the capability that resolves an
+  approval.
+- `POST /api/sessions/{session_id}/approval` — `{choice, request_id?, all?,
+  reason?}`. `request_id` targeting is **required when more than one approval
+  is pending on the conversation**: `session_key` is per-conversation, not
+  per-session, so a bare FIFO resolve could answer a different session's
+  approval. `resolved <= 0` → `409 approval_not_pending` (the
+  first-response-wins loser signal).
+- `POST /api/sessions/{session_id}/stop` — reach the gateway runner,
+  `_peek_session_state(session_key)` → running turn's agent →
+  `request_hard_interrupt`. Bare interrupt for this cut.
+- `GET /api/approvals` — poll-first global watch surface. SSE deferred.
+
+**Not in this cut:** the SSE broadcast seam (design goes to `docs/ADR.md`),
+and `_interrupt_and_clear_session` on stop (needs a synthesized
+`SessionSource`).
