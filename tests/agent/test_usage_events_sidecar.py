@@ -153,6 +153,7 @@ class TestGraftIntegration:
             model="glm-5.3",
             billing_provider="zai",
             billing_base_url="https://api.z.ai",
+            api_mode="chat_completions",
             api_call_count=1,
             estimated_cost_usd=0.001234,
         )
@@ -163,6 +164,7 @@ class TestGraftIntegration:
         assert row["source"] == "discord"
         assert row["model"] == "glm-5.3"
         assert row["provider"] == "zai"
+        assert row["api_mode"] == "chat_completions"
         assert row["purpose"] == "main"
         assert row["input_tokens"] == 100
         assert row["output_tokens"] == 50
@@ -182,6 +184,7 @@ class TestGraftIntegration:
             "vision",
             model="gemini-flash",
             billing_provider="google",
+            api_mode="chat_completions",
             input_tokens=77,
             output_tokens=3,
         )
@@ -191,6 +194,7 @@ class TestGraftIntegration:
         assert aux["purpose"] == "aux:vision"
         assert aux["model"] == "gemini-flash"
         assert aux["provider"] == "google"
+        assert aux["api_mode"] == "chat_completions"
         assert aux["input_tokens"] == 77
 
     def test_aux_missing_route_stays_unattributed(self, db):
@@ -207,6 +211,31 @@ class TestGraftIntegration:
         assert row["model"] == "unknown"
         assert row["provider"] == ""
         assert row["purpose"] == "aux:title_generation"
+
+    def test_api_mode_omitted_stays_null_never_fabricated(self, db):
+        """Regression: the 2026-08-25 sidecar cutover hardcoded
+        api_mode=None for every event (incident 2026-08-29). A caller that
+        passes api_mode must see it on the event; a caller that omits it
+        must yield NULL — never a borrowed or fabricated value."""
+        db.update_token_counts(
+            "sess-1",
+            input_tokens=5,
+            model="glm-5.3",
+            billing_provider="zai",
+            api_call_count=1,
+        )
+        db.update_token_counts(
+            "sess-1",
+            input_tokens=7,
+            model="glm-5.3",
+            billing_provider="zai",
+            api_mode="anthropic_messages",
+            api_call_count=1,
+        )
+        rows = _sidecar_rows()
+        assert len(rows) == 2
+        assert rows[0]["api_mode"] is None
+        assert rows[1]["api_mode"] == "anthropic_messages"
 
     def test_absolute_cumulative_never_events(self, db):
         db.update_token_counts(

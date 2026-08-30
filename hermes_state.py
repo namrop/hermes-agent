@@ -7219,7 +7219,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
-        "billing_provider", "billing_base_url", "billing_mode",
+        "billing_provider", "billing_base_url", "billing_mode", "api_mode",
     )
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
@@ -7487,10 +7487,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
+        api_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
     ) -> None:
         """Update token counters and backfill model if not already set.
+
+        ``api_mode`` is not stored on the ``sessions`` row (no column); it
+        threads through to the per-call sidecar event only, preserving the
+        endpoint/protocol attribution (``codex_responses``,
+        ``chat_completions``, ``anthropic_messages``, ``codex_app_server``,
+        ...) that the aggregate tables cannot represent. Lost at the
+        2026-08-25 sidecar cutover; restored per the 2026-08-29 incident.
 
         When *absolute* is False (default), values are **incremented** — use
         this for per-API-call deltas (CLI path).
@@ -7626,6 +7634,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     billing_provider=billing_provider,
                     billing_base_url=billing_base_url,
                     billing_mode=billing_mode,
+                    api_mode=api_mode,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
@@ -7648,6 +7657,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_provider: Optional[str],
         billing_base_url: Optional[str],
         billing_mode: Optional[str],
+        api_mode: Optional[str] = None,
         input_tokens: int,
         output_tokens: int,
         cache_read_tokens: int,
@@ -7754,7 +7764,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 source=sess_source,
                 model=eff_model,
                 provider=eff_provider,
-                api_mode=None,
+                api_mode=api_mode or None,
                 billing_base_url=eff_base_url,
                 billing_mode=eff_billing_mode,
                 task=task or "",
@@ -7791,6 +7801,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model: Optional[str] = None,
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
+        api_mode: Optional[str] = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
@@ -7833,6 +7844,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 billing_provider=billing_provider,
                 billing_base_url=billing_base_url,
                 billing_mode=None,
+                api_mode=api_mode,
                 input_tokens=input_tokens or 0,
                 output_tokens=output_tokens or 0,
                 cache_read_tokens=cache_read_tokens or 0,

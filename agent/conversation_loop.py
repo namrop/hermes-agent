@@ -4263,6 +4263,7 @@ def run_conversation(
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
+                                api_mode=agent.api_mode,
                                 model=agent.model,
                                 api_call_count=1,
                             )

@@ -887,6 +887,7 @@ def _snapshot_review_usage(review_agent: Any) -> Dict[str, Any]:
         "model": getattr(review_agent, "model", None),
         "provider": getattr(review_agent, "provider", None),
         "base_url": getattr(review_agent, "base_url", None),
+        "api_mode": getattr(review_agent, "api_mode", None),
         "input_tokens": int(getattr(review_agent, "session_input_tokens", 0) or 0),
         "output_tokens": int(getattr(review_agent, "session_output_tokens", 0) or 0),
         "cache_read_tokens": int(
@@ -952,6 +953,7 @@ def _record_review_usage_to_parent(
             model=usage.get("model"),
             billing_provider=usage.get("provider"),
             billing_base_url=usage.get("base_url"),
+            api_mode=usage.get("api_mode"),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read,
