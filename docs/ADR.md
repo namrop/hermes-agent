@@ -1,5 +1,38 @@
 # Architecture Decision Records
 
+## 2026-08-29: Journal visibility requires WARNING — INFO is file-only with an hours-scale window
+
+Status: Accepted (Vikunja #611)
+
+Context:
+`journalctl -u hermes-primary` showed 0 `Fallback activated` records over 7
+days while fallbacks demonstrably fired. Diagnosis: the journal is fed only
+by stderr, and the gateway's optional stderr handler defaults to WARNING
+(`gateway/run.py`, `verbosity=0` when `hermes gateway run` is launched
+without `-v`). INFO records route to the rotating `logs/agent.log`
+(5 MB × 3 backups), whose retention at Sol volume is **hours** (~6h
+observed), not days. Any multi-day investigation therefore finds both
+surfaces structurally empty — the journal by level, the file by rotation.
+
+Decision:
+Records an operator must be able to find days later must be logged at
+WARNING or above; INFO is treated as a short-lived debugging surface, not
+an audit trail. Applied to `Fallback activated` (a provider failure plus a
+live route change — WARNING semantics on its own merits). Global verbosity
+was deliberately NOT raised: `-v` would put ALL of INFO on the journal, and
+enlarging agent.log rotation trades disk for a problem better solved by
+choosing the right level per record.
+
+Consequences:
+- `Fallback activated: <old> via <p> → <new> via <q>` now reaches the
+  journal and `errors.log`, giving an independent check on the collapsed
+  fallback-walk status notice (Vikunja #610).
+- When adding a new log record, pick its level by asking "must this
+  survive until an operator looks?" — not by the record's tone.
+- If agent.log-based forensics are ever needed beyond hours, raise
+  `logging.max_size_mb` / `backup_count` in config.yaml consciously rather
+  than assuming the file is durable.
+
 ## 2026-07-13: Scope plugin manager state by Hermes home/profile (keyed cache)
 
 Status: Accepted

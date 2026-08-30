@@ -186,6 +186,72 @@ def test_flush_discards_pending_fallback_notice():
 
 
 
+def test_fallback_walk_collapses_multi_hop_into_one_line():
+    """A primary → A → B walk emits ONE line naming all three backends in
+    order — the old single-slot notice reported only A → B, structurally
+    hiding the primary's failure (docs/NEXT.md item 1, Kimi 2026-08-26)."""
+    agent = _make_bare_agent()
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    # Simulate try_activate_fallback firing twice inside one turn.
+    agent._record_fallback_hop("glm-5.3", "zai", "deepseek-v4-pro", "deepseek")
+    agent._record_fallback_hop(
+        "deepseek-v4-pro", "deepseek", "gpt-5.6-sol", "openai-codex"
+    )
+
+    agent._emit_pending_fallback_notice()
+    assert emitted == [
+        "🔄 Fallback walk: glm-5.3 via zai → deepseek-v4-pro via deepseek "
+        "→ gpt-5.6-sol via openai-codex"
+    ]
+    # Drained: a second success path emits nothing.
+    agent._emit_pending_fallback_notice()
+    assert len(emitted) == 1
+    assert agent._pending_fallback_notice is None
+
+
+def test_fallback_single_hop_keeps_legacy_text():
+    """No regression in the common case: one hop emits the exact legacy
+    single-switch line."""
+    agent = _make_bare_agent()
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._record_fallback_hop("m1", "p1", "m2", "p2")
+    agent._emit_pending_fallback_notice()
+    assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+
+
+def test_flush_discards_whole_fallback_walk():
+    """Terminal failure clears every pending hop, not just the last — the
+    flushed buffer carries the switch lines, so nothing may leak into a
+    later successful turn."""
+    agent = _make_bare_agent()
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._record_fallback_hop("m1", "p1", "m2", "p2")
+    agent._record_fallback_hop("m2", "p2", "m3", "p3")
+    agent._flush_status_buffer()
+
+    assert agent._pending_fallback_notice is None
+    agent._emit_pending_fallback_notice()
+    assert emitted == []
+
+
+def test_pending_fallback_notice_shim_reads_last_hop():
+    """The compatibility shim renders the LAST hop on read (legacy single-
+    slot behaviour) while the walk retains every hop for the emitter."""
+    agent = _make_bare_agent()
+    agent._record_fallback_hop("m1", "p1", "m2", "p2")
+    agent._record_fallback_hop("m2", "p2", "m3", "p3")
+    assert agent._pending_fallback_notice == (
+        "🔄 Switched to fallback model: m2 via p2 → m3 via p3"
+    )
+    assert len(agent._pending_fallback_hops) == 2
+
+
 def test_flush_swallows_callback_exceptions():
     agent = _make_bare_agent()
     seen = []

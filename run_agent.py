@@ -1169,25 +1169,103 @@ class AIAgent:
         except Exception:
             pass
 
+    def _record_fallback_hop(
+        self, old_model, old_provider, new_model, new_provider
+    ) -> None:
+        """Append one fallback activation to the turn's pending walk.
+
+        ``try_activate_fallback`` can fire several times inside one turn as
+        the retry loop walks the chain; the old single-string slot kept only
+        the last hop, so a ``primary → A → B`` walk reported ``A → B`` and the
+        primary's failure — the hop an operator most needs — was structurally
+        unlogged (see the 2026-08-26 Kimi quota incident). Every hop is kept
+        and ``_emit_pending_fallback_notice`` collapses the walk into one
+        status line.
+        """
+        hops = getattr(self, "_pending_fallback_hops", None)
+        if hops is None:
+            hops = []
+            self._pending_fallback_hops = hops
+        hops.append(("hop", old_model, old_provider, new_model, new_provider))
+
+    @staticmethod
+    def _render_fallback_notice(entries) -> str:
+        """Render pending fallback entries as one operator-facing line.
+
+        One entry keeps the legacy single-hop text byte-for-byte (and an
+        opaque string written through the ``_pending_fallback_notice`` shim
+        is emitted verbatim). Multiple entries collapse into a single
+        ``Fallback walk`` line naming every backend in activation order.
+        """
+        if len(entries) == 1:
+            entry = entries[0]
+            if entry[0] == "text":
+                return entry[1]
+            _, old_m, old_p, new_m, new_p = entry
+            return (
+                f"🔄 Switched to fallback model: {old_m} via {old_p} "
+                f"→ {new_m} via {new_p}"
+            )
+        parts: list[str] = []
+        for entry in entries:
+            if entry[0] == "hop":
+                _, old_m, old_p, new_m, new_p = entry
+                if not parts:
+                    parts.append(f"{old_m} via {old_p}")
+                parts.append(f"{new_m} via {new_p}")
+            else:
+                parts.append(entry[1])
+        return "🔄 Fallback walk: " + " → ".join(parts)
+
+    @property
+    def _pending_fallback_notice(self):
+        """Compatibility shim over ``_pending_fallback_hops``.
+
+        Reads render the LAST pending hop in the legacy single-line format
+        (or return the raw string a writer stored); writing a string appends
+        an opaque entry and writing ``None`` clears the whole walk — the
+        exact clear semantics ``_flush_status_buffer`` has always relied on.
+        Kept because tests and any external callers set the slot directly.
+        """
+        hops = getattr(self, "_pending_fallback_hops", None)
+        if not hops:
+            return None
+        return self._render_fallback_notice(hops[-1:])
+
+    @_pending_fallback_notice.setter
+    def _pending_fallback_notice(self, value) -> None:
+        hops = getattr(self, "_pending_fallback_hops", None)
+        if value is None:
+            if hops:
+                hops.clear()
+            return
+        if hops is None:
+            hops = []
+            self._pending_fallback_hops = hops
+        hops.append(("text", str(value)))
+
     def _emit_pending_fallback_notice(self) -> None:
-        """Surface the one-shot fallback-switch notice on successful recovery.
+        """Surface the turn's fallback walk on successful recovery.
 
         A provider/model switch is a durable state change operators must see,
         unlike transient retry chatter that ``_clear_status_buffer`` drops.
-        ``try_activate_fallback`` records the switch in
-        ``self._pending_fallback_notice``; this emits it exactly once via
-        ``_emit_status`` and then clears it, so a successful fallback still
-        produces one visible notice.  On terminal failure the buffered switch
-        line is flushed instead (and this notice discarded) — see
-        ``_flush_status_buffer`` — so the user always sees the switch once.
+        ``try_activate_fallback`` records each activation via
+        ``_record_fallback_hop``; this collapses the walk into ONE status
+        line naming every backend in order and clears it, so a successful
+        multi-hop fallback still produces exactly one visible notice.  On
+        terminal failure the buffered trace is flushed instead (and the walk
+        discarded) — see ``_flush_status_buffer`` — so the user always sees
+        the switch once.
         """
         try:
-            notice = getattr(self, "_pending_fallback_notice", None)
-            if notice:
-                # Clear before emitting so a (swallowed) callback error can't
-                # leave the notice set for a stale re-emit on a later turn.
-                self._pending_fallback_notice = None
-                self._emit_status(notice)
+            hops = getattr(self, "_pending_fallback_hops", None)
+            if not hops:
+                return
+            # Drain before emitting so a (swallowed) callback error can't
+            # leave the walk set for a stale re-emit on a later turn.
+            drained = list(hops)
+            hops.clear()
+            self._emit_status(self._render_fallback_notice(drained))
         except Exception:
             # Never break the conversation loop on a notice hiccup.
             pass

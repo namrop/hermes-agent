@@ -2820,17 +2820,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         # The buffered line above is dropped on successful recovery, but a
         # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
-        logger.info(
-            "Fallback activated: %s → %s (%s)",
-            old_model, fb_model, fb_provider,
+        # even when the fallback succeeds.  Record this hop in the turn's
+        # pending walk; the success path collapses ALL hops into one notice
+        # via _emit_pending_fallback_notice (see run_agent.py) — the old
+        # single-slot notice kept only the last hop, hiding the primary's
+        # failure on multi-hop walks.  Discarded on terminal failure since
+        # the buffered trace is flushed instead.
+        agent._record_fallback_hop(old_model, old_provider, fb_model, fb_provider)
+        # WARNING, not INFO: a fallback activation means a provider just
+        # failed and the live route changed — operator-significant. INFO
+        # records never reach the journal (the gateway's stderr handler
+        # defaults to WARNING) and agent.log's rotation window is hours at
+        # Sol volume, which is why 7 days of journal showed 0 of these
+        # (docs/NEXT.md item 2, diagnosed 2026-08-29).
+        logger.warning(
+            "Fallback activated: %s via %s → %s via %s",
+            old_model, old_provider, fb_model, fb_provider,
         )
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would
