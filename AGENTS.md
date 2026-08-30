@@ -4,6 +4,11 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+> **Fork note (`luis/sol-primary`):** work that is specified but not yet implemented
+> lives in [`docs/NEXT.md`](./docs/NEXT.md) — read it before starting new work so you don't
+> duplicate a queued item. Accepted decisions already in the tree go in
+> [`docs/ADR.md`](./docs/ADR.md).
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
