@@ -1,6 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
 import asyncio
+import json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -48,6 +49,10 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_get("/api/sessions/{session_id}/system_prompt", adapter._handle_session_system_prompt)
+    app.router.add_get("/api/sessions/{session_id}/approvals", adapter._handle_session_approvals)
+    app.router.add_post("/api/sessions/{session_id}/approval", adapter._handle_session_approval)
+    app.router.add_post("/api/sessions/{session_id}/stop", adapter._handle_session_stop)
+    app.router.add_get("/api/approvals", adapter._handle_list_approvals)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -953,3 +958,471 @@ async def test_session_system_prompt_unknown_session_404s(adapter):
         resp = await cli.get("/api/sessions/no-such-session/system_prompt")
         assert resp.status == 404, await resp.text()
         assert (await resp.json())["error"]["code"] == "session_not_found"
+
+
+# ---------------------------------------------------------------------------
+# Session approval + stop surface (Vikunja #613)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def approval_queues():
+    """Give each test an empty gateway approval queue and restore it after.
+
+    ``tools.approval._gateway_queues`` is process-global (it is reached from
+    agent threads that have no handle on anything else), so a test that leaves
+    an entry behind changes what the next test's global listing returns.
+    """
+    from tools import approval as approval_mod
+
+    saved = dict(approval_mod._gateway_queues)
+    approval_mod._gateway_queues.clear()
+    try:
+        yield approval_mod._gateway_queues
+    finally:
+        approval_mod._gateway_queues.clear()
+        approval_mod._gateway_queues.update(saved)
+
+
+def _enqueue_approval(queues, session_key: str, **data):
+    """Append a pending approval entry to *session_key*'s queue."""
+    from tools.approval import _ApprovalEntry
+
+    payload = {
+        "command": "rm -rf /tmp/demo",
+        "description": "recursive delete",
+        "pattern_key": "rm_rf",
+        "pattern_keys": ["rm_rf"],
+        "allow_permanent": True,
+        "allow_session": True,
+    }
+    payload.update(data)
+    entry = _ApprovalEntry(payload)
+    queues.setdefault(session_key, []).append(entry)
+    return entry
+
+
+class _StubTurn:
+    def __init__(self, agent):
+        self.agent = agent
+
+
+class _StubSessionState:
+    def __init__(self, agent):
+        self.turn = _StubTurn(agent)
+
+
+class _StubRunner:
+    """Minimal gateway-runner stand-in exposing only _peek_session_state."""
+
+    def __init__(self, states=None):
+        self._states = states or {}
+
+    def _peek_session_state(self, session_key):
+        return self._states.get(session_key)
+
+
+class _StubAgent:
+    def __init__(self):
+        self.interrupts = []
+
+    def hard_interrupt(self, message=None):
+        self.interrupts.append(message)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_capabilities_advertises_approval_and_stop_surface(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/v1/capabilities")
+        assert resp.status == 200
+        data = await resp.json()
+
+    features = data["features"]
+    assert features["session_approvals"] is True
+    assert features["session_approval"] is True
+    assert features["session_stop"] is True
+    assert features["approvals_list"] is True
+    endpoints = data["endpoints"]
+    assert endpoints["session_approvals"] == {
+        "method": "GET",
+        "path": "/api/sessions/{session_id}/approvals",
+    }
+    assert endpoints["session_approval"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/approval",
+    }
+    assert endpoints["session_stop"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/stop",
+    }
+    assert endpoints["approvals_list"] == {"method": "GET", "path": "/api/approvals"}
+
+
+@pytest.mark.asyncio
+async def test_session_approvals_lists_pending_without_session_key(
+    adapter, session_db, approval_queues
+):
+    """The pending list carries enough to adjudicate — and never the key.
+
+    ``session_key`` resolves approvals for the whole conversation, so echoing
+    it would hand every reader the capability the endpoint exists to mediate.
+    """
+    session_id = session_db.create_session(
+        "approval-session", "discord", session_key="discord:chan-1"
+    )
+    entry = _enqueue_approval(
+        approval_queues,
+        "discord:chan-1",
+        turn_id="turn-9",
+        tool_call_id="call-3",
+    )
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/approvals")
+        assert resp.status == 200, await resp.text()
+        payload = await resp.json()
+
+    assert payload["object"] == "hermes.session.approvals"
+    assert payload["session_id"] == session_id
+    assert len(payload["approvals"]) == 1
+    item = payload["approvals"][0]
+    assert item["request_id"] == entry.data["request_id"]
+    assert item["command"] == "rm -rf /tmp/demo"
+    assert item["pattern_keys"] == ["rm_rf"]
+    assert item["choices"] == ["once", "session", "always", "deny"]
+    assert item["turn_id"] == "turn-9"
+    assert item["tool_call_id"] == "call-3"
+    # F1 enrichment: both stamps are present and ordered.
+    assert item["expires_at"] > item["created_at"]
+    assert "session_key" not in item
+    assert "discord:chan-1" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_session_approvals_smart_denied_narrows_choices(
+    adapter, session_db, approval_queues
+):
+    session_id = session_db.create_session(
+        "smart-denied-session", "discord", session_key="discord:chan-sd"
+    )
+    _enqueue_approval(
+        approval_queues,
+        "discord:chan-sd",
+        smart_denied=True,
+        allow_permanent=False,
+        allow_session=False,
+    )
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        payload = await (await cli.get(f"/api/sessions/{session_id}/approvals")).json()
+
+    item = payload["approvals"][0]
+    assert item["smart_denied"] is True
+    assert item["allow_permanent"] is False
+    assert item["allow_session"] is False
+    assert item["choices"] == ["once", "deny"]
+
+
+@pytest.mark.asyncio
+async def test_session_approvals_empty_without_gateway_key(adapter, session_db, approval_queues):
+    """An API-created session has no routing key, so it has no queue."""
+    session_id = session_db.create_session("keyless-session", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/approvals")
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["approvals"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_approvals_unknown_session_404s(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/sessions/no-such-session/approvals")
+        assert resp.status == 404, await resp.text()
+        assert (await resp.json())["error"]["code"] == "session_not_found"
+
+
+@pytest.mark.asyncio
+async def test_session_approval_requires_auth(auth_adapter, session_db, approval_queues):
+    session_id = session_db.create_session(
+        "auth-approval-session", "discord", session_key="discord:chan-auth"
+    )
+    _enqueue_approval(approval_queues, "discord:chan-auth")
+    app = _create_session_app(auth_adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        assert (await cli.get(f"/api/sessions/{session_id}/approvals")).status == 401
+        assert (
+            await cli.post(
+                f"/api/sessions/{session_id}/approval", json={"choice": "once"}
+            )
+        ).status == 401
+        assert (await cli.post(f"/api/sessions/{session_id}/stop", json={})).status == 401
+        assert (await cli.get("/api/approvals")).status == 401
+
+    # The rejected calls must not have resolved anything.
+    assert len(approval_queues["discord:chan-auth"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_approval_resolves_by_request_id(adapter, session_db, approval_queues):
+    session_id = session_db.create_session(
+        "resolve-session", "discord", session_key="discord:chan-2"
+    )
+    first = _enqueue_approval(approval_queues, "discord:chan-2", command="cmd-1")
+    second = _enqueue_approval(approval_queues, "discord:chan-2", command="cmd-2")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/approval",
+            json={"choice": "approve", "request_id": second.data["request_id"]},
+        )
+        assert resp.status == 200, await resp.text()
+        payload = await resp.json()
+
+    assert payload == {
+        "object": "hermes.session.approval_response",
+        "session_id": session_id,
+        "request_id": second.data["request_id"],
+        "choice": "once",
+        "resolved": 1,
+    }
+    # The targeted entry was resolved; the FIFO head was left alone.
+    assert second.result == "once"
+    assert second.event.is_set()
+    assert first.result is None
+    assert [e.data["request_id"] for e in approval_queues["discord:chan-2"]] == [
+        first.data["request_id"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_approval_requires_request_id_when_multiple_pending(
+    adapter, session_db, approval_queues
+):
+    """session_key is per-conversation: a bare FIFO could answer another session.
+
+    Two sessions can share one routing key, so an untargeted resolve is not
+    merely ambiguous — it can consent on behalf of a session the caller never
+    named. Refuse rather than guess.
+    """
+    session_id = session_db.create_session(
+        "ambiguous-session", "discord", session_key="discord:chan-3"
+    )
+    _enqueue_approval(approval_queues, "discord:chan-3", command="cmd-1")
+    _enqueue_approval(approval_queues, "discord:chan-3", command="cmd-2")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/approval", json={"choice": "deny"}
+        )
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["error"]["code"] == "approval_request_id_required"
+
+        # all=true is the sanctioned untargeted form and still works.
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/approval",
+            json={"choice": "deny", "all": True, "reason": "not now"},
+        )
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["resolved"] == 2
+
+    assert "discord:chan-3" not in approval_queues
+
+
+@pytest.mark.asyncio
+async def test_session_approval_single_pending_needs_no_request_id(
+    adapter, session_db, approval_queues
+):
+    session_id = session_db.create_session(
+        "single-pending-session", "discord", session_key="discord:chan-4"
+    )
+    entry = _enqueue_approval(approval_queues, "discord:chan-4")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/approval",
+            json={"choice": "deny", "reason": "too broad"},
+        )
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["resolved"] == 1
+
+    assert entry.result == "deny"
+    assert entry.reason == "too broad"
+
+
+@pytest.mark.asyncio
+async def test_session_approval_no_pending_returns_409(adapter, session_db, approval_queues):
+    session_id = session_db.create_session(
+        "nothing-pending-session", "discord", session_key="discord:chan-5"
+    )
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/approval", json={"choice": "once"}
+        )
+        assert resp.status == 409, await resp.text()
+        assert (await resp.json())["error"]["code"] == "approval_not_pending"
+
+
+@pytest.mark.asyncio
+async def test_session_approval_rejects_unknown_choice(adapter, session_db, approval_queues):
+    session_id = session_db.create_session(
+        "bad-choice-session", "discord", session_key="discord:chan-6"
+    )
+    entry = _enqueue_approval(approval_queues, "discord:chan-6")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/approval", json={"choice": "maybe"}
+        )
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["error"]["code"] == "invalid_approval_choice"
+
+    assert entry.result is None
+
+
+@pytest.mark.asyncio
+async def test_session_approval_keyless_session_409s(adapter, session_db, approval_queues):
+    session_id = session_db.create_session("keyless-approval-session", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/approval", json={"choice": "once"}
+        )
+        assert resp.status == 409, await resp.text()
+        assert (await resp.json())["error"]["code"] == "approval_not_active"
+
+
+@pytest.mark.asyncio
+async def test_session_approval_first_response_wins_loser_gets_409(
+    adapter, session_db, approval_queues
+):
+    """THE RACE: two clients answer the same approval; exactly one resolves it.
+
+    Diadem's whole point is that a human and an agent may be looking at the
+    same pending approval. The queue resolves under a lock, so the second
+    caller must be told the state moved (409) rather than silently succeeding
+    on an approval it did not actually decide.
+    """
+    session_id = session_db.create_session(
+        "race-session", "discord", session_key="discord:chan-7"
+    )
+    entry = _enqueue_approval(approval_queues, "discord:chan-7")
+    app = _create_session_app(adapter)
+    body = {"choice": "once", "request_id": entry.data["request_id"]}
+
+    async with TestClient(TestServer(app)) as cli:
+        first, second = await asyncio.gather(
+            cli.post(f"/api/sessions/{session_id}/approval", json=body),
+            cli.post(f"/api/sessions/{session_id}/approval", json=body),
+        )
+        statuses = sorted([first.status, second.status])
+        payloads = [await first.json(), await second.json()]
+
+    assert statuses == [200, 409]
+    winner = next(p for p in payloads if p.get("resolved"))
+    loser = next(p for p in payloads if "error" in p)
+    assert winner["resolved"] == 1
+    assert loser["error"]["code"] == "approval_not_pending"
+    assert entry.result == "once"
+
+
+@pytest.mark.asyncio
+async def test_session_stop_interrupts_running_turn(adapter, session_db):
+    session_id = session_db.create_session(
+        "stop-session", "discord", session_key="discord:chan-8"
+    )
+    agent = _StubAgent()
+    adapter.gateway_runner = _StubRunner({"discord:chan-8": _StubSessionState(agent)})
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(f"/api/sessions/{session_id}/stop", json={})
+        assert resp.status == 200, await resp.text()
+        payload = await resp.json()
+
+    assert payload == {
+        "object": "hermes.session.stop",
+        "session_id": session_id,
+        "status": "stopping",
+    }
+    assert agent.interrupts == ["Stop requested via API"]
+
+
+@pytest.mark.asyncio
+async def test_session_stop_reports_not_running(adapter, session_db):
+    """No running turn — and no session_key at all — are both honest no-ops."""
+    running_id = session_db.create_session(
+        "idle-session", "discord", session_key="discord:chan-9"
+    )
+    keyless_id = session_db.create_session("keyless-stop-session", "api_server")
+    adapter.gateway_runner = _StubRunner({})
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        for session_id in (running_id, keyless_id):
+            resp = await cli.post(f"/api/sessions/{session_id}/stop", json={})
+            assert resp.status == 200, await resp.text()
+            assert (await resp.json())["status"] == "not_running"
+
+
+@pytest.mark.asyncio
+async def test_session_stop_unknown_session_404s(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions/no-such-session/stop", json={})
+        assert resp.status == 404, await resp.text()
+        assert (await resp.json())["error"]["code"] == "session_not_found"
+
+
+@pytest.mark.asyncio
+async def test_list_approvals_maps_keys_to_sessions_and_admits_orphans(
+    adapter, session_db, approval_queues
+):
+    """The global watch surface attributes what it can and admits what it can't.
+
+    An approval whose routing key matches no session row still has to appear:
+    an unattributable pending approval is precisely the one an operator needs
+    to see, and dropping it would make the list quietly wrong.
+    """
+    session_id = session_db.create_session(
+        "watch-session", "discord", session_key="discord:chan-10"
+    )
+    _enqueue_approval(approval_queues, "discord:chan-10", command="mapped")
+    _enqueue_approval(approval_queues, "telegram:orphan", command="orphaned")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/approvals")
+        assert resp.status == 200, await resp.text()
+        payload = await resp.json()
+
+    assert payload["object"] == "hermes.approvals"
+    by_command = {item["command"]: item for item in payload["approvals"]}
+    assert by_command["mapped"]["session_id"] == session_id
+    assert by_command["orphaned"]["session_id"] is None
+    assert all("session_key" not in item for item in payload["approvals"])
+    # Same redacted projection as the per-session list.
+    assert by_command["mapped"]["choices"] == ["once", "session", "always", "deny"]
+
+
+@pytest.mark.asyncio
+async def test_list_approvals_empty_when_nothing_pending(adapter, approval_queues):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/approvals")
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["approvals"] == []

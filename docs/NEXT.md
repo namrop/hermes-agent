@@ -46,37 +46,46 @@ continuation seams) is a small frontend round.
 
 ---
 
-## Session approval + stop API (Diadem β adjudication surface, Vikunja #613)
+## SSE approval stream (`GET /api/approvals/events`)
 
-**Problem (2026-08-30, Diadem lane):** Diadem can render a session but cannot
-*act* on one. A pending dangerous-command approval is reachable today only
-through a chat platform's button card or the TUI gateway's JSON-RPC method;
-the HTTP API exposes approval resolution only per-`/v1/runs/{run_id}`, which
-Diadem never owns. Likewise there is no way to stop an in-flight session turn
-from the API. The keeper-ruled β scope is therefore **session-scoped approval
-+ stop**.
+**Deferred from Vikunja #613.** The β adjudication surface is poll-first:
+`GET /api/approvals` returns the pending list, and a client that wants to
+notice an approval it did not initiate polls it. That is adequate for a
+single operator and a handful of sessions; it is not adequate for a wall
+display or for sub-second handoff between a human and an agent.
 
-**Shape (build to `f789ce4e`, the session sysprompt endpoint):**
+**The design is already settled — see `docs/ADR.md` (2026-08-30).** The
+broadcast must be fed from the **enqueue point** in
+`_await_gateway_decision`, where `_ApprovalEntry` is constructed, and NOT
+from the `pre_approval_request` plugin hook: the hook payload has no
+`request_id` (it is minted inside `_ApprovalEntry`), so hook-fed events
+would be unactionable, and the hook also fires on the smart
+auto-adjudication path that never enqueues anything.
 
-- `tools/approval.py` — enrich `_ApprovalEntry` payloads with `created_at`,
-  `expires_at` (created + configured approval timeout), and the enqueue-time
-  contextvars (`turn_id`, `tool_call_id`, `session_id`). Additive keys only:
-  the dict is copied into every platform approval card. Add
-  `list_all_gateway_approvals()` (under `_lock`) for the global read.
-- `GET /api/sessions/{session_id}/approvals` — redacted pending list.
-  **Never echo `session_key`** — it is the capability that resolves an
-  approval.
-- `POST /api/sessions/{session_id}/approval` — `{choice, request_id?, all?,
-  reason?}`. `request_id` targeting is **required when more than one approval
-  is pending on the conversation**: `session_key` is per-conversation, not
-  per-session, so a bare FIFO resolve could answer a different session's
-  approval. `resolved <= 0` → `409 approval_not_pending` (the
-  first-response-wins loser signal).
-- `POST /api/sessions/{session_id}/stop` — reach the gateway runner,
-  `_peek_session_state(session_key)` → running turn's agent →
-  `request_hard_interrupt`. Bare interrupt for this cut.
-- `GET /api/approvals` — poll-first global watch surface. SSE deferred.
+**Work:** a broadcast seam at the enqueue site (and at
+`resolve_gateway_approval` for the `approval.resolved` counterpart, so a
+client learns it lost the race without polling), an SSE route reusing the
+`_session_approval_view` projection, and `approvals_stream` in the
+capabilities manifest. The per-entry `created_at` / `expires_at` stamps
+landed with #613 and are what let a stream client render a countdown.
 
-**Not in this cut:** the SSE broadcast seam (design goes to `docs/ADR.md`),
-and `_interrupt_and_clear_session` on stop (needs a synthesized
-`SessionSource`).
+---
+
+## Session stop should clear queued work, not just interrupt
+
+**Deferred from Vikunja #613.** `POST /api/sessions/{id}/stop` currently
+sends a bare `request_hard_interrupt` to the running turn's agent. The
+gateway's own `/stop` goes further through
+`GatewayRunner._interrupt_and_clear_session`, which also drops queued
+follow-up work and posts a stop notice to the user.
+
+**Why it was not done:** `_interrupt_and_clear_session` needs a
+`SessionSource`, and this endpoint has none — the caller is an HTTP client,
+not a chat message. Synthesizing one means guessing a platform/chat/thread,
+and a wrong guess posts the stop notice into someone else's channel.
+
+**Work:** either give `_interrupt_and_clear_session` a notice-suppressing
+mode that takes a `session_key` instead of a source, or reconstruct a
+faithful `SessionSource` from the session row's `source`/`chat_id`/
+`thread_id`/`origin_json` and stop guessing. The first is smaller and does
+not invent an origin.

@@ -211,8 +211,18 @@ def test_live_session_payload_replays_pending_approval(server, monkeypatch):
     assert payload["pending_approval"] is not first
     replayed = payload["pending_approval"]
     # request_id is injected by _ApprovalEntry so reconnecting clients can
-    # correlate their approval.respond with the exact queued request.
+    # correlate their approval.respond with the exact queued request; the
+    # enqueue-time stamps (created/expires + turn/tool/session identity) are
+    # injected alongside it so a reattaching client can tell how old the
+    # request is and what raised it. Both are additive: assert the caller's
+    # payload survives verbatim rather than freezing the injected key set.
     assert replayed.pop("request_id")
+    created_at = replayed.pop("created_at")
+    assert created_at > 0
+    assert replayed.pop("expires_at") > created_at
+    for injected in ("turn_id", "tool_call_id", "session_id"):
+        assert injected in replayed
+        replayed.pop(injected)
     assert replayed == first
 
 

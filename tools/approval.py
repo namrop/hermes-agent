@@ -2710,12 +2710,49 @@ class _ApprovalEntry:
         self.event = threading.Event()
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
+        self._stamp_enqueue_context()
         self.acknowledged = False
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+
+    def _stamp_enqueue_context(self) -> None:
+        """Stamp enqueue-time timing and identity onto ``self.data``.
+
+        Read surfaces (the HTTP approvals endpoints, the TUI gateway's
+        pending-approval method) need to know *when* a request arrived, when
+        it will fail closed, and which turn/tool call it belongs to — none of
+        which is recoverable after the fact, because the queue holds no
+        history. The contextvars are read here rather than at the read side
+        on purpose: ``_ApprovalEntry`` is constructed on the agent thread that
+        blocked, which is the only context where they are bound.
+
+        Every key is ADDITIVE and set via ``setdefault``: ``self.data`` is
+        copied verbatim into every platform approval card and into the notify
+        payload, so an existing caller-supplied value always wins and no
+        existing key changes meaning.
+
+        ``expires_at`` is wall-clock and advisory — the authoritative wait
+        deadline in ``_await_gateway_decision`` is monotonic — so a client
+        must treat it as "roughly when this stops being answerable", not as a
+        guarantee. ``turn_id`` / ``tool_call_id`` / ``session_id`` normalize
+        the contextvars' empty-string default to ``None`` so a JSON reader can
+        tell "not bound" from "bound to something".
+        """
+        created_at = self.data.setdefault("created_at", time.time())
+        try:
+            timeout = float(_get_approval_timeout())
+        except Exception:  # pragma: no cover - config read is already defensive
+            timeout = 300.0
+        try:
+            self.data.setdefault("expires_at", float(created_at) + timeout)
+        except (TypeError, ValueError):  # caller supplied a non-numeric created_at
+            self.data.setdefault("expires_at", None)
+        self.data.setdefault("turn_id", _approval_turn_id.get() or None)
+        self.data.setdefault("tool_call_id", _approval_tool_call_id.get() or None)
+        self.data.setdefault("session_id", _approval_session_id.get() or None)
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2793,6 +2830,28 @@ def list_gateway_approvals(session_key: str) -> list[dict]:
     """Return replay-safe snapshots of unresolved approvals for one session."""
     with _lock:
         return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])]
+
+
+def list_all_gateway_approvals() -> dict[str, list[dict]]:
+    """Return replay-safe snapshots of every unresolved approval, by session key.
+
+    One ``_lock`` acquisition for the whole map: a caller that instead looped
+    over ``_gateway_queues`` calling :func:`list_gateway_approvals` per key
+    would be reading a queue that resolves and mutates underneath it, and
+    would tear a resolve across two sessions. Empty queues are omitted rather
+    than reported as keys with no approvals — ``resolve_gateway_approval``
+    already pops a key when its last entry is taken, so an empty list here
+    would only ever be a transient artifact of the caller's own iteration.
+
+    The values are the same replay-safe copies :func:`list_gateway_approvals`
+    returns; the caller owns them and mutating one cannot corrupt the queue.
+    """
+    with _lock:
+        return {
+            key: [dict(entry.data) for entry in entries]
+            for key, entries in _gateway_queues.items()
+            if entries
+        }
 
 
 def ack_gateway_approval(session_key: str, request_id: str) -> bool:

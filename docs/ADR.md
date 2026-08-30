@@ -1,5 +1,74 @@
 # Architecture Decision Records
 
+## 2026-08-30: Session approval + stop API — request_id targeting, and where an approval stream must be fed from
+
+Status: Accepted (Vikunja #613)
+
+Context:
+Diadem needs to adjudicate a session, not just render one. Before this
+change the HTTP API could resolve an approval only through
+`POST /v1/runs/{run_id}/approval`, which requires owning the run — Diadem
+owns none — and it could not stop an in-flight session turn at all. The
+blocking approval queue (`tools/approval._gateway_queues`) is keyed by the
+gateway **`session_key`**, which is the per-*conversation* routing key, not
+the session id: two sessions on the same channel share one queue.
+
+Three consequences drove the design:
+
+1. `session_key` is a capability, not an identifier. Anything holding it can
+   resolve any approval on that conversation. It is therefore never emitted
+   by these endpoints; the session row is the translation table
+   (`sessions.session_key`), and clients address approvals by `request_id`.
+2. An untargeted FIFO resolve is not merely ambiguous — it can consent on
+   behalf of a session the caller never named. A chat user typing `/approve`
+   accepts that because they are looking at the card; an API client is not.
+3. Two clients can hold the same pending approval (that is the point of a
+   shared adjudication surface), so answering is inherently racy.
+
+Decision:
+- `request_id` is **required** on `POST /api/sessions/{id}/approval` whenever
+  more than one approval is pending on the conversation (400
+  `approval_request_id_required`). With exactly one pending the target is
+  unambiguous and it may be omitted. `all: true` remains the sanctioned
+  untargeted form — it means "resolve everything pending on this
+  conversation" (`/approve all` semantics) and is deliberate breadth, not a
+  guess.
+- `resolve_gateway_approval` returning `<= 0` is the **first-response-wins
+  loser signal** and maps to `409 approval_not_pending`, not 404: the session
+  is fine and the request was well-formed; the state moved. The winner is
+  whichever call took `_lock` first.
+- `POST /api/sessions/{id}/stop` sends a **bare** `request_hard_interrupt`.
+  The gateway's own `/stop` goes through `_interrupt_and_clear_session`,
+  which also clears queued work and posts a notice — but it needs a
+  `SessionSource` this endpoint cannot honestly synthesize, and a fabricated
+  one would post the stop notice into a guessed channel. `status` is
+  `"stopping"` only when an interrupt was actually accepted: a session slot
+  can hold a pending sentinel rather than a real agent, and promising a stop
+  nothing will perform is worse than reporting `"not_running"`.
+- The β watch surface is **poll-first** (`GET /api/approvals`). Approvals
+  whose routing key maps to no session row are reported with
+  `"session_id": null` rather than dropped — an unattributable pending
+  approval is exactly the one an operator needs to see.
+
+Consequences / the deferred stream:
+When an SSE approval stream is added, it must be fed from the **enqueue
+point** in `_await_gateway_decision` (where `_ApprovalEntry` is constructed),
+NOT from the `pre_approval_request` plugin hook. The hook payload carries
+`command`/`description`/`pattern_key(s)`/`session_key`/`surface` plus the
+turn/tool/session contextvars — but **no `request_id`**, which is minted by
+`_ApprovalEntry` itself. A stream fed from the hook would therefore emit
+events no client could act on, since `request_id` is the only safe targeting
+handle (see above). Worse, `pre_approval_request` also fires on the *smart*
+auto-adjudication path (`_observe_smart_approval_*`), which never enqueues
+anything: a hook-fed stream would announce approvals that can never be
+answered. The enqueue point has the entry, the request id, and the guarantee
+that something is actually blocked. `_ApprovalEntry` now stamps `created_at`
+/ `expires_at` / `turn_id` / `tool_call_id` / `session_id` at construction
+for exactly this reason — the queue keeps no history, so anything not
+captured at enqueue is unrecoverable at read time. Every stamp is additive
+and set with `setdefault`, because the entry's `data` dict is copied verbatim
+into every platform approval card.
+
 ## 2026-08-29: Journal visibility requires WARNING — INFO is file-only with an hours-scale window
 
 Status: Accepted (Vikunja #611)

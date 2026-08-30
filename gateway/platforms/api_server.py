@@ -77,6 +77,53 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
 
 
+def _session_approval_view(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Project one queued approval into its client-facing HTTP shape.
+
+    Two properties are load-bearing:
+
+    * ``session_key`` is NEVER echoed. It is not an identifier, it is the
+      capability: anything holding it can resolve any approval on that
+      conversation through ``resolve_gateway_approval``. Clients target an
+      approval by ``request_id`` and address the session by ``session_id``.
+    * ``command`` is re-run through the gateway's approval redactor. The
+      terminal guard already redacts before enqueue, but the run-SSE transport
+      redacts again at egress (#48456) because not every enqueue path is
+      guaranteed to have done so. This is a third transport for the same
+      payload, so it gets the same treatment rather than a weaker one.
+
+    ``choices`` is computed with :func:`_approval_event_choices` — the same
+    function the SSE ``approval.request`` event uses — so a client never has
+    to reimplement the smart-DENY / no-permanent scope rules.
+    """
+    command = entry.get("command")
+    try:
+        from gateway.run import _redact_approval_command
+
+        command = _redact_approval_command(command)
+    except Exception:  # pragma: no cover - redactor import/exec is defensive
+        pass
+    allow_permanent = entry.get("allow_permanent") is not False
+    smart_denied = bool(entry.get("smart_denied"))
+    return {
+        "request_id": entry.get("request_id"),
+        "command": command,
+        "description": entry.get("description"),
+        "pattern_keys": list(entry.get("pattern_keys") or []),
+        "allow_permanent": allow_permanent,
+        "allow_session": entry.get("allow_session") is not False,
+        "smart_denied": smart_denied,
+        "choices": _approval_event_choices(
+            smart_denied=smart_denied,
+            allow_permanent=allow_permanent,
+        ),
+        "created_at": entry.get("created_at"),
+        "expires_at": entry.get("expires_at"),
+        "turn_id": entry.get("turn_id"),
+        "tool_call_id": entry.get("tool_call_id"),
+    }
+
+
 try:
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
@@ -2101,6 +2148,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("GET", "/api/sessions/{session_id}/system_prompt", self._handle_session_system_prompt),
+            ("GET", "/api/sessions/{session_id}/approvals", self._handle_session_approvals),
+            ("POST", "/api/sessions/{session_id}/approval", self._handle_session_approval),
+            ("POST", "/api/sessions/{session_id}/stop", self._handle_session_stop),
+            ("GET", "/api/approvals", self._handle_list_approvals),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3215,6 +3266,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "session_approvals": True,
+                "session_approval": True,
+                "session_stop": True,
+                "approvals_list": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -3247,6 +3302,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_system_prompt": {"method": "GET", "path": "/api/sessions/{session_id}/system_prompt"},
+                "session_approvals": {"method": "GET", "path": "/api/sessions/{session_id}/approvals"},
+                "session_approval": {"method": "POST", "path": "/api/sessions/{session_id}/approval"},
+                "session_stop": {"method": "POST", "path": "/api/sessions/{session_id}/stop"},
+                "approvals_list": {"method": "GET", "path": "/api/approvals"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -3726,6 +3785,325 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session.get("id"),
             "system_prompt": session.get("system_prompt") or None,
             "system_prompt_hash": session.get("system_prompt_hash") or None,
+        })
+
+    async def _handle_session_approvals(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/approvals — pending approvals.
+
+        The blocking approval queue is keyed by the gateway ``session_key``
+        (the per-conversation routing key), not by session id, so the session
+        row is the translation table: resolve it first, then read its
+        ``session_key``. A session row without one (an API-created session
+        that never went through gateway routing) simply has no queue and
+        answers with an empty list — that is an honest empty, not an error.
+
+        The response never contains ``session_key``; see
+        :func:`_session_approval_view`.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        if err:
+            return err
+
+        session_key = (session.get("session_key") or "").strip()
+        approvals: List[Dict[str, Any]] = []
+        if session_key:
+            try:
+                from tools.approval import list_gateway_approvals
+
+                approvals = [
+                    _session_approval_view(entry)
+                    for entry in list_gateway_approvals(session_key)
+                ]
+            except Exception:
+                logger.exception(
+                    "[api_server] failed listing approvals for session %s",
+                    session.get("id"),
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Failed to read pending approvals",
+                        err_type="server_error",
+                        code="approval_read_failed",
+                    ),
+                    status=500,
+                )
+
+        return web.json_response({
+            "object": "hermes.session.approvals",
+            "session_id": session.get("id"),
+            "approvals": approvals,
+        })
+
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/approval — resolve a pending approval.
+
+        Body: ``{"choice": "once|session|always|deny", "request_id": ...,
+        "all": bool, "reason": str}``. ``choice`` accepts the same aliases as
+        the run endpoint so one client vocabulary serves both surfaces.
+
+        **``request_id`` is required whenever more than one approval is
+        pending on the conversation.** The queue is keyed by ``session_key``,
+        which is per-*conversation*, not per-session: two sessions on the same
+        channel share one queue, so an untargeted FIFO resolve can answer an
+        approval that belongs to a different session than the one in the URL.
+        A chat user typing ``/approve`` accepts that because they are looking
+        at the card; an API client is not, so it must name the request. When
+        exactly one approval is pending the target is unambiguous and
+        ``request_id`` may be omitted.
+
+        ``all: true`` is the deliberate exception: it means "resolve
+        everything pending on this conversation" (the ``/approve all``
+        semantics) and therefore does not need — and is not narrowed by —
+        a request id.
+
+        ``resolved <= 0`` is the first-response-wins loser signal: the
+        approval existed when the client read it and was answered by someone
+        else (another client, the chat card, a timeout) before this call took
+        ``_lock``. It is a 409, not a 404, because the session is fine and the
+        request was well-formed; the state moved.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        if err:
+            return err
+
+        body, body_err = await self._read_json_body(request)
+        if body_err:
+            return body_err
+
+        raw_choice = str(body.get("choice", "")).strip().lower()
+        aliases = {"approve": "once", "approved": "once", "allow": "once"}
+        choice = aliases.get(raw_choice, raw_choice)
+        if choice not in {"once", "session", "always", "deny"}:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
+        session_key = (session.get("session_key") or "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error(
+                    f"Session has no gateway approval queue: {session.get('id')}",
+                    code="approval_not_active",
+                ),
+                status=409,
+            )
+
+        request_id = str(body.get("request_id") or "").strip()
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        reason = str(body.get("reason") or "").strip() or None
+
+        try:
+            from tools.approval import list_gateway_approvals, resolve_gateway_approval
+
+            if not request_id and not resolve_all:
+                pending = list_gateway_approvals(session_key)
+                if len(pending) > 1:
+                    return web.json_response(
+                        _openai_error(
+                            "Multiple approvals are pending on this conversation; "
+                            "pass request_id to target one (or all=true to resolve "
+                            "every pending approval).",
+                            code="approval_request_id_required",
+                            param="request_id",
+                        ),
+                        status=400,
+                    )
+
+            resolved = resolve_gateway_approval(
+                session_key,
+                choice,
+                resolve_all=resolve_all,
+                reason=reason,
+                request_id=request_id or None,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[api_server] approval resolution failed for session %s",
+                session.get("id"),
+            )
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if resolved <= 0:
+            return web.json_response(
+                _openai_error(
+                    f"Session has no pending approval: {session.get('id')}",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+
+        return web.json_response({
+            "object": "hermes.session.approval_response",
+            "session_id": session.get("id"),
+            "request_id": request_id or None,
+            "choice": choice,
+            "resolved": resolved,
+        })
+
+    async def _handle_session_stop(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/stop — interrupt the running turn.
+
+        Unlike ``/v1/runs/{run_id}/stop``, this adapter does not own the
+        agent: a gateway session's turn is held by the gateway runner, so the
+        runner is the only place the agent object can be reached. Resolution
+        order is the adapter's injected runner, then the app key, then the
+        module-level ref — the same ladder the platform-callback and drain
+        paths use, so a differently-wired deployment behaves identically.
+
+        This cut sends a BARE ``request_hard_interrupt``. The gateway's own
+        ``/stop`` goes through ``_interrupt_and_clear_session``, which also
+        clears queued work and posts a notice, but it requires a
+        ``SessionSource`` this endpoint has no honest way to synthesize — a
+        fabricated source would post the stop notice into a guessed channel.
+        Queued-work clearing is recorded in ``docs/NEXT.md`` as the follow-up.
+
+        ``status`` is ``"stopping"`` only when an interrupt was actually
+        accepted. A session slot can hold a pending sentinel rather than a
+        real agent (see ``_is_session_running``), and
+        ``request_hard_interrupt`` returns False when the object exposes
+        neither interrupt ABI — reporting "stopping" there would promise a
+        stop that nothing is going to perform.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        if err:
+            return err
+
+        session_key = (session.get("session_key") or "").strip()
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if runner is None:
+            try:
+                from gateway.run import _gateway_runner_ref
+
+                runner = _gateway_runner_ref()
+            except Exception:
+                runner = None
+
+        agent = None
+        if runner is not None and session_key:
+            try:
+                state = runner._peek_session_state(session_key)
+            except Exception:
+                logger.exception(
+                    "[api_server] failed peeking session state for %s",
+                    session.get("id"),
+                )
+                state = None
+            agent = getattr(getattr(state, "turn", None), "agent", None)
+
+        stopping = False
+        if agent is not None:
+            try:
+                stopping = bool(request_hard_interrupt(agent, "Stop requested via API"))
+            except Exception:
+                logger.exception(
+                    "[api_server] stop failed for session %s", session.get("id")
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Failed to interrupt the running turn",
+                        err_type="server_error",
+                        code="session_stop_failed",
+                    ),
+                    status=500,
+                )
+
+        return web.json_response({
+            "object": "hermes.session.stop",
+            "session_id": session.get("id"),
+            "status": "stopping" if stopping else "not_running",
+        })
+
+    async def _handle_list_approvals(self, request: "web.Request") -> "web.Response":
+        """GET /api/approvals — every pending approval this process holds.
+
+        The poll-first watch surface: a client that wants to notice approvals
+        it did not initiate would otherwise have to poll every session it
+        knows about, and would still miss approvals raised on sessions it has
+        not listed. SSE is the eventual shape (see ``docs/ADR.md``); polling
+        this route is the β answer.
+
+        Queue keys are gateway ``session_key`` values, so each is mapped back
+        to a session id through the store's gateway-session listing. Keys that
+        map to no session row report ``"session_id": null`` rather than being
+        dropped: a pending approval that cannot be attributed is exactly the
+        thing an operator most needs to see, and hiding it would make the
+        watch surface quietly incomplete. The ``session_key`` itself is still
+        never emitted.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from tools.approval import list_all_gateway_approvals
+
+            queues = list_all_gateway_approvals()
+        except Exception:
+            logger.exception("[api_server] failed listing pending approvals")
+            return web.json_response(
+                _openai_error(
+                    "Failed to read pending approvals",
+                    err_type="server_error",
+                    code="approval_read_failed",
+                ),
+                status=500,
+            )
+
+        key_to_session_id: Dict[str, str] = {}
+        if queues:
+            db = await self._ensure_session_db_async()
+            if db is not None:
+                try:
+                    # active_only=False: an approval can outlive the row's
+                    # ended_at (the queue is process state, the row is store
+                    # state), and the listing already returns the newest row
+                    # per key, so this widens attribution without ambiguity.
+                    rows = await asyncio.to_thread(
+                        db.list_gateway_sessions, active_only=False
+                    )
+                except Exception:
+                    logger.warning(
+                        "[api_server] gateway session listing failed; "
+                        "reporting approvals without session ids",
+                        exc_info=True,
+                    )
+                    rows = []
+                for row in rows:
+                    key = (row.get("session_key") or "").strip()
+                    if key and key in queues:
+                        key_to_session_id[key] = row.get("id")
+
+        approvals: List[Dict[str, Any]] = []
+        for key, entries in queues.items():
+            session_id = key_to_session_id.get(key)
+            for entry in entries:
+                view = _session_approval_view(entry)
+                view["session_id"] = session_id
+                approvals.append(view)
+        # Oldest first: the one closest to timing out is the one an operator
+        # must answer first. Entries without a stamp sort last rather than
+        # crashing the sort on a None comparison.
+        approvals.sort(key=lambda item: (item.get("created_at") is None, item.get("created_at") or 0))
+
+        return web.json_response({
+            "object": "hermes.approvals",
+            "approvals": approvals,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
