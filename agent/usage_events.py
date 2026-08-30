@@ -59,7 +59,6 @@ CREATE TABLE IF NOT EXISTS usage_events (
     timestamp REAL NOT NULL,
     harness TEXT NOT NULL,
     session_id TEXT,
-    run_id TEXT,
     source TEXT,
     purpose TEXT NOT NULL DEFAULT 'main',
     record_kind TEXT NOT NULL DEFAULT 'api_attempt',
@@ -67,6 +66,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     measurement_confidence TEXT NOT NULL DEFAULT 'exact',
     provider TEXT,
     model TEXT,
+    model_reported TEXT,
     api_mode TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -163,10 +163,44 @@ class UsageEventLedger:
             conn = self._connect()
             with self._lock, conn:
                 conn.executescript(_SCHEMA_SQL)
+                self._migrate_schema(conn)
             self._conn = conn
         except Exception:
             logger.debug("usage-event ledger init failed", exc_info=True)
             self._conn = None
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        """Bring a pre-existing sidecar file up to the current schema.
+
+        New files are created by ``_SCHEMA_SQL`` already in final shape
+        (``CREATE TABLE IF NOT EXISTS`` never alters an existing table), so
+        existing files are adjusted in place on open:
+
+        * ``run_id`` is dropped — 0% populated since the table's creation
+          (keeper ruling 2026-08-29). Guarded: ``DROP COLUMN`` needs
+          SQLite >= 3.35; on an older build the dead column merely
+          survives, which loses nothing.
+        * ``model_reported`` is added — the provider-echoed served model,
+          the substitution-detection signal (NULL when the transport
+          echoes nothing; never copied from the requested ``model``).
+        """
+        cols = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM pragma_table_info('usage_events')"
+            )
+        }
+        if "run_id" in cols:
+            try:
+                conn.execute("ALTER TABLE usage_events DROP COLUMN run_id")
+            except sqlite3.OperationalError:
+                logger.debug(
+                    "run_id drop unsupported on this SQLite; dead column retained",
+                    exc_info=True,
+                )
+        if "model_reported" not in cols:
+            conn.execute("ALTER TABLE usage_events ADD COLUMN model_reported TEXT")
 
     def append_event(self, **event: Any) -> Optional[str]:
         """Append one event row; returns its ``event_uid`` or ``None``.
@@ -181,9 +215,10 @@ class UsageEventLedger:
             with self._lock, self._conn:
                 self._conn.execute(
                     """INSERT INTO usage_events (
-                           event_uid, timestamp, harness, session_id, run_id,
+                           event_uid, timestamp, harness, session_id,
                            source, purpose, record_kind, usage_source,
-                           measurement_confidence, provider, model, api_mode,
+                           measurement_confidence, provider, model,
+                           model_reported, api_mode,
                            billing_base_url, billing_mode,
                            input_tokens, output_tokens, cache_read_tokens,
                            cache_write_tokens, reasoning_tokens,
@@ -196,7 +231,6 @@ class UsageEventLedger:
                         float(event.get("timestamp") or now),
                         str(event.get("harness") or HARNESS_NAME),
                         event.get("session_id"),
-                        event.get("run_id"),
                         event.get("source"),
                         str(event.get("purpose") or "main"),
                         str(event.get("record_kind") or "api_attempt"),
@@ -204,6 +238,7 @@ class UsageEventLedger:
                         str(event.get("measurement_confidence") or "exact"),
                         event.get("provider"),
                         event.get("model"),
+                        event.get("model_reported"),
                         event.get("api_mode"),
                         event.get("billing_base_url"),
                         event.get("billing_mode"),
@@ -274,6 +309,7 @@ def record_model_delta_event(
     session_id: Optional[str],
     source: Optional[str],
     model: Optional[str],
+    model_reported: Optional[str] = None,
     provider: Optional[str],
     api_mode: Optional[str],
     billing_base_url: Optional[str],
@@ -298,6 +334,12 @@ def record_model_delta_event(
     ``api_call_count > 1``) remain one event — the contract's unit is the
     accounted delta, and fork-level splits are not available at the
     boundary.
+
+    ``model_reported`` is the model the provider's response *echoed back*
+    (the substitution-detection signal). It stays NULL when the transport
+    does not echo one and is never defaulted from the requested ``model`` —
+    an honest NULL beats a copied value; the whole point is detecting when
+    they differ.
     """
     ledger = get_event_ledger()
     if ledger is None:
@@ -314,6 +356,7 @@ def record_model_delta_event(
         purpose=purpose_for_task(task),
         provider=provider or "",
         model=model or "",
+        model_reported=model_reported or None,
         api_mode=api_mode,
         billing_base_url=billing_base_url or "",
         billing_mode=billing_mode or "",

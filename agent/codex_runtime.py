@@ -234,6 +234,11 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 if cost_result.status == "included" else None,
                 api_mode=agent.api_mode,
                 model=agent.model,
+                # The app-server protocol never echoes the served model
+                # (thread/tokenUsage/updated carries only token counts and
+                # modelContextWindow), so there is no substitution signal in
+                # scope — record an honest NULL, never the requested model.
+                model_reported=None,
                 api_call_count=1,
             )
         except Exception as exc:

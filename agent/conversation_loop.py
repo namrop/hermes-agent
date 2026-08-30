@@ -4265,6 +4265,15 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 api_mode=agent.api_mode,
                                 model=agent.model,
+                                # Provider-echoed served model (the
+                                # substitution-detection signal). Genuine
+                                # echo or None: non-streaming SDK responses
+                                # carry the provider's model field, and the
+                                # streaming reconstruction seeds model from
+                                # chunk echoes only — never the request.
+                                model_reported=(
+                                    getattr(response, "model", None) or None
+                                ),
                                 api_call_count=1,
                             )
                         except Exception as e:

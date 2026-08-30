@@ -7218,7 +7218,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
     _TOKEN_DELTA_ROUTE_FIELDS = (
-        "model", "cost_status", "cost_source", "pricing_version",
+        "model", "model_reported", "cost_status", "cost_source",
+        "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode", "api_mode",
     )
 
@@ -7488,6 +7489,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
         api_mode: Optional[str] = None,
+        model_reported: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
     ) -> None:
@@ -7499,6 +7501,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``chat_completions``, ``anthropic_messages``, ``codex_app_server``,
         ...) that the aggregate tables cannot represent. Lost at the
         2026-08-25 sidecar cutover; restored per the 2026-08-29 incident.
+
+        ``model_reported`` likewise threads through to the sidecar event
+        only: it is the model the provider's response echoed back (the
+        substitution-detection signal), NULL when no echo was in scope at
+        the call site — never defaulted from the requested ``model``.
 
         When *absolute* is False (default), values are **incremented** — use
         this for per-API-call deltas (CLI path).
@@ -7631,6 +7638,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn,
                     session_id,
                     model=model,
+                    model_reported=model_reported,
                     billing_provider=billing_provider,
                     billing_base_url=billing_base_url,
                     billing_mode=billing_mode,
@@ -7654,6 +7662,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         *,
         model: Optional[str],
+        model_reported: Optional[str] = None,
         billing_provider: Optional[str],
         billing_base_url: Optional[str],
         billing_mode: Optional[str],
@@ -7763,6 +7772,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 session_id=session_id,
                 source=sess_source,
                 model=eff_model,
+                # Never coalesced from the session or the requested model:
+                # NULL means "no provider echo in scope", and the value's
+                # entire purpose is diverging from ``model`` on substitution.
+                model_reported=model_reported or None,
                 provider=eff_provider,
                 api_mode=api_mode or None,
                 billing_base_url=eff_base_url,
@@ -7799,6 +7812,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         task: str,
         *,
         model: Optional[str] = None,
+        model_reported: Optional[str] = None,
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         api_mode: Optional[str] = None,
@@ -7841,6 +7855,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn,
                 session_id,
                 model=model,
+                model_reported=model_reported,
                 billing_provider=billing_provider,
                 billing_base_url=billing_base_url,
                 billing_mode=None,

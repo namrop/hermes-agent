@@ -102,6 +102,20 @@ class TestLedgerBasics:
         assert "idx_usage_events_harness_ts" in names
         assert "idx_usage_events_event_uid" in names
 
+    def test_new_schema_drops_run_id_and_carries_model_reported(self, tmp_path):
+        """run_id was 0% populated since the table's creation (keeper ruling
+        2026-08-29: removed); model_reported is the provider-echoed served
+        model. A freshly bootstrapped file has the final shape directly."""
+        ledger = UsageEventLedger(tmp_path / "usage_events.db")
+        cols = {
+            r["name"]
+            for r in ledger._conn.execute(
+                "SELECT name FROM pragma_table_info('usage_events')"
+            )
+        }
+        assert "run_id" not in cols
+        assert "model_reported" in cols
+
     def test_append_generates_uid_and_defaults(self, tmp_path):
         ledger = UsageEventLedger(tmp_path / "usage_events.db")
         uid = ledger.append_event(session_id="s1", input_tokens=5)
@@ -237,6 +251,46 @@ class TestGraftIntegration:
         assert rows[0]["api_mode"] is None
         assert rows[1]["api_mode"] == "anthropic_messages"
 
+    def test_model_reported_round_trips_never_copied_from_model(self, db):
+        """The provider-echoed served model is the substitution-detection
+        signal: a caller that passes it sees it verbatim on the event; a
+        caller that omits it yields NULL — never a copy of the requested
+        ``model``, because the value's entire purpose is diverging from it."""
+        db.update_token_counts(
+            "sess-1",
+            input_tokens=5,
+            model="glm-5.3",
+            billing_provider="zai",
+            model_reported="glm-5.3-air",
+            api_call_count=1,
+        )
+        db.update_token_counts(
+            "sess-1",
+            input_tokens=7,
+            model="glm-5.3",
+            billing_provider="zai",
+            api_call_count=1,
+        )
+        rows = _sidecar_rows()
+        assert len(rows) == 2
+        assert rows[0]["model"] == "glm-5.3"
+        assert rows[0]["model_reported"] == "glm-5.3-air"
+        assert rows[1]["model"] == "glm-5.3"
+        assert rows[1]["model_reported"] is None  # honest NULL, no copy
+
+    def test_model_reported_threads_through_aux_path(self, db):
+        db.record_auxiliary_usage(
+            "sess-1",
+            "vision",
+            model="gemini-flash",
+            billing_provider="google",
+            model_reported="gemini-flash-002",
+            input_tokens=9,
+        )
+        row = _sidecar_rows()[0]
+        assert row["model"] == "gemini-flash"
+        assert row["model_reported"] == "gemini-flash-002"
+
     def test_absolute_cumulative_never_events(self, db):
         db.update_token_counts(
             "sess-1",
@@ -367,3 +421,109 @@ class TestLegacyImport:
         assert result["skipped"] == 1
         ledger = ue._ledgers[str(tmp_path / "usage_events.db")]
         assert ledger.count() == 3
+
+
+# The sidecar schema as it shipped before 2026-08-29: run_id present (never
+# populated), model_reported absent. Used to prove the on-open migration
+# converges a deployed file to the current shape without losing rows.
+_OLD_SIDECAR_SQL = """
+CREATE TABLE usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_uid TEXT,
+    timestamp REAL NOT NULL,
+    harness TEXT NOT NULL,
+    session_id TEXT,
+    run_id TEXT,
+    source TEXT,
+    purpose TEXT NOT NULL DEFAULT 'main',
+    record_kind TEXT NOT NULL DEFAULT 'api_attempt',
+    usage_source TEXT NOT NULL DEFAULT 'provider_reported',
+    measurement_confidence TEXT NOT NULL DEFAULT 'exact',
+    provider TEXT,
+    model TEXT,
+    api_mode TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd_micro INTEGER,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    latency_ms INTEGER,
+    request_status TEXT NOT NULL DEFAULT 'ok',
+    error_class TEXT,
+    api_call_index INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE INDEX idx_usage_events_timestamp ON usage_events(timestamp DESC);
+CREATE INDEX idx_usage_events_session ON usage_events(session_id, timestamp DESC);
+CREATE INDEX idx_usage_events_provider_model ON usage_events(provider, model, timestamp DESC);
+CREATE INDEX idx_usage_events_harness_ts ON usage_events(harness, timestamp DESC);
+CREATE UNIQUE INDEX idx_usage_events_event_uid
+    ON usage_events(event_uid) WHERE event_uid IS NOT NULL;
+"""
+
+
+class TestSchemaMigration:
+    def _old_schema_db(self, tmp_path):
+        path = tmp_path / "usage_events.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(_OLD_SIDECAR_SQL)
+        conn.execute(
+            "INSERT INTO usage_events (event_uid, timestamp, harness, session_id,"
+            " run_id, provider, model, input_tokens, created_at)"
+            " VALUES ('uid-old-1', 1000.0, 'hermes', 'old-sess', NULL,"
+            " 'zai', 'glm-5.3', 42, 1000.0)"
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_open_migrates_old_schema_in_place(self, tmp_path):
+        """Opening a deployed old-schema sidecar drops run_id, adds
+        model_reported, and preserves the existing rows byte-for-byte."""
+        path = self._old_schema_db(tmp_path)
+        ledger = UsageEventLedger(path)
+        assert ledger._conn is not None
+        cols = {
+            r["name"]
+            for r in ledger._conn.execute(
+                "SELECT name FROM pragma_table_info('usage_events')"
+            )
+        }
+        assert "run_id" not in cols
+        assert "model_reported" in cols
+        row = ledger._conn.execute(
+            "SELECT * FROM usage_events WHERE event_uid = 'uid-old-1'"
+        ).fetchone()
+        assert row["session_id"] == "old-sess"
+        assert row["model"] == "glm-5.3"
+        assert row["input_tokens"] == 42
+        assert row["model_reported"] is None  # backfilled column stays NULL
+
+    def test_migrated_file_accepts_new_events(self, tmp_path):
+        path = self._old_schema_db(tmp_path)
+        ledger = UsageEventLedger(path)
+        uid = ledger.append_event(
+            session_id="new-sess",
+            model="glm-5.3",
+            model_reported="glm-5.3-air",
+            input_tokens=1,
+        )
+        assert uid
+        row = ledger._conn.execute(
+            "SELECT * FROM usage_events WHERE event_uid = ?", (uid,)
+        ).fetchone()
+        assert row["model_reported"] == "glm-5.3-air"
+        assert ledger.count() == 2
+
+    def test_migration_idempotent_across_reopens(self, tmp_path):
+        path = self._old_schema_db(tmp_path)
+        UsageEventLedger(path).close()
+        ledger = UsageEventLedger(path)  # second open: nothing left to do
+        assert ledger._conn is not None
+        assert ledger.count() == 1
