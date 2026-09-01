@@ -1,0 +1,8 @@
+name: approval_ledger
+version: "1.0.0"
+description: "Append-only JSONL ledger of every approval request that reaches a prompt or smart-approval surface. Observer only — it can never block, delay, or alter an approval decision. Enable via `hermes plugins enable observability/approval_ledger`."
+author: Luis Ramirez
+hooks:
+  - pre_approval_request
+  - post_approval_response
+  - post_tool_call
