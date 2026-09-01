@@ -1486,6 +1486,71 @@ def drop_thinking_only_and_merge_users(
 
 
 
+def _skip_benched_primary(agent) -> bool:
+    """Leave a primary the credential pool already knows is benched.
+
+    Nothing on the request path consults the pool: ``restore_primary_runtime``
+    is the only reader, and it returns early for an agent that has not yet
+    failed over. So every freshly-created agent re-discovers a known-exhausted
+    primary by paying a real 429 plus its retry cycle, then falls back — once
+    per session, for the whole length of the provider's cooldown.
+
+    Observed on Sol: opencode-go carries roughly three turns per 5-hour window
+    and its 429 supplies a reset timestamp, so the pool knew it was benched for
+    ~4 hours while 36 separate turns each paid the discovery cost anyway.
+
+    Fails open on absolutely everything — an unreadable pool, a legacy adapter
+    without ``has_available``, no chain configured — because a wrong skip here
+    would strand traffic on a fallback while the primary is healthy. Returns
+    True only when it actually moved the agent off the primary.
+    """
+    try:
+        if getattr(agent, "_fallback_activated", False):
+            return False
+        chain = getattr(agent, "_fallback_chain", None) or []
+        if not chain:
+            return False
+
+        primary_provider = str(
+            (getattr(agent, "_primary_runtime", None) or {}).get("provider")
+            or getattr(agent, "provider", "")
+            or ""
+        ).strip().lower()
+        if not primary_provider:
+            return False
+
+        from agent.credential_pool import load_pool
+
+        pool = load_pool(primary_provider)
+        if pool is None or not pool.entries():
+            return False
+        # A pool with nothing available right now is benched. Only skip when it
+        # also reports a recovery time — that distinguishes a cooldown from a
+        # pool that is simply empty/misconfigured, which fallback cannot fix
+        # and which should keep its existing error path.
+        if pool.has_available():
+            return False
+        # next_available_at() is wall-clock epoch seconds, not monotonic.
+        next_at = pool.next_available_at()
+        if not next_at or next_at <= time.time():
+            return False
+
+        # No reason= argument: the rate-limit branch of try_activate_fallback
+        # arms a fresh cooldown, and the primary is already benched by the
+        # event that got us here. Re-arming would extend it for no reason.
+        if agent._try_activate_fallback():
+            agent._vprint(
+                f"{agent.log_prefix}⏭️  Primary {primary_provider} is benched "
+                f"until {datetime.fromtimestamp(next_at).isoformat(timespec='seconds')} "
+                f"— starting on fallback instead of paying a 429 to find out.",
+                force=True,
+            )
+            return True
+    except Exception as exc:  # never block a turn on this optimisation
+        logging.debug("skip-benched-primary check failed: %s", exc)
+    return False
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
@@ -1506,6 +1571,7 @@ def restore_primary_runtime(agent) -> bool:
         # entirely, stranding the index and silently blocking all future
         # fallback attempts for the session.  Fixes #20465.
         agent._fallback_index = 0
+        _skip_benched_primary(agent)
         return False
 
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
