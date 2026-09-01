@@ -2720,10 +2720,10 @@ logger = logging.getLogger(__name__)
 def _blocking_attention_prefix(source: Optional[SessionSource]) -> str:
     """Return a safe platform-native attention prefix for blocking prompts.
 
-    Used by the clarify callback so interactive prompts actually notify the
-    person who must answer them. Empty (no ping) for DMs — the user is
-    already looking at the chat — and for platforms without a safe
-    same-message mention syntax in plain text.
+    Used by the clarify and exec-approval callbacks so interactive prompts
+    actually notify the person who must answer them. Empty (no ping) for
+    DMs — the user is already looking at the chat — and for platforms
+    without a safe same-message mention syntax in plain text.
     """
     if source is None:
         return ""
@@ -2770,6 +2770,39 @@ def _clarify_metadata_with_ping(
     out["clarify_attention_prefix"] = attention
     if platform is not None:
         out["clarify_ping_platform"] = str(platform).lower()
+    return out
+
+
+def _approval_metadata_with_ping(
+    metadata: Optional[dict],
+    source: Optional[SessionSource],
+) -> Optional[dict]:
+    """Copy approval send metadata and add same-thread requester ping hints.
+
+    The exec-approval gate blocks the agent thread until a human answers.
+    Without a direct mention the prompt is just another message in a busy
+    channel, so the request sits until the configured ceiling and the
+    timeout denies it — the human tier becomes a dead branch. Adapters
+    with native mentions (Discord) read ``approval_ping_user_id`` to put a
+    validated mention in the prompt message itself; the plain-text
+    fallback prepends ``approval_attention_prefix``.
+
+    Distinct keys from the clarify path so an adapter can render one
+    surface without implying the other. Returns the original object
+    unchanged when there is nothing to add, so untouched platforms keep
+    byte-identical sends.
+    """
+    attention = _blocking_attention_prefix(source)
+    if not attention:
+        return metadata
+
+    out = dict(metadata or {})
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    out["approval_ping_user_id"] = user_id
+    out["approval_attention_prefix"] = attention
+    if platform is not None:
+        out["approval_ping_platform"] = str(platform).lower()
     return out
 
 
@@ -6248,7 +6281,10 @@ class TurnRunner:
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata_with_ping(
+                                ctx._status_thread_metadata,
+                                ctx.source,
+                            ),
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -6298,6 +6334,12 @@ class TurnRunner:
                 allow_session=approval_data.get("allow_session", True),
                 smart_denied=approval_data.get("smart_denied", False),
             )
+            # Same reason as the button path: an approval nobody sees runs
+            # to the timeout ceiling and is denied. Platforms without a
+            # native mention surface get the prefix inline.
+            _attention = _blocking_attention_prefix(ctx.source)
+            if _attention:
+                msg = f"{_attention}🔔 {msg}"
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
                     ctx._status_adapter.send(

@@ -564,6 +564,46 @@ def _clarify_ping_content(metadata: Optional[dict]) -> Optional[str]:
     return f"<@{raw_user_id}> 🔔"
 
 
+def _approval_ping_content(metadata: Optional[dict]) -> Optional[str]:
+    """Return same-message Discord mention content for approval prompts.
+
+    The gateway attaches ``approval_ping_user_id`` (the requesting user in
+    a non-DM chat). This is the requester ping and is independent of the
+    ``discord.approval_mentions`` allowlist broadcast: the person the gate
+    is blocking on gets notified whether or not the operator opted into
+    pinging the whole allowlist. Only a plausible Discord snowflake is
+    accepted — anything else renders no mention rather than echoing
+    unvalidated metadata into message content.
+    """
+    if not metadata:
+        return None
+    raw_user_id = str(metadata.get("approval_ping_user_id", "") or "").strip()
+    if not re.fullmatch(r"\d{5,25}", raw_user_id):
+        return None
+    return f"<@{raw_user_id}> 🔔"
+
+
+def _merge_approval_mentions(*fragments: Optional[str]) -> Optional[str]:
+    """Join approval mention fragments, dropping blanks and repeat pings.
+
+    A fragment whose mentioned ids are all already present is skipped, so
+    the requester ping plus an allowlist broadcast that contains only the
+    requester renders one mention rather than two.
+    """
+    seen: set = set()
+    parts: list = []
+    for fragment in fragments:
+        text = str(fragment or "").strip()
+        if not text:
+            continue
+        ids = set(re.findall(r"<@!?(\d+)>", text))
+        if ids and ids.issubset(seen):
+            continue
+        seen |= ids
+        parts.append(text)
+    return " ".join(parts) or None
+
+
 def _discord_ready_timeout_seconds() -> float:
     """Return the Discord ready wait timeout during gateway startup."""
     raw = os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
@@ -7579,7 +7619,10 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if smart_denied:
                 prompt_prefix += "**Smart DENY:** owner override applies to this one operation only.\n\n"
-            mention_content = self._approval_mention_content()
+            mention_content = _merge_approval_mentions(
+                _approval_ping_content(metadata),
+                self._approval_mention_content(),
+            )
             if mention_content:
                 prompt_prefix = f"{mention_content}\n{prompt_prefix}"
             prompt_tail = f"\n```\n**Reason:** {reason_display}"

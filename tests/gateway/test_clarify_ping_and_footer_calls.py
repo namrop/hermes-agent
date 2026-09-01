@@ -6,9 +6,15 @@ Ported divergence from primary ``995a564b94`` (reduced) and ``88d26e5623``:
   gateway attaches requester ping hints to clarify metadata for non-DM
   chats on platforms with a safe plain-text mention syntax; the Discord
   adapter renders a validated same-message mention and the default text
-  fallback prepends the attention prefix. Approval-side pings are NOT
-  ported — upstream's ``send_exec_approval`` mention mechanism
-  (``discord.approval_mentions``) already covers that surface.
+  fallback prepends the attention prefix.
+
+  NOTE (2026-08-31): the original port left approval-side pings out on the
+  reasoning that upstream's ``send_exec_approval`` mention mechanism
+  (``discord.approval_mentions``) already covered that surface. It does
+  not — that gate defaults to ``False`` and was never enabled, so the
+  approval surface shipped with no notification at all. Approval-side
+  pings are now ported alongside the clarify ones; see
+  ``test_approval_notification_ping.py``.
 * The runtime footer gains the ``api_calls`` field (model API calls made
   during the turn). Primary's ``elapsed`` field is superseded by
   upstream's ``latency``/``turn_seconds``.
