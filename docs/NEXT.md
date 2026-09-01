@@ -94,7 +94,8 @@ not invent an origin.
 
 ## 3. Quota-aware fallback ordering and pre-emptive provider cooldown
 
-**Status:** specified, not implemented. Larger than item 1 — crosses a repo boundary.
+**Status:** Phase A **implemented** (`tools/quota_bench.py`, `tests/test_quota_bench.py`)
+and running dry — nothing armed. Phase B not started.
 **Priority:** high. Phase A is deployable without a fork change; Phase B needs one.
 
 ### What this does
@@ -112,6 +113,10 @@ a non-retryable classification, potentially a dead turn.
 3. **Fail open:** if *every* provider is over threshold, ignore the signal entirely
    and route as if it were absent. Never let this mechanism empty the chain.
 4. It must gate the **fallback chain**, not just primary restore.
+5. **Thresholds are per-provider.** `opencode-go` is exempt from the 90% cliff — it
+   runs to the cap (100%) and benches on cooldown from there. It is an `estimated`
+   source over a rolling USD window, so a 90% bench would be acting on a guess;
+   waiting for the estimate to report actually-spent is the honest trigger.
 
 ### Data source
 
@@ -138,8 +143,9 @@ Latest weekly observations at time of writing (2026-08-31 23:12 EDT):
 Two data caveats the implementation must handle rather than assume away:
 
 - **`opencode-go` is `estimated`, not `exact`** — inferred USD windows, and it reports
-  no `resets_at`. Either exclude `estimated` sources from benching, or bench them with
-  a synthetic TTL. Do not silently treat an estimate as ground truth.
+  no `resets_at`. Resolved by requirement 5: it participates, but at a 100% threshold
+  and with a synthetic TTL rather than a reset cliff. Do not silently treat an estimate
+  as ground truth by giving it the same 90% cliff as an exact source.
 - **`resets_at` is absent for several providers** (`opencode-go`, `openrouter`,
   `deepseek`). A bench with no reset time needs an explicit fallback TTL, otherwise
   `_exhausted_until` returns `None` for a `last_status_at`-less entry and the bench
@@ -244,7 +250,9 @@ consistent view, and add the config surface:
 ```yaml
 quota_routing:
   enabled: true
-  threshold_pct: 90          # keeper-set
+  threshold_pct: 90          # keeper-set default
+  provider_thresholds:       # per-provider overrides
+    opencode-go: 100         # estimated source — run to the cap, don't guess at 90
   window: week               # never five_hour
   ledger_path: ~/.local/state/codex-usage-tracker/quota_observations.sqlite3
   max_observation_age_minutes: 90    # stale ledger => ignore signal
@@ -271,6 +279,8 @@ log the bench set, write nothing) for one cycle before arming the writes.
 ### Acceptance criteria
 
 - A provider at ≥90% weekly is benched until its ledger `resets_at`, not for a fixed TTL.
+- `opencode-go` at 95% is **not** benched; at 100% it is. A per-provider override never
+  leaks into another provider's threshold.
 - The 5-hour window is never consulted.
 - When every chain provider is over threshold, routing is byte-identical to the
   signal being absent.

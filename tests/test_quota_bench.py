@@ -146,3 +146,59 @@ def test_ledger_provider_names_map_to_pool_names():
     # wham/usage is the ChatGPT OAuth surface, not the separately-billed openai-api pool
     assert qb.LEDGER_TO_POOL["openai"] == "openai-codex"
     assert qb.POOL_TO_LEDGER["zai"] == "z-ai"
+
+
+# ── per-provider thresholds (keeper ruling 2026-08-31) ──────────────────────
+# opencode-go is estimated over a rolling window; benching it at 90% would be
+# acting on a guess. It runs to the cap instead.
+
+
+def test_opencode_go_defaults_to_the_cap_not_ninety():
+    assert qb.DEFAULT_PROVIDER_THRESHOLDS["opencode-go"] == 100.0
+    assert "zai" not in qb.DEFAULT_PROVIDER_THRESHOLDS
+    assert "kimi-coding" not in qb.DEFAULT_PROVIDER_THRESHOLDS
+
+
+def test_opencode_go_at_95_percent_is_not_benched():
+    """95% would trip the global 90%, but opencode-go runs to its cap."""
+    r = run(["opencode-go", "openai-codex"],
+            {"opencode-go": obs("opencode-go", used=28.5, limit=30,
+                                confidence="estimated", window_kind="rolling"),
+             "openai": obs("openai", used=1, limit=100)},
+            provider_thresholds=qb.DEFAULT_PROVIDER_THRESHOLDS)
+    assert benched_names(r) == set()
+    row = next(a for a in r["assessments"] if a["pool_provider"] == "opencode-go")
+    assert row["threshold_pct"] == 100.0
+    assert row["pct"] == pytest.approx(95.0)
+
+
+def test_opencode_go_at_the_cap_is_benched():
+    r = run(["opencode-go", "openai-codex"],
+            {"opencode-go": obs("opencode-go", used=30, limit=30,
+                                confidence="estimated", window_kind="rolling"),
+             "openai": obs("openai", used=1, limit=100)},
+            provider_thresholds=qb.DEFAULT_PROVIDER_THRESHOLDS)
+    assert benched_names(r) == {"opencode-go"}
+    assert r["benched"][0]["bench_basis"] == "rolling window, no resets_at"
+
+
+def test_override_does_not_leak_to_other_providers():
+    """zai must still bench at the global 90% while opencode-go waits for 100%."""
+    r = run(["zai", "opencode-go", "openai-codex"],
+            {"z-ai": obs("z-ai", used=92, limit=100),
+             "opencode-go": obs("opencode-go", used=28.5, limit=30,
+                                confidence="estimated", window_kind="rolling"),
+             "openai": obs("openai", used=1, limit=100)},
+            provider_thresholds=qb.DEFAULT_PROVIDER_THRESHOLDS)
+    assert benched_names(r) == {"zai"}
+
+
+def test_fail_open_respects_per_provider_thresholds():
+    """Everything over *its own* threshold still fails open."""
+    r = run(["zai", "opencode-go"],
+            {"z-ai": obs("z-ai", used=95, limit=100),
+             "opencode-go": obs("opencode-go", used=30, limit=30,
+                                confidence="estimated", window_kind="rolling")},
+            provider_thresholds=qb.DEFAULT_PROVIDER_THRESHOLDS)
+    assert r["fail_open"] is True
+    assert benched_names(r) == set()

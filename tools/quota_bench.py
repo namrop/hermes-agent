@@ -51,6 +51,16 @@ LEDGER_TO_POOL = {
 }
 POOL_TO_LEDGER = {v: k for k, v in LEDGER_TO_POOL.items()}
 
+# Per-provider threshold overrides (utilization %% at which to bench). Anything
+# absent here uses the global ``--threshold``.
+#
+# opencode-go is an ``estimated`` source over a rolling USD window, so a 90%
+# cliff would be benching on a guess. Let it run to the cap and bench on the
+# estimate actually reporting spent — keeper ruling 2026-08-31.
+DEFAULT_PROVIDER_THRESHOLDS = {
+    "opencode-go": 100.0,
+}
+
 # Weekly-window quota names, most preferred first. Deliberately excludes
 # ``five_hour`` (resets too fast) and balance-style quotas
 # (``credit_balance`` / ``account_balance``) which are not windows at all and
@@ -152,16 +162,20 @@ def evaluate(
     include_estimated: bool,
     default_bench_seconds: int,
     now: float,
+    provider_thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Decide the bench set. Pure — no I/O, no writes."""
+    thresholds = dict(provider_thresholds or {})
     assessments: List[Dict[str, Any]] = []
 
     for pool_provider in chain:
         ledger_provider = POOL_TO_LEDGER.get(pool_provider, pool_provider)
         rec = observations.get(ledger_provider)
+        effective_threshold = thresholds.get(pool_provider, threshold_pct)
         row: Dict[str, Any] = {
             "pool_provider": pool_provider,
             "ledger_provider": ledger_provider,
+            "threshold_pct": effective_threshold,
             "over_threshold": False,
             "skip_reason": None,
             "pct": None,
@@ -206,7 +220,7 @@ def evaluate(
 
         pct = 100.0 * used / limit
         row["pct"] = pct
-        if pct < threshold_pct:
+        if pct < effective_threshold:
             assessments.append(row)
             continue
 
@@ -298,11 +312,14 @@ def _fmt(row: Dict[str, Any], threshold: float) -> str:
     pct = row["pct"]
     mark = "OVER " if row["over_threshold"] else "under"
     conf = row.get("confidence", "?")
+    limit_pct = row.get("threshold_pct", threshold)
+    star = "*" if limit_pct != threshold else " "
     detail = (
         f"{row.get('used')}/{row.get('limit')} {row.get('unit')} "
         f"[{row.get('quota_name')}, {conf}]"
     )
-    line = f"  {'!' if row['over_threshold'] else '·'} {name:<14} {pct:6.1f}%  {mark} {threshold:.0f}%  {detail}"
+    line = (f"  {'!' if row['over_threshold'] else '·'} {name:<14} {pct:6.1f}%  "
+            f"{mark} {limit_pct:.0f}%{star} {detail}")
     if row["over_threshold"]:
         until = datetime.fromtimestamp(row["bench_until"]).isoformat(timespec="seconds")
         line += f"\n      -> would bench until {until}  ({row['bench_basis']})"
@@ -315,7 +332,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     default=Path(os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME))
     ap.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     ap.add_argument("--threshold", type=float, default=90.0,
-                    help="utilization %% at which to bench (default: 90)")
+                    help="default utilization %% at which to bench (default: 90)")
+    ap.add_argument("--provider-threshold", action="append", default=[],
+                    metavar="PROVIDER=PCT",
+                    help="per-provider threshold override, repeatable. Defaults: "
+                         + ", ".join(f"{k}={v:.0f}" for k, v in DEFAULT_PROVIDER_THRESHOLDS.items()))
     ap.add_argument("--max-age-minutes", type=float, default=90.0,
                     help="ignore observations older than this (default: 90)")
     ap.add_argument("--default-bench-seconds", type=int, default=21600,
@@ -331,6 +352,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: ledger not found: {args.ledger}", file=sys.stderr)
         return 2
 
+    provider_thresholds = dict(DEFAULT_PROVIDER_THRESHOLDS)
+    for item in args.provider_threshold:
+        name, _, value = item.partition("=")
+        try:
+            provider_thresholds[name.strip().lower()] = float(value)
+        except ValueError:
+            print(f"error: bad --provider-threshold {item!r} (want PROVIDER=PCT)",
+                  file=sys.stderr)
+            return 2
+
     now = time.time()
     chain = resolve_chain(args.hermes_home)
     observations = latest_weekly_observations(args.ledger)
@@ -342,6 +373,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         include_estimated=not args.no_estimated,
         default_bench_seconds=args.default_bench_seconds,
         now=now,
+        provider_thresholds=provider_thresholds,
     )
 
     if args.json:
@@ -351,7 +383,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     mode = "APPLY" if args.apply else "DRY RUN — no writes"
-    print(f"quota_bench [{mode}]  threshold={args.threshold:.0f}%  window=weekly")
+    overrides = ", ".join(
+        f"{k}={v:.0f}%" for k, v in sorted(provider_thresholds.items()) if k in chain)
+    print(f"quota_bench [{mode}]  threshold={args.threshold:.0f}%  window=weekly"
+          + (f"  overrides: {overrides}" if overrides else ""))
     print(f"chain: {' -> '.join(chain) if chain else '(empty)'}\n")
     for row in result["assessments"]:
         print(_fmt(row, args.threshold))
