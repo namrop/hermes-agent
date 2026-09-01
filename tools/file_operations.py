@@ -575,7 +575,7 @@ class FileOperations(ABC):
 
     @abstractmethod
     def search(self, pattern: str, path: str = ".", target: str = "content",
-               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               file_glob: Optional[str] = None, limit: int = 300, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
         """Search for content or files."""
         ...
@@ -795,7 +795,7 @@ MAX_FILE_SIZE = 50 * 1024  # 50KB
 DEFAULT_READ_OFFSET = 1
 DEFAULT_READ_LIMIT = 2000
 DEFAULT_SEARCH_OFFSET = 0
-DEFAULT_SEARCH_LIMIT = 50
+DEFAULT_SEARCH_LIMIT = 300
 
 # Echoed by the size probe when the path exists but is not a regular file.
 # `wc -c` prints only digits, so this can never collide with a real size.
@@ -2761,7 +2761,7 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
-               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               file_glob: Optional[str] = None, limit: int = 300, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
         """
         Search for content or files.
@@ -2771,7 +2771,7 @@ class ShellFileOperations(FileOperations):
             path: Directory/file to search (default: cwd)
             target: "content" (grep) or "files" (glob)
             file_glob: File pattern filter for content search (e.g., "*.py")
-            limit: Max results (default 50)
+            limit: Max results (default 300)
             offset: Skip first N results
             output_mode: "content", "files_only", or "count"
             context: Lines of context around matches
