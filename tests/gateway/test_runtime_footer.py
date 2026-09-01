@@ -317,3 +317,75 @@ def test_default_build_footer_line_ignores_turn_seconds(monkeypatch):
     with_timing = build_footer_line(**common, turn_seconds=125.0)
     assert baseline == "gpt-5.4 · 5% · /var/data"
     assert with_timing == baseline
+
+
+# ── provider field ─────────────────────────────────────────────────────────
+# The provider that actually served the turn. On a multi-leg fallback chain
+# this is the only per-message signal of which backend answered.
+
+
+def test_provider_field_renders():
+    from gateway.runtime_footer import format_runtime_footer
+
+    out = format_runtime_footer(
+        model="glm-5.3",
+        provider="opencode-go",
+        context_tokens=0,
+        context_length=None,
+        fields=["model", "provider"],
+    )
+    assert out == "glm-5.3 · opencode-go"
+
+
+def test_provider_field_skipped_when_absent():
+    """A missing provider must drop the slot, not render an empty one."""
+    from gateway.runtime_footer import format_runtime_footer
+
+    for missing in (None, "", "   "):
+        out = format_runtime_footer(
+            model="glm-5.3",
+            provider=missing,
+            context_tokens=0,
+            context_length=None,
+            fields=["model", "provider"],
+        )
+        assert out == "glm-5.3", f"expected no empty slot for {missing!r}, got {out!r}"
+
+
+def test_provider_not_in_defaults():
+    """Adding the field must not change the footer for anyone on defaults."""
+    from gateway.runtime_footer import _DEFAULT_FIELDS, format_runtime_footer
+
+    assert "provider" not in _DEFAULT_FIELDS
+    out = format_runtime_footer(
+        model="glm-5.3", provider="opencode-go",
+        context_tokens=0, context_length=None,
+    )
+    assert "opencode-go" not in out
+
+
+def test_build_footer_line_passes_provider_through():
+    from gateway.runtime_footer import build_footer_line
+
+    out = build_footer_line(
+        user_config={"display": {"runtime_footer": {
+            "enabled": True, "fields": ["provider"]}}},
+        platform_key="discord",
+        model="glm-5.3",
+        provider="kimi-coding",
+        context_tokens=0,
+        context_length=None,
+    )
+    assert out == "kimi-coding"
+
+
+def test_elapsed_is_accepted_as_alias_for_latency():
+    """'elapsed' is the natural spelling and was silently dropped in production."""
+    from gateway.runtime_footer import format_runtime_footer
+
+    for spelling in ("latency", "elapsed"):
+        out = format_runtime_footer(
+            model="glm-5.3", context_tokens=0, context_length=None,
+            turn_seconds=65, fields=[spelling],
+        )
+        assert out == "1m05s", f"{spelling!r} produced {out!r}"

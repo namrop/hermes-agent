@@ -112,6 +112,7 @@ def _format_latency(seconds: float) -> str:
 def format_runtime_footer(
     *,
     model: Optional[str],
+    provider: Optional[str] = None,
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
@@ -130,13 +131,24 @@ def format_runtime_footer(
             m = _model_short(model)
             if m:
                 parts.append(m)
+        elif field == "provider":
+            # The provider that ACTUALLY served this turn (agent.provider after
+            # any fallback walk), not the configured primary. On a multi-leg
+            # chain this is the only per-message signal of which backend
+            # answered.
+            pv = (provider or "").strip()
+            if pv:
+                parts.append(pv)
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
-        elif field == "latency":
+        elif field in ("latency", "elapsed"):
             # Wall-clock turn duration. Skipped when the caller supplied no
             # timing (call sites that don't measure) or the value is negative.
+            # "elapsed" is accepted as an alias: unknown field names are
+            # silently ignored, so the natural spelling was costing users the
+            # field with no error anywhere (it was live in sol's config).
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
         elif field in ("api_calls", "calls"):
@@ -160,6 +172,7 @@ def build_footer_line(
     user_config: dict[str, Any] | None,
     platform_key: str | None,
     model: Optional[str],
+    provider: Optional[str] = None,
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
@@ -182,6 +195,7 @@ def build_footer_line(
         return ""
     return format_runtime_footer(
         model=model,
+        provider=provider,
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
