@@ -89,6 +89,41 @@ def _num(value: Any) -> Optional[float]:
         return None
 
 
+def load_hermes_env(hermes_home: Path) -> int:
+    """Load ``$HERMES_HOME/.env`` into os.environ, mirroring hermes startup.
+
+    Pool entries carry ``source: env:ZAI_API_KEY`` and no stored token — their
+    ``runtime_api_key`` resolves from the environment. Hermes loads this file
+    at startup (``hermes_cli/env_loader``); a standalone process does not, so
+    without this every env-sourced credential looks keyless and entry selection
+    silently fails to find anything to mark.
+
+    Does not override variables already set in the environment.
+    """
+    env_path = hermes_home / ".env"
+    if not env_path.exists():
+        return 0
+    loaded = 0
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ[key] = value
+        loaded += 1
+    return loaded
+
+
 def resolve_chain(hermes_home: Path) -> List[str]:
     """Pool provider names in routing order: primary first, then each leg.
 
@@ -275,31 +310,72 @@ def apply_benches(
     different profiles.
     """
     os.environ["HERMES_HOME"] = str(hermes_home)
-    from agent.credential_pool import load_pool
+
+    # ``python3 tools/quota_bench.py`` puts tools/ on sys.path, NOT the repo
+    # root, so ``agent`` is not importable by default. Append (don't prepend)
+    # the repo root so an already-installed hermes still wins on version skew.
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.append(str(repo_root))
+
+    try:
+        from agent.credential_pool import load_pool
+    except ModuleNotFoundError as exc:
+        print(f"  ! cannot import hermes ({exc}); no benches written.\n"
+              f"    tried repo root: {repo_root}", file=sys.stderr)
+        return 0
+
+    import agent.credential_pool as _cp
+    if verbose:
+        print(f"  using hermes from: {Path(_cp.__file__).resolve().parent.parent}")
+
+    loaded = load_hermes_env(hermes_home)
+    if verbose and loaded:
+        print(f"  loaded {loaded} vars from {hermes_home}/.env")
 
     applied = 0
     for row in benched:
         provider = row["pool_provider"]
         try:
             pool = load_pool(provider)
-            if not pool.entries():
+            entries = pool.entries()
+            if not entries:
                 print(f"  ! {provider}: pool has no entries; nothing to bench")
                 continue
-            pool.mark_exhausted_and_rotate(
-                status_code=429,
-                error_context={
-                    "reset_at": row["bench_until"],
-                    "message": (
-                        f"pre-emptive quota bench at {row['pct']:.1f}% of weekly "
-                        f"{row.get('quota_name')} (quota_bench.py)"
-                    ),
-                },
-                failure_reason="rate_limit",
-            )
+
+            # Target every entry by id. Without an explicit credential_id the
+            # pool falls through to _select_unlocked(), which returns None when
+            # an entry's key cannot be resolved — the call then silently marks
+            # nothing while still appearing to succeed. Benching a provider
+            # means benching all of its credentials anyway.
+            for entry in entries:
+                pool.mark_exhausted_and_rotate(
+                    status_code=429,
+                    credential_id=entry.id,
+                    error_context={
+                        "reset_at": row["bench_until"],
+                        "message": (
+                            f"pre-emptive quota bench at {row['pct']:.1f}% of weekly "
+                            f"{row.get('quota_name')} (quota_bench.py)"
+                        ),
+                    },
+                    failure_reason="rate_limit",
+                )
+
+            # Verify from disk. Never report a bench we did not actually write.
+            verified = [
+                e for e in load_pool(provider).entries()
+                if e.last_status == "exhausted" and e.last_error_reset_at
+            ]
+            if not verified:
+                print(f"  ✖ {provider}: mark did not persist — NOT benched")
+                continue
+
             applied += 1
             if verbose:
                 until = datetime.fromtimestamp(row["bench_until"]).isoformat(timespec="seconds")
-                print(f"  ✔ benched {provider} until {until} ({row['bench_basis']})")
+                print(f"  ✔ benched {provider} ({len(verified)}/{len(entries)} creds) "
+                      f"until {until} ({row['bench_basis']})")
         except Exception as exc:  # never let one provider abort the rest
             print(f"  ! {provider}: bench failed: {type(exc).__name__}: {exc}")
     return applied

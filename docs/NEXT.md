@@ -96,6 +96,21 @@ not invent an origin.
 
 **Status:** Phase A **implemented** (`tools/quota_bench.py`, `tests/test_quota_bench.py`)
 and running dry — nothing armed. Phase B not started.
+
+**Blocked on a lock advance (2026-09-01).** Arming Phase A found that provider
+benches did not survive a process boundary at all: `_upsert_entry` treated the
+freshly-seeded env key as a key rotation on *every* `load_pool()` and cleared the
+entry's exhaustion state. Env-sourced credentials never persist their token — only
+a `secret_fingerprint` reaches disk — so `existing.access_token` is `""` on each
+load and `token_changed` was unconditionally true. Every cooldown for `zai`,
+`kimi-coding`, `opencode-go` and `deepseek` was written to `auth.json` and wiped by
+the next read. This affected the **reactive** 402/429 path too, not just this
+feature; in-process marks worked, cross-process ones never did.
+
+Fixed in `agent/credential_pool.py` (`token_changed` now requires that a token was
+actually persisted) with two regression tests. Because the live gateway runs the
+flake-pinned package, **`--apply` cannot work end-to-end until the fleet lock
+advances past this commit.**
 **Priority:** high. Phase A is deployable without a fork change; Phase B needs one.
 
 ### What this does

@@ -2079,3 +2079,88 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+def test_env_sourced_cooldown_survives_reload(monkeypatch, tmp_path):
+    """An env-sourced credential's exhaustion must survive a load_pool round-trip.
+
+    Regression: env-sourced entries never persist their token — only a
+    secret_fingerprint reaches disk — so ``existing.access_token`` is "" on
+    every fresh load. ``_upsert_entry`` compared the freshly-seeded env key
+    against "" and treated it as a key rotation, clearing the entry's
+    exhaustion state on EVERY load. Any cooldown for zai / kimi-coding /
+    opencode-go / deepseek was written to auth.json and wiped by the next
+    load, so a provider bench never survived a process boundary.
+    """
+    from dataclasses import replace as _replace
+
+    from agent.credential_pool import PooledCredential, _upsert_entry
+
+    existing = PooledCredential.from_dict(
+        "zai",
+        {
+            "id": "abc123",
+            "label": "ZAI_API_KEY",
+            "source": "env:ZAI_API_KEY",
+            "auth_type": "api_key",
+            "last_status": "exhausted",
+            "last_status_at": 1_700_000_000.0,
+            "last_error_code": 429,
+            "last_error_reset_at": 1_700_086_400.0,
+            # note: no access_token — this is exactly how it lands on disk
+        },
+    )
+    assert existing.access_token == ""
+
+    entries = [existing]
+    _upsert_entry(
+        entries,
+        "zai",
+        "env:ZAI_API_KEY",
+        {
+            "source": "env:ZAI_API_KEY",
+            "auth_type": "api_key",
+            "access_token": "the-real-key-from-the-environment",
+            "label": "ZAI_API_KEY",
+        },
+    )
+
+    updated = entries[0]
+    assert updated.last_status == "exhausted", "seeding must not clear the cooldown"
+    assert updated.last_error_reset_at == 1_700_086_400.0
+    assert updated.access_token == "the-real-key-from-the-environment"
+
+
+def test_real_token_rotation_still_clears_cooldown():
+    """The guard must not suppress a genuine key rotation."""
+    from agent.credential_pool import PooledCredential, _upsert_entry
+
+    existing = PooledCredential.from_dict(
+        "zai",
+        {
+            "id": "abc123",
+            "label": "ZAI_API_KEY",
+            "source": "env:ZAI_API_KEY",
+            "auth_type": "api_key",
+            "access_token": "the-OLD-key",
+            "last_status": "exhausted",
+            "last_status_at": 1_700_000_000.0,
+            "last_error_code": 429,
+            "last_error_reset_at": 1_700_086_400.0,
+        },
+    )
+    entries = [existing]
+    _upsert_entry(
+        entries,
+        "zai",
+        "env:ZAI_API_KEY",
+        {
+            "source": "env:ZAI_API_KEY",
+            "auth_type": "api_key",
+            "access_token": "a-genuinely-NEW-key",
+            "label": "ZAI_API_KEY",
+        },
+    )
+    updated = entries[0]
+    assert updated.last_status is None, "a real rotation must clear stale status"
+    assert updated.last_error_reset_at is None

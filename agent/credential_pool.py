@@ -2427,9 +2427,20 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
+    # An env-sourced credential is never persisted with its token: only a
+    # ``secret_fingerprint`` survives to disk, so ``existing.access_token`` is
+    # "" on every fresh load. Comparing the freshly-seeded env key against ""
+    # made ``token_changed`` true on EVERY load_pool() call, which cleared the
+    # entry's exhaustion state below as if the key had rotated. Effect: any
+    # cooldown for an env-sourced provider (zai, kimi-coding, opencode-go,
+    # deepseek) was written to auth.json and then wiped by the next load —
+    # so provider benches never survived a process boundary.
+    # Absence of a persisted token is not evidence of rotation; require that
+    # there WAS a token to have changed.
     token_changed = (
         "access_token" in payload
         and payload["access_token"] is not None
+        and bool(existing.access_token)
         and payload["access_token"] != existing.access_token
     )
     for key, value in payload.items():
