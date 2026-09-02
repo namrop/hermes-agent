@@ -20,7 +20,7 @@ from hermes_constants import (
     reset_hermes_home_override,
     set_hermes_home_override,
 )
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -868,6 +868,95 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
 # message representation stays consistent ("system" everywhere).
 DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 
+# ---------------------------------------------------------------------------
+# Render profiles — bounded renderer negotiation for the api_server platform.
+#
+# The API transport ("you are talking through an HTTP API") is a fixed fact
+# about the channel.  How the CLIENT renders the reply is not: an arbitrary
+# OpenAI-compatible client pipes bytes into a terminal, while a known native
+# client such as Diadem runs a real Markdown renderer.  Historically the
+# api_server hint hard-coded the pessimistic answer ("assume plain text"),
+# which is right for unknown clients and wrong for known ones.
+#
+# So the two halves are split.  ``API_SERVER_TRANSPORT_*`` carry the transport
+# facts (including MEDIA: interception, which is a delivery question and NOT a
+# markdown question).  ``RENDER_PROFILE_HINTS`` carries the render contract,
+# selected by a validated profile the client picks from ``RENDER_PROFILES`` —
+# the client chooses among declared contracts, it never authors system-prompt
+# policy as free text.
+#
+# ``plain`` reproduces the pre-existing hint byte for byte; that equality is
+# pinned by tests.  The profile is resolved at session creation or first turn
+# and never changes mid-session, so the system-prompt prefix (and therefore
+# the provider prompt-cache key) stays stable for the life of the session.
+# ---------------------------------------------------------------------------
+
+RENDER_PROFILES = ("plain", "diadem-native-v1")
+DEFAULT_RENDER_PROFILE = "plain"
+
+RENDER_PROFILE_HINTS = {
+    # Byte-identical to the original api_server render guidance.
+    "plain": (
+        "The rendering layer is unknown — "
+        "assume plain text. No markdown formatting (no asterisks, bullets, headers, "
+        "code fences). Treat this like a conversation, not a document. Keep responses "
+        "brief and natural. "
+    ),
+    "diadem-native-v1": (
+        "The client is Diadem, which renders your reply as Markdown. Use Markdown "
+        "where it helps: headings, bold and italic, inline code and fenced code "
+        "blocks with a language tag, ordered and unordered lists, links, and "
+        "tables. Raw HTML and scripts are not rendered — do not emit them. "
+    ),
+}
+
+API_SERVER_TRANSPORT_INTRO = "You're responding through an API server. "
+
+# Media delivery is deliberately independent of the render profile: MEDIA:
+# interception is a server-side delivery behaviour, identical under every
+# profile, and it is documented here rather than in the render hint so a new
+# profile can never accidentally rewrite it.
+API_SERVER_TRANSPORT_MEDIA = (
+    "File/media delivery: images referenced as MEDIA:/absolute/path tags "
+    "(.png/.jpg/.jpeg/.gif/.webp/.bmp, up to 5MB) are inlined as base64 data "
+    "URLs in responses on the chat, completions, and responses endpoints. "
+    "Non-image files are NOT intercepted anywhere, and the runs endpoint "
+    "intercepts nothing — a MEDIA: tag there renders as literal text exposing "
+    "a raw host filesystem path. For those cases, state the plain file path "
+    "in your response text instead of a MEDIA: tag."
+)
+
+
+def normalize_render_profile(render_profile: Any) -> str:
+    """Coerce an arbitrary value to a known render profile id.
+
+    Anything unrecognised — None, empty, a bogus string — degrades to
+    ``plain``.  Validation with a user-visible error belongs at the API
+    boundary (``invalid_render_profile``); by the time prompt construction
+    runs, an unknown profile must never be able to widen what the agent is
+    told the client can render.
+    """
+    if isinstance(render_profile, str):
+        candidate = render_profile.strip()
+        if candidate in RENDER_PROFILES:
+            return candidate
+    return DEFAULT_RENDER_PROFILE
+
+
+def api_server_platform_hint(render_profile: Any = DEFAULT_RENDER_PROFILE) -> str:
+    """Compose the api_server platform hint for a given render profile.
+
+    ``normalize_render_profile(...) == "plain"`` reproduces
+    ``PLATFORM_HINTS["api_server"]`` exactly.
+    """
+    profile = normalize_render_profile(render_profile)
+    return (
+        API_SERVER_TRANSPORT_INTRO
+        + RENDER_PROFILE_HINTS[profile]
+        + API_SERVER_TRANSPORT_MEDIA
+    )
+
+
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
@@ -1113,19 +1202,7 @@ PLATFORM_HINTS = {
         "image and is the WRONG path. Bare Unicode emoji in text is also not a substitute "
         "— when a sticker is the right response, use yb_send_sticker."
     ),
-    "api_server": (
-        "You're responding through an API server. The rendering layer is unknown — "
-        "assume plain text. No markdown formatting (no asterisks, bullets, headers, "
-        "code fences). Treat this like a conversation, not a document. Keep responses "
-        "brief and natural. "
-        "File/media delivery: images referenced as MEDIA:/absolute/path tags "
-        "(.png/.jpg/.jpeg/.gif/.webp/.bmp, up to 5MB) are inlined as base64 data "
-        "URLs in responses on the chat, completions, and responses endpoints. "
-        "Non-image files are NOT intercepted anywhere, and the runs endpoint "
-        "intercepts nothing — a MEDIA: tag there renders as literal text exposing "
-        "a raw host filesystem path. For those cases, state the plain file path "
-        "in your response text instead of a MEDIA: tag."
-    ),
+    "api_server": api_server_platform_hint(DEFAULT_RENDER_PROFILE),
     "webui": (
         "You are in the Hermes WebUI, a browser-based chat interface. "
         "Full Markdown rendering is supported — headings, bold, italic, code "

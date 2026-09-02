@@ -49,6 +49,7 @@ from agent.prompt_builder import (
     TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    api_server_platform_hint,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -728,7 +729,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Resolve the built-in/plugin default hint for this platform, then apply
     # any per-platform override from config (platform_hints.<platform>).
     _default_hint = ""
-    if platform_key in PLATFORM_HINTS:
+    if platform_key == "api_server":
+        # The api_server hint is the one platform hint that is not a constant:
+        # the API transport is fixed, but the client's RENDERER is negotiated
+        # per session (``render_profile``).  The profile is validated against
+        # an enum and pinned at session creation / first turn by
+        # gateway/platforms/api_server.py, so this selection cannot move
+        # mid-session and the stable system-prompt prefix (hence the provider
+        # prompt-cache key) stays put.  Absent/unknown -> "plain", which
+        # reproduces the historical hint byte for byte.
+        _default_hint = api_server_platform_hint(getattr(agent, "render_profile", None))
+    elif platform_key in PLATFORM_HINTS:
         _default_hint = PLATFORM_HINTS[platform_key]
     elif platform_key:
         # Check plugin registry for platform-specific LLM guidance

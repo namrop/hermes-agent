@@ -71,6 +71,19 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
+def _render_profile_contract() -> tuple:
+    """Return ``(supported_profiles, default_profile)`` for renderer negotiation.
+
+    The enum lives in ``agent.prompt_builder`` next to the hint text it
+    selects, so the wire contract and the prompt text can never drift apart.
+    Imported lazily to keep this module's import graph shallow, matching the
+    rest of the file (``from run_agent import AIAgent`` etc.).
+    """
+    from agent.prompt_builder import DEFAULT_RENDER_PROFILE, RENDER_PROFILES
+
+    return RENDER_PROFILES, DEFAULT_RENDER_PROFILE
+
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -2557,6 +2570,116 @@ class APIServerAdapter(BasePlatformAdapter):
                 return parsed
         return {}
 
+    @staticmethod
+    def _render_profile_from_body(
+        body: Dict[str, Any],
+    ) -> tuple[str, Optional["web.Response"]]:
+        """Validate an optional ``render_profile`` field on a request body.
+
+        Returns ``(profile, None)`` on success — ``""`` when the client did
+        not ask for one — or ``("", error_response)`` with a 400
+        ``invalid_render_profile``.
+
+        This is the whole negotiation surface: the client picks one id from
+        the enum ``GET /v1/capabilities`` advertises. Free-text rendering
+        instructions are deliberately NOT accepted here; a client selects
+        among declared contracts, it does not author system-prompt policy.
+        """
+        raw = body.get("render_profile")
+        if raw is None:
+            return "", None
+        if not isinstance(raw, str):
+            return "", web.json_response(
+                _openai_error(
+                    "render_profile must be a string",
+                    code="invalid_render_profile",
+                ),
+                status=400,
+            )
+        profile = raw.strip()
+        if not profile:
+            return "", None
+        supported, _default = _render_profile_contract()
+        if profile not in supported:
+            return "", web.json_response(
+                _openai_error(
+                    f"Unknown render_profile {profile!r}; supported profiles: "
+                    + ", ".join(supported),
+                    code="invalid_render_profile",
+                ),
+                status=400,
+            )
+        return profile, None
+
+    @classmethod
+    def _stored_render_profile(cls, session: Optional[Dict[str, Any]]) -> str:
+        """Read the pinned render profile off a session row, or ``""``.
+
+        A stored value that is no longer in the enum (an id retired between
+        releases) reads as unset, so the session degrades to ``plain`` rather
+        than to a profile the prompt builder can no longer describe.
+        """
+        if not isinstance(session, dict):
+            return ""
+        model_config = cls._parse_session_model_config(session.get("model_config"))
+        value = model_config.get("render_profile")
+        if not isinstance(value, str):
+            return ""
+        profile = value.strip()
+        supported, _default = _render_profile_contract()
+        return profile if profile in supported else ""
+
+    def _resolve_turn_render_profile(
+        self,
+        *,
+        session: Optional[Dict[str, Any]],
+        session_id: str,
+        body: Dict[str, Any],
+    ) -> tuple[str, Optional["web.Response"]]:
+        """Resolve (and, on the first turn, pin) the render profile for a chat turn.
+
+        Precedence, per the render-profile seam:
+
+        * a valid body value on a session that has none yet  -> accept + persist
+        * a body value equal to the pinned one               -> accept (idempotent)
+        * a body value different from the pinned one         -> 409 render_profile_pinned
+        * no body value                                      -> the pinned one, else ``plain``
+
+        The 409 is what keeps the system-prompt prefix — and therefore the
+        provider prompt-cache key — stable for the life of the session. A
+        client that genuinely needs a different renderer forks the session.
+        """
+        _supported, default_profile = _render_profile_contract()
+        requested, err = self._render_profile_from_body(body)
+        if err is not None:
+            return "", err
+        stored = self._stored_render_profile(session)
+        if requested and stored and requested != stored:
+            return "", web.json_response(
+                _openai_error(
+                    f"Session {session_id} is pinned to render_profile "
+                    f"{stored!r}; it cannot be changed to {requested!r} "
+                    f"mid-session. Create or fork a session to use a "
+                    f"different profile.",
+                    code="render_profile_pinned",
+                ),
+                status=409,
+            )
+        if requested and not stored:
+            db = self._ensure_session_db()
+            if db is not None:
+                try:
+                    db.set_session_render_profile(session_id, requested)
+                except Exception:
+                    logger.warning(
+                        "[%s] failed to persist render_profile for %s",
+                        self.name,
+                        session_id,
+                        exc_info=True,
+                    )
+            return requested, None
+        return stored or requested or default_profile, None
+
     def _runtime_request_from_persisted_session_lock(
         self,
         session: Optional[Dict[str, Any]],
@@ -2734,6 +2857,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        render_profile: str = "",
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2762,6 +2886,13 @@ class APIServerAdapter(BasePlatformAdapter):
         model), never both.  Precedence: session ``/model`` override →
         ``session_model`` → route alias / per-request selection → global.
 
+        ``render_profile`` is the session's negotiated renderer contract. It
+        is stashed on the agent (not passed through ``AIAgent.__init__``) the
+        same way ``_hermes_api_runtime`` is, and read back by
+        ``agent/system_prompt.py`` when it selects the api_server platform
+        hint. The system prompt is built lazily inside ``run_conversation``,
+        so setting it after construction is in time.
+
         ``confirmed_runtime_lock`` marks a backend-acknowledged Browser model
         lock (POST /api/sessions/{id}/model).  A confirmed lock beats the
         session ``/model`` override, disables the global fallback model
@@ -2769,6 +2900,7 @@ class APIServerAdapter(BasePlatformAdapter):
         be resolved.
         """
         from run_agent import AIAgent
+        from agent.prompt_builder import normalize_render_profile
         from gateway.run import (
             _checkpoint_agent_kwargs,
             _current_max_iterations,
@@ -3049,6 +3181,12 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        # Stashed post-construction, exactly like _hermes_api_runtime below:
+        # the system prompt is built lazily inside run_conversation(), so this
+        # lands before agent/system_prompt.py reads it to pick the api_server
+        # platform hint. Normalized here as well as at the HTTP boundary —
+        # nothing downstream of validation may widen the declared renderer.
+        agent.render_profile = normalize_render_profile(render_profile)
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3229,6 +3367,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        _render_profiles, _render_profile_default = _render_profile_contract()
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3247,6 +3387,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     "explicit split-runtime mode is enabled."
                 ),
             },
+            "render_profiles": list(_render_profiles),
+            "render_profile_default": _render_profile_default,
+            "render_profile_note": (
+                "Send render_profile on POST /api/sessions, or on the first "
+                "POST /api/sessions/{session_id}/chat or /chat/stream turn. It "
+                "pins for the life of the session; a later, different value is "
+                "rejected with 409 render_profile_pinned. Render profiles govern "
+                "TEXT formatting only \u2014 media delivery is independent and "
+                "identical under every profile: MEDIA:/absolute/path image tags are "
+                "inlined as base64 data URLs on the session chat, "
+                "/v1/chat/completions and /v1/responses endpoints, and are never "
+                "intercepted on /v1/runs."
+            ),
             "features": {
                 "chat_completions": True,
                 "chat_completions_streaming": True,
@@ -3266,6 +3419,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "render_profiles": True,
                 "session_approvals": True,
                 "session_approval": True,
                 "session_stop": True,
@@ -3416,8 +3570,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return default
         return min(parsed, maximum)
 
-    @staticmethod
-    def _session_response(session: Dict[str, Any]) -> Dict[str, Any]:
+    @classmethod
+    def _session_response(cls, session: Dict[str, Any]) -> Dict[str, Any]:
         """Return a stable, client-safe session representation."""
         safe_keys = (
             "id", "source", "user_id", "model", "title", "started_at", "ended_at",
@@ -3436,6 +3590,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        # Render profile is echoed resolved, never null: ``render_profile`` is
+        # always the contract the agent is actually being told about, and
+        # ``render_profile_pinned`` says whether it was negotiated (and so is
+        # now immutable) or is just the standing default.
+        _stored_profile = cls._stored_render_profile(session)
+        _supported, _default_profile = _render_profile_contract()
+        payload["render_profile"] = _stored_profile or _default_profile
+        payload["render_profile_pinned"] = bool(_stored_profile)
         return payload
 
     @staticmethod
@@ -3546,6 +3708,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
         source = self._normalize_session_source(body.get("source") or "api_server")
+        render_profile, profile_err = self._render_profile_from_body(body)
+        if profile_err is not None:
+            return profile_err
         runtime_request = self._session_runtime_request_from_body(body)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
@@ -3575,6 +3740,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     "updated_at": time.time(),
                 }
             }
+        if render_profile:
+            # Same JSON column the Browser model lock and the YOLO flag use, so
+            # the profile survives a restart with no schema migration and rides
+            # along with the row through fork/branch lineage.
+            model_config = dict(model_config or {})
+            model_config["render_profile"] = render_profile
         title = body.get("title")
 
         # Run the entire check-insert-title sequence inside a single
@@ -4172,6 +4343,16 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        # Render profile: negotiated once, then pinned. Resolved BEFORE any
+        # model-lock persistence so a 400/409 here leaves the session row
+        # untouched.
+        render_profile, profile_err = self._resolve_turn_render_profile(
+            session=session,
+            session_id=session_id,
+            body=body,
+        )
+        if profile_err is not None:
+            return profile_err
         # Runtime selection. A backend-acknowledged Browser model lock
         # (require_model_lock in the body, or a previously confirmed lock
         # persisted on the session row) is an execution contract and wins.
@@ -4235,6 +4416,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            render_profile=render_profile,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -4289,6 +4471,16 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        # Render profile: negotiated once, then pinned. Resolved BEFORE any
+        # model-lock persistence so a 400/409 here leaves the session row
+        # untouched.
+        render_profile, profile_err = self._resolve_turn_render_profile(
+            session=session,
+            session_id=session_id,
+            body=body,
+        )
+        if profile_err is not None:
+            return profile_err
         # Runtime selection — mirrors _handle_session_chat (lock wins,
         # otherwise session-persisted model then per-request values).
         runtime_request = self._effective_session_runtime_request(
@@ -4408,6 +4600,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    render_profile=render_profile,
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -6771,6 +6964,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        render_profile: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6791,6 +6985,13 @@ class APIServerAdapter(BasePlatformAdapter):
         active the completed agent's actual provider/model must match the
         locked selection or the turn fails, and the response carries
         sanitized ``runtime`` metadata reporting actual vs requested.
+
+        *render_profile* is the session's pinned renderer contract (see
+        ``_resolve_turn_render_profile``). It selects the render half of the
+        api_server platform hint. Empty — the case for every endpoint that
+        has no session row to negotiate on, e.g. /v1/chat/completions,
+        /v1/responses and /v1/runs — degrades to ``plain``, i.e. the exact
+        pre-existing hint.
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -6832,6 +7033,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        render_profile=render_profile,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent

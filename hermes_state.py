@@ -7089,6 +7089,66 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def set_session_render_profile(self, session_id: str, render_profile: str) -> None:
+        """Persist the negotiated client render profile into ``model_config``.
+
+        Merges ``render_profile`` into the existing ``model_config`` JSON (same
+        merge discipline as ``set_session_yolo`` / ``update_session_runtime_lock``
+        so lineage markers like ``_branched_from`` / ``_delegate_from`` survive).
+
+        The render profile selects which renderer contract the api_server
+        platform hint describes, so it is part of the system prompt. The
+        cached prompt snapshot is therefore invalidated here: a prompt built
+        under the previous (default ``plain``) profile would otherwise keep
+        telling the agent the renderer is unknown for the rest of the session.
+        The API layer only ever calls this once per session — a second,
+        different profile is rejected with 409 ``render_profile_pinned`` —
+        so the prefix is stable from the first turn onward.
+
+        No-op when the session row doesn't exist yet; the creation-time
+        ``model_config`` carries the profile for ``POST /api/sessions``.
+        """
+        if not session_id or not isinstance(render_profile, str) or not render_profile.strip():
+            return
+        value = render_profile.strip()
+
+        def _do(conn):
+            merged = self._merge_model_config_json(
+                conn, session_id, {"render_profile": value}
+            )
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return
+            conn.execute(
+                """UPDATE sessions SET
+                   model_config = ?,
+                   system_prompt = NULL,
+                   system_prompt_hash = NULL
+                   WHERE id = ?""",
+                (merged, session_id),
+            )
+            self._delete_unreferenced_system_prompts(conn)
+        self._execute_write(_do)
+
+    @staticmethod
+    def session_render_profile(session_meta: Optional[Dict[str, Any]]) -> str:
+        """Read the persisted render profile off a session row dict.
+
+        Accepts the dict returned by ``get_session`` (``model_config`` is a
+        JSON string) or an already-parsed dict. Returns ``""`` on any parse
+        failure or when no profile was ever negotiated — callers fall back to
+        the default ``plain`` contract, never to something more permissive.
+        """
+        raw = (session_meta or {}).get("model_config")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return ""
+        if not isinstance(raw, dict):
+            return ""
+        value = raw.get("render_profile")
+        return value.strip() if isinstance(value, str) else ""
+
     @staticmethod
     def session_yolo_enabled(session_meta: Optional[Dict[str, Any]]) -> bool:
         """Read the persisted YOLO flag off a session row dict.

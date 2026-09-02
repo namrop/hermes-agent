@@ -259,6 +259,53 @@ Returns a machine-readable description of the API server's stable surface for ex
 
 Use this endpoint when integrating dashboards, browser UIs, or control planes so they can discover whether the running Hermes version supports runs, streaming, cancellation, and session continuity without depending on private Python internals.
 
+## Render profiles
+
+The API server does not know what will render its replies. A generic
+OpenAI-compatible client pipes bytes into a terminal; a native client such as
+Diadem runs a real Markdown renderer. Hermes therefore defaults to the
+pessimistic answer — the agent is told to assume plain text — and lets a known
+client opt into a richer contract by name.
+
+`GET /v1/capabilities` advertises the contracts:
+
+```json
+{
+  "render_profiles": ["plain", "diadem-native-v1"],
+  "render_profile_default": "plain"
+}
+```
+
+| Profile | The agent is told |
+|---|---|
+| `plain` (default) | The rendering layer is unknown — plain text, no markdown. |
+| `diadem-native-v1` | Markdown renders: headings, bold/italic, inline code and fenced code blocks, ordered/unordered lists, links, tables. Raw HTML and scripts are not rendered. |
+
+Send `render_profile` on `POST /api/sessions`, or on the first
+`POST /api/sessions/{session_id}/chat` or `/chat/stream` turn:
+
+```json
+{"id": "my-session", "render_profile": "diadem-native-v1"}
+```
+
+The session response echoes `render_profile` (always resolved, never null) and
+`render_profile_pinned` (whether it was negotiated or is just the default).
+
+The profile is **pinned for the life of the session**. It is stored on the
+session row, so it survives a restart, and a later turn that sends a
+*different* value is rejected with `409 render_profile_pinned` — the system
+prompt prefix, and therefore the provider prompt-cache key, must not move
+mid-conversation. Fork or create a session to use a different renderer. An id
+outside the enum is rejected with `400 invalid_render_profile`; free-text
+rendering instructions are not accepted, because a client selects among
+declared contracts rather than authoring system-prompt policy.
+
+Render profiles govern **text formatting only**. Media delivery is independent
+and identical under every profile: `MEDIA:/absolute/path` image tags are
+inlined as base64 data URLs on the session chat, `POST /v1/chat/completions`
+and `POST /v1/responses` endpoints; non-image files are never intercepted, and
+`POST /v1/runs` intercepts nothing at all.
+
 ## Per-request model selection
 
 Authenticated clients can override Hermes' default model selection per request
