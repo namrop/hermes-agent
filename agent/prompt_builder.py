@@ -169,10 +169,16 @@ HERMES_AGENT_HELP_GUIDANCE = (
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
-    "tool: user preferences, environment details, tool quirks, and stable conventions. "
+    "You have persistent memory across sessions. The memory tool writes the "
+    "always-on stores (MEMORY.md/USER.md): every entry is injected into every "
+    "future turn, so it is an intentional surface, not a default capture "
+    "path — write only durable facts the user would want always-on: user "
+    "preferences, environment details, tool quirks, and stable conventions. "
     "Memory is injected into every turn, so keep it compact and focused on facts that "
     "will still matter later.\n"
+    "Writes may require approval: when memory.write_approval is on, a write "
+    "stages to a pending queue instead of saving. If a result says 'staged', "
+    "report it — the entry awaits user review via /memory pending.\n"
     "Prioritize what reduces future user steering — the most valuable memory is one "
     "that prevents the user from having to correct or remind you again. "
     "User preferences and recurring corrections matter more than procedural task details.\n"
@@ -189,6 +195,20 @@ MEMORY_GUIDANCE = (
     "Imperative phrasing gets re-read as a directive in later sessions and can "
     "cause repeated work or override the user's current request. Procedures and "
     "workflows belong in skills, not memory."
+)
+
+# Tier routing: injected only when the fact_store tool is loaded (Layer-2
+# providers like holographic). Establishes photons-default / trunk-intentional
+# so the always-on block is not the ambient capture path. Installs without a
+# fact_store tool never see this and keep the plain MEMORY_GUIDANCE frame.
+FACT_STORE_GUIDANCE = (
+    "Memory tiers: fact_store is the default capture surface. Durable facts "
+    "(preferences, environment, conventions, decisions) belong there — cheap "
+    "to write, recalled by query, and reviewed before anything durable is "
+    "minted. The memory tool's always-on stores (MEMORY.md/USER.md) are an "
+    "intentional, keeper-reviewed surface for entries that must be injected "
+    "every turn; write to them only when the user asks or explicitly "
+    "approves, never as a default capture path."
 )
 
 USER_PROFILE_GUIDANCE = (

@@ -31,6 +31,7 @@ from agent.prompt_builder import (
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
+    FACT_STORE_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
@@ -50,6 +51,13 @@ class TestGuidanceConstants:
         assert "session_search" in MEMORY_GUIDANCE
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
+
+    def test_fact_store_guidance_routes_tiers(self):
+        # Photons default, trunk intentional — the always-on block must not
+        # be framed as the ambient capture path when fact_store is loaded.
+        assert "fact_store is the default capture surface" in FACT_STORE_GUIDANCE
+        assert "never as a default capture path" in FACT_STORE_GUIDANCE
+        assert "Save durable facts using the memory" not in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE

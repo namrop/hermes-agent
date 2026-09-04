@@ -38,6 +38,7 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
+    FACT_STORE_GUIDANCE,
     USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
@@ -432,6 +433,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             tool_guidance.append(MEMORY_GUIDANCE)
         elif _profile_enabled:
             tool_guidance.append(USER_PROFILE_GUIDANCE)
+    # Tier routing — only when the Layer-2 fact store is actually loaded.
+    # Converts "save durable facts" (ambient pressure toward the always-on
+    # trunk) into "photons default, trunk intentional": fact_store becomes the
+    # default capture surface, and MEMORY.md/USER.md require explicit user
+    # intent. Installs without a fact_store tool never see this block.
+    if "fact_store" in agent.valid_tool_names:
+        tool_guidance.append(FACT_STORE_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
