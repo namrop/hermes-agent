@@ -7910,6 +7910,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # initial create_session() can fail under concurrent SQLite locking).
         self._insert_session_row(session_id, "unknown")
 
+        # Auxiliary calls have their own route; never consult the parent
+        # session or infer a subscription from the model name. Codex's
+        # explicitly supplied subscription route has the same included-cost
+        # semantics here as on the main loop, rather than an estimated $0.
+        billing_mode = cost_status = cost_source = None
+        if billing_provider and estimated_cost_usd in (None, 0):
+            try:
+                from agent.usage_pricing import resolve_billing_route
+
+                route = resolve_billing_route(
+                    model or "", provider=billing_provider, base_url=billing_base_url,
+                )
+                if route.billing_mode == "subscription_included":
+                    billing_mode = route.billing_mode
+                    cost_status = "included"
+                    cost_source = "none"
+            except Exception:
+                pass  # Best-effort metadata must not break usage recording.
+
         def _do(conn):
             self._record_model_usage(
                 conn,
@@ -7918,7 +7937,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 model_reported=model_reported,
                 billing_provider=billing_provider,
                 billing_base_url=billing_base_url,
-                billing_mode=None,
+                billing_mode=billing_mode,
                 api_mode=api_mode,
                 input_tokens=input_tokens or 0,
                 output_tokens=output_tokens or 0,
@@ -7927,8 +7946,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 reasoning_tokens=reasoning_tokens or 0,
                 estimated_cost_usd=estimated_cost_usd,
                 actual_cost_usd=None,
-                cost_status=None,
-                cost_source=None,
+                cost_status=cost_status,
+                cost_source=cost_source,
                 api_call_count=(
                     1 if api_call_count is None else int(api_call_count)
                 ),

@@ -226,6 +226,40 @@ class TestGraftIntegration:
         assert row["provider"] == ""
         assert row["purpose"] == "aux:title_generation"
 
+    @pytest.mark.parametrize("task", ["vision", "compression", "background_review"])
+    def test_aux_codex_subscription_metadata_reaches_both_stores(self, db, task):
+        db.record_auxiliary_usage(
+            "sess-1", task, model="gpt-6-astra",
+            billing_provider="openai-codex",
+            billing_base_url="https://chatgpt.com/backend-api/codex",
+            input_tokens=7, output_tokens=3, estimated_cost_usd=0.0,
+        )
+        row = _sidecar_rows()[0]
+        assert row["billing_mode"] == "subscription_included"
+        assert row["cost_status"] == "included"
+        assert row["cost_source"] == "none"
+        assert row["cost_usd_micro"] == 0
+        aggregate = db._conn.execute(
+            "SELECT billing_mode, cost_status, cost_source FROM session_model_usage "
+            "WHERE session_id = ? AND task = ?", ("sess-1", task),
+        ).fetchone()
+        assert tuple(aggregate) == ("subscription_included", "included", "none")
+
+    @pytest.mark.parametrize("provider", [None, "openai", "unknown"])
+    def test_aux_does_not_infer_subscription_from_parent_or_model(self, db, provider):
+        db.update_token_counts(
+            "sess-1", model="gpt-6-astra", billing_provider="openai-codex",
+            billing_mode="subscription_included", input_tokens=1, api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "sess-1", "vision", model="gpt-6-astra", billing_provider=provider,
+            input_tokens=7, estimated_cost_usd=0.0,
+        )
+        row = _sidecar_rows()[-1]
+        assert row["provider"] == (provider or "")
+        assert row["billing_mode"] != "subscription_included"
+        assert row["cost_status"] != "included"
+
     def test_api_mode_omitted_stays_null_never_fabricated(self, db):
         """Regression: the 2026-08-25 sidecar cutover hardcoded
         api_mode=None for every event (incident 2026-08-29). A caller that
