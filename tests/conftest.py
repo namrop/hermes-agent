@@ -1743,3 +1743,12 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _enable_threat_scanning_for_tests(monkeypatch):
+    """Production disables keyword threat scanning (keeper ruling 2026-09-08,
+    see tools/threat_patterns.py). The pattern library is still exercised by
+    the suite so the switch stays reversible without code archaeology."""
+    from tools import threat_patterns
+    monkeypatch.setattr(threat_patterns, "SCANNING_ENABLED", True)

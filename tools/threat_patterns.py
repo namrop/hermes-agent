@@ -52,6 +52,19 @@ from typing import List, Optional, Tuple
 # detections near the beginning of injected content.
 MAX_SCAN_CHARS = 65_536
 
+# Keeper ruling (Luis, 2026-09-08 02:26 EDT, Claude Code session
+# 94e391f7-8ee4-5bc5-9131-8c6b303240c9): "the threat scanner should be
+# disabled. it's lossy and dumb. [...] keyword scanning is not a good
+# mechanism for a security scanner that is trying to prevent semantic
+# payloads. a dumb scanner is worse than no scanner."
+#
+# Production default is OFF. The pattern library stays importable and
+# testable (tests/conftest.py re-enables it for the suite) so the decision
+# is reversible by flipping one flag, not by restoring deleted code.
+# Every caller (context files, tool results, memory entries) routes through
+# scan_for_threats(), so this is the single switch.
+SCANNING_ENABLED = False
+
 # Bounded filler used between key attack words.  Earlier patterns used
 # ``(?:\w+\s+)*`` which is ambiguous and can backtrack heavily on adversarial
 # near-misses.  Eight filler words is enough for the intended obfuscation
@@ -290,6 +303,9 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     ``"invisible_unicode_U+XXXX"`` so the caller can surface the offending
     codepoint in a log line).
     """
+    if not SCANNING_ENABLED:
+        return []
+
     if not content:
         return []
 
@@ -346,6 +362,7 @@ def first_threat_message(content: str, scope: str = "strict") -> Optional[str]:
 
 
 __all__ = [
+    "SCANNING_ENABLED",
     "INVISIBLE_CHARS",
     "MAX_SCAN_CHARS",
     "scan_for_threats",
