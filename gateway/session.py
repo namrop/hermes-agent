@@ -3460,12 +3460,17 @@ class SessionStore:
         """``(session_key, notice)`` for every notice still owed, oldest first."""
         with self._lock:
             self._ensure_loaded_locked()
-            pending = [
-                (entry.session_key, dict(entry.interrupt_notice))
-                for entry in self._entries.values()
-                if isinstance(entry.interrupt_notice, dict)
-                and not entry.interrupt_notice.get("delivered_at")
-            ]
+            pending = []
+            for entry in self._entries.values():
+                notice = entry.interrupt_notice
+                if not isinstance(notice, dict) or notice.get("delivered_at"):
+                    continue
+                notice = dict(notice)
+                # Derived, not persisted: the owner summary reads better with
+                # "#general" than with a routing key, and the display name can
+                # change between the interruption and the notice.
+                notice["session_label"] = entry.display_name or None
+                pending.append((entry.session_key, notice))
         pending.sort(key=lambda item: str(item[1].get("interrupted_at") or ""))
         return pending
 

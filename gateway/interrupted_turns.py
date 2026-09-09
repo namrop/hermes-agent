@@ -112,6 +112,7 @@ class InterruptedTurn:
     """One turn that was cut, as recovered from a pending notice."""
 
     session_key: str
+    label: Optional[str] = None
     excerpt: Optional[str] = None
     model: Optional[str] = None
     started_at: Optional[datetime] = None
@@ -127,6 +128,9 @@ class InterruptedTurn:
             return None
         return cls(
             session_key=session_key,
+            label=(
+                str(notice["session_label"]) if notice.get("session_label") else None
+            ),
             excerpt=summarize_turn_excerpt(notice.get("excerpt")),
             model=(str(notice["model"]) if notice.get("model") else None),
             started_at=_parse_dt(notice.get("started_at")),
@@ -134,6 +138,11 @@ class InterruptedTurn:
             reason=(str(notice["reason"]) if notice.get("reason") else None),
             cause=(str(notice["cause"]) if notice.get("cause") else None),
         )
+
+    @property
+    def display(self) -> str:
+        """What to call this conversation in the owner summary."""
+        return self.label or self.session_key
 
     def age_seconds(self, now: datetime) -> Optional[float]:
         armed = self.interrupted_at
@@ -197,7 +206,7 @@ def format_owner_summary(
         detail = f'"{turn.excerpt}"' if turn.excerpt else "no message recorded"
         started = format_clock(turn.started_at, tz)
         tail = f" (started {started})" if started else ""
-        lines.append(f"- {turn.session_key} — {detail}{tail}")
+        lines.append(f"- {turn.display} — {detail}{tail}")
 
     lines.append("Each thread was told separately. Say `resume` in one to continue it.")
     return "\n".join(lines)

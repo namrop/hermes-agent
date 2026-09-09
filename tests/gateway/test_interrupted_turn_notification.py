@@ -306,6 +306,12 @@ def test_cause_is_named_only_when_the_lifecycle_ledger_knows_it():
     )
 
 
+def test_owner_summary_prefers_the_conversation_name_over_the_routing_key():
+    summary = format_owner_summary([_turn(label="#general")])
+    assert "- #general — " in summary
+    assert "discord:channel:999" not in summary
+
+
 def test_owner_summary_lists_every_cut_turn_once():
     turns = [
         _turn(session_key="discord:channel:1", excerpt="first ask"),
