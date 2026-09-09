@@ -23,6 +23,7 @@ The gateway already had most of the evidence and none of the announcement:
 - `recover_interrupted_turns` / `suspend_recently_active` promote survivors to
   `resume_pending`, and `_schedule_resume_pending_sessions` may auto-resume
   them. Both are silent, and auto-resume does not always fire.
+- Residual gap (keeper-acknowledged 2026-09-09): crash-left markers older than `recover_interrupted_turns`' ~1 h promotion window are cleared without promotion and never reach the arming step, so a gateway down for over an hour after a crash restarts silently for those turns. The window is the recovery pass's, not this feature's.
 
 Decision:
 - Notify on the **startup** side, not the shutdown side. The shutdown notice

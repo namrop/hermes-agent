@@ -48,6 +48,14 @@ INTERRUPT_RESUME_REASONS = frozenset(
     {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
 )
 
+# Known residual gap (keeper-acknowledged 2026-09-09): crash-left markers older
+# than ``recover_interrupted_turns``' promotion window (~1 h) are cleared by that
+# pass without being promoted to ``resume_pending``, so they never reach the
+# arming step here and produce no notice.  A gateway that stays down for more
+# than an hour after a crash therefore restarts silently for those turns.  The
+# window belongs to the recovery pass, not to this module; widen it there if
+# the silence ever matters.
+
 # A notice that could not be delivered for this long (adapter never came
 # back, channel deleted) is dropped rather than surfacing as archaeology.
 NOTICE_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -185,7 +193,7 @@ def format_thread_notice(turn: InterruptedTurn, tz: Any = None) -> str:
     head = f"Interrupted by {describe_event(turn)}{when}"
     if turn.excerpt:
         head += f' while working on: "{turn.excerpt}"'
-    return f"{head}. Say `resume` to continue."
+    return f"{head}. Send any message here to continue."
 
 
 def format_owner_summary(
@@ -212,7 +220,7 @@ def format_owner_summary(
         tail = f" (started {started})" if started else ""
         lines.append(f"- {turn.display} — {detail}{tail}")
 
-    lines.append("Each thread was told separately. Say `resume` in one to continue it.")
+    lines.append("Each thread was told separately. Send any message in one to continue it.")
     return "\n".join(lines)
 
 
