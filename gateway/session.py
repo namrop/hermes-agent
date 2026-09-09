@@ -3249,10 +3249,16 @@ class SessionStore:
             candidate["active_turn_token"] = token
             candidate["active_turn_started_at"] = now.isoformat()
             candidate["last_turn_started_at"] = now.isoformat()
-            if excerpt is not None:
-                candidate["last_turn_excerpt"] = summarize_turn_excerpt(excerpt)
-            if model is not None:
-                candidate["last_turn_model"] = str(model)[:120] or None
+            # Only a real ask overwrites the remembered one.  The startup
+            # resume pass runs a synthetic empty-text turn on exactly the
+            # sessions that were cut; letting it blank the excerpt would make
+            # the SECOND interruption of the same session say nothing about
+            # what the user actually wanted.
+            summarized = summarize_turn_excerpt(excerpt)
+            if summarized:
+                candidate["last_turn_excerpt"] = summarized
+            if model:
+                candidate["last_turn_model"] = str(model)[:120]
             # Keep the legacy 120-second startup heuristic effective during a
             # rolling downgrade/upgrade window where an older binary cannot
             # understand the exact marker fields.
@@ -3268,10 +3274,10 @@ class SessionStore:
             entry.active_turn_token = token
             entry.active_turn_started_at = now
             entry.last_turn_started_at = now
-            if excerpt is not None:
-                entry.last_turn_excerpt = summarize_turn_excerpt(excerpt)
-            if model is not None:
-                entry.last_turn_model = str(model)[:120] or None
+            if summarized:
+                entry.last_turn_excerpt = summarized
+            if model:
+                entry.last_turn_model = str(model)[:120]
             entry.updated_at = now
         return token
 

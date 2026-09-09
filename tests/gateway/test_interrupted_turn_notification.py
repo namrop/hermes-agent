@@ -219,6 +219,63 @@ def test_a_new_interruption_after_delivery_arms_again(tmp_path):
     assert notice["excerpt"] == "the second ask"
 
 
+def test_a_turn_that_finished_during_the_drain_is_not_announced(tmp_path):
+    """The drain pre-marks EVERY running agent, including ones that then finish.
+
+    A session that completed its turn during the drain window clears
+    ``resume_pending`` on its own success path, and nothing was cut — so it
+    must never be told it was interrupted.
+    """
+    store = _make_store(tmp_path)
+    entry = store.get_or_create_session(_make_source())
+    token = store.mark_turn_active(entry.session_key, excerpt="finished in time")
+    store.mark_resume_pending(entry.session_key, "shutdown_timeout")
+
+    # The successful-turn path: marker released, resume flag cleared.
+    store.clear_turn_active(entry.session_key, token)
+    assert store.clear_resume_pending(entry.session_key) is True
+
+    store.recover_interrupted_turns()
+    assert store.arm_interrupt_notices() == 0
+    assert store.pending_interrupt_notices() == []
+
+
+def test_the_startup_resume_turn_does_not_overwrite_the_users_ask(tmp_path):
+    """Cut → auto-resume → cut again must still quote what the user asked.
+
+    ``_schedule_resume_pending_sessions`` runs a synthetic empty-text turn on
+    exactly the sessions that were interrupted.
+    """
+    store = _make_store(tmp_path)
+    entry = store.get_or_create_session(_make_source())
+    store.mark_turn_active(entry.session_key, excerpt="the real request")
+
+    # First interruption, then the startup resume pass re-marks the session.
+    store.recover_interrupted_turns()
+    store.mark_turn_active(entry.session_key, excerpt="")
+    store.recover_interrupted_turns()
+    store.arm_interrupt_notices()
+
+    _, notice = store.pending_interrupt_notices()[0]
+    assert notice["excerpt"] == "the real request"
+
+
+def test_a_long_outage_still_gets_its_notice(tmp_path):
+    """A switch that goes wrong and is fixed hours later is the worst case."""
+    store = _make_store(tmp_path)
+    entry = store.get_or_create_session(_make_source())
+    store.mark_turn_active(entry.session_key, excerpt="cut before a long outage")
+    store.mark_resume_pending(entry.session_key, "shutdown_timeout")
+    with store._lock:
+        store._entries[entry.session_key].last_resume_marked_at = (
+            datetime.now() - timedelta(hours=6)
+        )
+
+    from gateway.interrupted_turns import NOTICE_MAX_AGE_SECONDS
+
+    assert store.arm_interrupt_notices(max_age_seconds=NOTICE_MAX_AGE_SECONDS) == 1
+
+
 def test_a_clean_shutdown_arms_nothing(tmp_path):
     """Markers discarded after a verified clean exit: no turn was cut."""
     store = _make_store(tmp_path)
@@ -301,7 +358,9 @@ def test_cause_is_named_only_when_the_lifecycle_ledger_knows_it():
     assert "crash (out of memory)" in format_thread_notice(_turn(cause=CAUSE_OOM))
     assert "crash (no exit path ran)" in format_thread_notice(_turn(cause=CAUSE_UNCLEAN))
     assert "gateway restart" in format_thread_notice(_turn(cause=CAUSE_RESTART))
-    assert "gateway shutdown" in format_thread_notice(
+    # A service stop reads as a restart: the notice is delivered by a gateway
+    # that is already back up.
+    assert "gateway restart" in format_thread_notice(
         _turn(reason="shutdown_timeout", cause=None)
     )
 
@@ -493,6 +552,23 @@ async def test_the_summary_alone_settles_a_thread_that_could_not_be_reached(tmp_
     assert [chat for chat, _ in adapter.sent] == ["home-chan"]
     # Luis was told, so the notice is not owed a second time.
     assert store.pending_interrupt_notices() == []
+
+
+@pytest.mark.asyncio
+async def test_the_summary_only_wakes_the_home_of_a_platform_that_lost_work(tmp_path):
+    store = _make_store(tmp_path)
+    _cut_turn(store, "chan-a", "discord work")
+    runner, adapter = _make_notify_runner(store)
+    quiet = PlatformConfig(enabled=True, token="***")
+    quiet.home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="tg-home", name="Home"
+    )
+    runner.config.platforms[Platform.TELEGRAM] = quiet
+    runner.adapters[Platform.TELEGRAM] = MagicMock()
+
+    assert await runner._notify_interrupted_turns() == 1
+    assert sorted(chat for chat, _ in adapter.sent) == ["chan-a", "home-chan"]
+    runner.adapters[Platform.TELEGRAM].send.assert_not_called()
 
 
 @pytest.mark.asyncio

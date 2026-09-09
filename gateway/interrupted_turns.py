@@ -164,13 +164,17 @@ def describe_event(turn: InterruptedTurn) -> str:
     The lifecycle sentinel is the only durable record of an unclean death
     (``gateway.lifecycle_ledger``), so it is the only place a stronger claim
     than "restart" can come from.  Absent that, say "restart" and stop.
+
+    "Restart" and not "shutdown" even for ``shutdown_timeout``: this message
+    is delivered by a gateway that is up, so by the time anyone reads it the
+    stop was a restart whatever the stopping process believed. The drain
+    reason distinguishes ``/restart`` from a service stop, which is a
+    distinction for the log, not for the person who lost their answer.
     """
     if turn.cause == CAUSE_OOM:
         return "a gateway crash (out of memory)"
     if turn.cause == CAUSE_UNCLEAN:
         return "a gateway crash (no exit path ran)"
-    if turn.reason == "shutdown_timeout":
-        return "a gateway shutdown"
     return "a gateway restart"
 
 

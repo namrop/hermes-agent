@@ -46,11 +46,22 @@ Decision:
 - Settle a notice when it reaches its thread **or** when the owner summary
   lands. Reaching Luis is the requirement; a thread whose channel is gone
   should not keep the notice owed forever.
+- The freshness window for arming a notice is the delivery window (24h), not
+  the marker-recovery window (~1h). A switch that goes wrong and is repaired
+  two hours later is exactly the case where the user has stopped watching.
+- The notice always says "restart", never "shutdown": it is delivered by a
+  gateway that is up, so by the time anyone reads it the stop was a restart
+  whatever the stopping process believed. Only a crash (from the lifecycle
+  sentinel) earns a different clause.
+- Synthetic turns — the startup resume pass, background-process notifications
+  — do not overwrite the remembered excerpt. Cut → auto-resume → cut again
+  must still quote what the user asked for, not what the gateway said.
 - The owner surface is the existing home channel
   (`platforms.<p>.home_channel`, also populated from `<PLATFORM>_HOME_CHANNEL`),
   the same target every other unprompted lifecycle message already uses. One
-  summary per configured home channel; when a single cut turn *was* the home
-  channel, its own notice is the summary.
+  summary per home channel of a platform that actually lost work (a
+  Discord-only interruption does not wake the Telegram home); when a single
+  cut turn *was* the home channel, its own notice is the summary.
 
 Consequences:
 - `gateway.interrupted_turn_notification` (default true) disables the feature;

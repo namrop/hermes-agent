@@ -12673,7 +12673,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``resume_pending`` and its mark time, and that mark time is the
         # identity a notice is deduplicated on.  Covers exact markers and the
         # legacy recency fallback in one sweep.
-        await self._arm_interrupt_notices(cause, marker_max_age)
+        #
+        # Deliberately NOT ``marker_max_age`` (~1h): the outage itself is what
+        # decides how old the mark is, and a switch that goes wrong and gets
+        # fixed two hours later is precisely the case where the user has
+        # stopped watching. The notice window is the delivery window.
+        from gateway.interrupted_turns import NOTICE_MAX_AGE_SECONDS
+
+        await self._arm_interrupt_notices(cause, NOTICE_MAX_AGE_SECONDS)
         return exact, fallback
 
     def _interrupt_cause_from_lifecycle(self) -> str:
@@ -18976,9 +18983,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cut, not merely that something was (``gateway.interrupted_turns``).
         """
         try:
+            # Synthetic turns (startup resume, background-process
+            # notifications) carry gateway-authored text; keep the user's own
+            # last ask instead of overwriting it with our own words.
+            excerpt = None if getattr(event, "internal", False) else getattr(event, "text", None)
             token = await self.async_session_store.mark_turn_active(
                 session_key,
-                excerpt=getattr(event, "text", None),
+                excerpt=excerpt,
                 model=model,
             )
         except Exception as exc:
@@ -24803,6 +24814,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         delivered_keys: set[str] = set()
         thread_targets: set[tuple[str, str, Optional[str]]] = set()
+        cut_platforms: set = set()
 
         for turn in fresh:
             try:
@@ -24812,6 +24824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if source is None:
                     continue
                 platform = source.platform
+                cut_platforms.add(platform)
                 platform_cfg = self.config.platforms.get(platform)
                 if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                     logger.info(
@@ -24879,7 +24892,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         summary_delivered = await self._send_interrupted_turn_summary(
-            fresh, thread_targets, tz, zone_name
+            fresh, thread_targets, tz, zone_name, cut_platforms
         )
 
         # Settle only what actually reached someone.  A turn whose thread
@@ -24898,6 +24911,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         thread_targets,
         tz,
         zone_name: Optional[str],
+        cut_platforms=None,
     ) -> bool:
         """One roll-up of everything the stop cut, to the configured home.
 
@@ -24918,6 +24932,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_cfg in self.config.platforms.items():
             home = getattr(platform_cfg, "home_channel", None)
             if not home or not home.chat_id:
+                continue
+            # One summary, where the work was.  A Discord-only interruption
+            # has no business waking the Telegram home channel; fall back to
+            # every home only when no platform could be resolved at all.
+            if cut_platforms and platform not in cut_platforms:
                 continue
             if not platform_cfg.gateway_restart_notification:
                 continue
