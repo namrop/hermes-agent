@@ -334,7 +334,7 @@ def test_thread_notice_states_time_excerpt_and_the_way_back():
 
     assert text.startswith("Interrupted by a gateway restart at 07:41 ")
     assert '"fix the wifi backup leg on acubens"' in text
-    assert "`resume`" in text
+    assert "Send any message here to continue." in text
     # Luis's register: no apology, no filler, no hedge.
     for banned in ("sorry", "apolog", "unfortunately", "I'm afraid", "please note"):
         assert banned.lower() not in text.lower()
