@@ -310,6 +310,26 @@ def mark_exited(
         logger.debug("Failed to mark lifecycle sentinel exited", exc_info=True)
 
 
+def read_prior_life_flags(home: Optional[Path] = None) -> Dict[str, bool]:
+    """How the PREVIOUS life ended, as carried on this life's sentinel.
+
+    :func:`record_startup` stamps ``prior_unclean_exit`` /
+    ``prior_suspected_oom`` onto the sentinel it claims, so this stays
+    readable for the whole life even though the previous life's own record
+    has been overwritten.  Read-only and exception-free; ``{}`` when there is
+    nothing to say (clean boot, no sentinel, unreadable file).
+    """
+    try:
+        sentinel = _read_json(get_lifecycle_sentinel_path(home)) or {}
+    except Exception:
+        return {}
+    flags: Dict[str, bool] = {}
+    for key in ("prior_unclean_exit", "prior_suspected_oom"):
+        if sentinel.get(key):
+            flags[key] = True
+    return flags
+
+
 def read_prior_exit_label(profile_home: Path) -> str:
     """Container-boot helper: one-word summary of how the profile's last
     gateway life ended.  ``clean`` / ``unclean`` / ``unknown`` (no sentinel

@@ -705,6 +705,24 @@ gateway:
 
 Disable it on noisy or low-priority platforms while leaving it on for your primary chat. The notification is sent once per restart, regardless of how many sessions were in flight.
 
+### Interrupted-turn notices
+
+The restart notification above is sent *on the way out*, which only works when the gateway gets to leave politely. A SIGKILL, an OOM kill, or an adapter that is already disconnected takes the process with it, and the request someone was waiting on simply never comes back.
+
+Every running turn writes a durable marker (routing key, the user's message truncated to 200 characters, start time, model) as part of the write it was already making, and clears it when the turn ends. On a startup that follows an unclean exit, the gateway reads what survived and says so:
+
+- one notice into each affected conversation — `Interrupted by a gateway restart at 07:41 EDT while working on: "…". Say ``resume`` to continue.` — naming the cause when the lifecycle ledger recorded one (crash, out of memory);
+- one summary listing every cut turn to each configured home channel.
+
+A notice is armed once per interruption and cleared only once it has actually been delivered, so a restart that happens before the adapters reconnect defers the notice instead of losing it, and no interruption is ever announced twice. Turn it off with:
+
+```yaml
+gateway:
+  interrupted_turn_notification: false
+```
+
+The per-platform `gateway_restart_notification` flag still suppresses these notices on that platform.
+
 ### Typing indicators
 
 While the agent is processing a message, the gateway shows a live typing status on platforms that support it — a "typing…" bubble on Telegram/Discord/Signal, or the "is thinking…" assistant status on Slack. This is controlled per-platform by the `typing_indicator` flag in `gateway-config.yaml`, which defaults to `true`:

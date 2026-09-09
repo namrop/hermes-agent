@@ -1,5 +1,67 @@
 # Architecture Decision Records
 
+## 2026-09-09: A cut turn is never silent — startup interrupted-turn notices
+
+Status: Accepted (keeper ruling 2026-09-09, Luis)
+
+Context:
+When hermes-primary is restarted — NixOS switch, `hermes update`, a crash, an
+operator — turns in flight are cut. Sometimes the session self-corrects on the
+next message and the work is picked up; sometimes it does not, and the request
+just dies. Luis: "I don't even get a ping or anything from Hermes. If I'm not
+actively working on it, I won't see that it died until I go and check on it
+later, or if I forget to check, I'll just never see it."
+
+The gateway already had most of the evidence and none of the announcement:
+
+- `SessionEntry.active_turn_token` is a durable per-turn marker, written by
+  `mark_turn_active` before the agent runs and cleared on unwind, so any
+  violent death leaves it behind (that is its whole design).
+- `_notify_active_sessions_of_shutdown` warns active chats — but only from
+  inside a graceful stop, with adapters still connected. SIGKILL, OOM, VM
+  death and a torn-down adapter all bypass it.
+- `recover_interrupted_turns` / `suspend_recently_active` promote survivors to
+  `resume_pending`, and `_schedule_resume_pending_sessions` may auto-resume
+  them. Both are silent, and auto-resume does not always fire.
+
+Decision:
+- Notify on the **startup** side, not the shutdown side. The shutdown notice
+  is a different claim ("will be interrupted") and is left untouched; the new
+  notice is the factual one ("was interrupted at HH:MM"), and it is reached by
+  a path that does not require the dying process to still be able to speak.
+- Carry the *content* on the marker: `mark_turn_active` also stores
+  `last_turn_excerpt` (≤200 chars), `last_turn_model` and
+  `last_turn_started_at` on the same durable write — zero extra I/O, and
+  nothing that depends on a shutdown hook. Those fields are deliberately NOT
+  cleared when the turn ends: an agent that unwinds after a hard interrupt
+  clears its marker but is still an unanswered request.
+- Key the sweep off `resume_pending` + `resume_reason`, not off the marker.
+  Both interruption shapes converge there (the drain pre-marks its victims;
+  recovery promotes the crash survivors), so one rule covers both.
+- Identity of an interruption is `last_resume_marked_at`, recorded on the
+  notice. `resume_pending` outlives delivery — it is cleared only by a
+  successful resumed turn — so without that stamp every later boot would
+  re-announce the same interruption. With it: armed once, retried until
+  delivered, never repeated.
+- Settle a notice when it reaches its thread **or** when the owner summary
+  lands. Reaching Luis is the requirement; a thread whose channel is gone
+  should not keep the notice owed forever.
+- The owner surface is the existing home channel
+  (`platforms.<p>.home_channel`, also populated from `<PLATFORM>_HOME_CHANNEL`),
+  the same target every other unprompted lifecycle message already uses. One
+  summary per configured home channel; when a single cut turn *was* the home
+  channel, its own notice is the summary.
+
+Consequences:
+- `gateway.interrupted_turn_notification` (default true) disables the feature;
+  the per-platform `gateway_restart_notification` flag still suppresses it per
+  surface.
+- Drain behaviour, the systemd unit and the exit paths are unchanged. Nothing
+  new runs at SIGTERM — the persistence is incremental by construction, which
+  is what keeps it inside `agent_cache_pressure`'s flush budget.
+- Resume itself is still the existing `resume_pending` machinery. The notice
+  tells the user it can be resumed; it does not resume anything.
+
 ## 2026-08-30: Session approval + stop API — request_id targeting, and where an approval stream must be fed from
 
 Status: Accepted (Vikunja #613)

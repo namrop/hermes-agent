@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,10 @@ from .config import (
     GatewayConfig,
     SessionResetPolicy,  # noqa: F401 — re-exported via gateway/__init__.py
     HomeChannel,
+)
+from .interrupted_turns import (
+    INTERRUPT_RESUME_REASONS,
+    summarize_turn_excerpt,
 )
 from .whatsapp_identity import (
     canonical_whatsapp_identifier,
@@ -862,6 +866,23 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
 
+    # Cheap description of the LAST turn started on this entry, written by
+    # the same durable ``mark_turn_active`` write (zero extra I/O) and
+    # deliberately NOT cleared when the turn ends: after an unclean death the
+    # marker is gone but we still need to tell the user *what* was cut.
+    # Truncated to ``_TURN_EXCERPT_LIMIT`` characters at write time.
+    last_turn_excerpt: Optional[str] = None
+    last_turn_model: Optional[str] = None
+    last_turn_started_at: Optional[datetime] = None
+
+    # Pending "your turn was interrupted" notice, armed on the unclean
+    # startup path (:meth:`SessionStore.arm_interrupt_notices`) and cleared
+    # once delivered.  Presence is the whole idempotence contract: a notice
+    # is armed once per interruption and survives further restarts until it
+    # is actually delivered, so a cut turn can never go silent and can never
+    # be announced twice.
+    interrupt_notice: Optional[Dict[str, Any]] = None
+
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
@@ -911,6 +932,14 @@ class SessionEntry:
                 if self.active_turn_started_at
                 else None
             ),
+            "last_turn_excerpt": self.last_turn_excerpt,
+            "last_turn_model": self.last_turn_model,
+            "last_turn_started_at": (
+                self.last_turn_started_at.isoformat()
+                if self.last_turn_started_at
+                else None
+            ),
+            "interrupt_notice": self.interrupt_notice,
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -955,6 +984,14 @@ class SessionEntry:
                 active_turn_started_at = datetime.fromisoformat(_atsa)
             except (TypeError, ValueError):
                 active_turn_started_at = None
+        last_turn_started_at = None
+        _ltsa = data.get("last_turn_started_at")
+        if _ltsa:
+            try:
+                last_turn_started_at = datetime.fromisoformat(_ltsa)
+            except (TypeError, ValueError):
+                last_turn_started_at = None
+
         active_turn_token = data.get("active_turn_token")
         if not isinstance(active_turn_token, str) or not active_turn_token:
             # The token/timestamp pair is written atomically.  A partial or
@@ -1006,6 +1043,14 @@ class SessionEntry:
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
+            last_turn_excerpt=data.get("last_turn_excerpt") or None,
+            last_turn_model=data.get("last_turn_model") or None,
+            last_turn_started_at=last_turn_started_at,
+            interrupt_notice=(
+                data.get("interrupt_notice")
+                if isinstance(data.get("interrupt_notice"), dict)
+                else None
+            ),
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -3174,12 +3219,24 @@ class SessionStore:
                 return True
         return False
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(
+        self,
+        session_key: str,
+        excerpt: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
         The opaque token is returned to the caller and must be supplied to
         :meth:`clear_turn_active`.  Re-marking replaces the previous token so
         a stale asynchronous unwind cannot clear a newer turn.
+
+        *excerpt* / *model* ride along on this same durable write (no extra
+        I/O) and are what lets a later startup say *what* was cut, not just
+        that something was.  They are stored as ``last_turn_*`` and are
+        deliberately NOT cleared when the turn ends — a turn that is killed
+        after its marker was cleared (drain interrupt, then unwind) still
+        needs its excerpt at the next boot.
         """
         token = uuid.uuid4().hex
         with self._lock:
@@ -3191,6 +3248,11 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = token
             candidate["active_turn_started_at"] = now.isoformat()
+            candidate["last_turn_started_at"] = now.isoformat()
+            if excerpt is not None:
+                candidate["last_turn_excerpt"] = summarize_turn_excerpt(excerpt)
+            if model is not None:
+                candidate["last_turn_model"] = str(model)[:120] or None
             # Keep the legacy 120-second startup heuristic effective during a
             # rolling downgrade/upgrade window where an older binary cannot
             # understand the exact marker fields.
@@ -3205,6 +3267,11 @@ class SessionStore:
             )
             entry.active_turn_token = token
             entry.active_turn_started_at = now
+            entry.last_turn_started_at = now
+            if excerpt is not None:
+                entry.last_turn_excerpt = summarize_turn_excerpt(excerpt)
+            if model is not None:
+                entry.last_turn_model = str(model)[:120] or None
             entry.updated_at = now
         return token
 
@@ -3309,6 +3376,126 @@ class SessionStore:
             if cleared:
                 self._save()
         return cleared
+
+    def arm_interrupt_notices(
+        self,
+        cause: Optional[str] = None,
+        max_age_seconds: int = 60 * 60,
+    ) -> int:
+        """Arm a pending "your turn was cut" notice for every interrupted turn.
+
+        Runs on the unclean-startup path only, AFTER recovery — a clean exit
+        drained its agents, so nothing was cut, and recovery is what settles
+        ``resume_pending`` / ``last_resume_marked_at`` for both shapes of
+        interruption (the drain pre-marks its victims; ``recover_interrupted_
+        turns`` promotes the markers a violent death left behind).
+
+        ``last_resume_marked_at`` is the identity of the interruption, and a
+        notice records it.  That is the whole no-spam contract:
+
+        * a notice already armed for THIS interruption is never re-armed —
+          including after it was delivered, even though ``resume_pending``
+          stays set until a successful resumed turn clears it;
+        * an undelivered notice survives further boots (the adapter may not
+          have been connected), so a cut turn cannot go silent;
+        * a genuinely NEW interruption carries a new mark time and re-arms.
+
+        Returns the number of newly armed notices.
+        """
+        now = _now()
+        max_age = timedelta(seconds=max(0, max_age_seconds))
+        armed = 0
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            for entry in self._entries.values():
+                if entry.suspended:
+                    continue
+                if not entry.resume_pending:
+                    continue
+                if entry.resume_reason not in INTERRUPT_RESUME_REASONS:
+                    continue
+
+                marked_at = entry.last_resume_marked_at
+                # Freshness: an old flag from a downgrade/re-upgrade cycle
+                # must not resurface as a notice about work nobody remembers.
+                try:
+                    if marked_at is None or (
+                        max_age_seconds > 0 and now - marked_at > max_age
+                    ):
+                        continue
+                except TypeError:
+                    # Mixed aware/naive timestamps — not trustworthy enough.
+                    continue
+
+                identity = marked_at.isoformat()
+                existing = entry.interrupt_notice
+                if isinstance(existing, dict) and existing.get("interrupted_at") == identity:
+                    continue
+
+                entry.interrupt_notice = {
+                    "excerpt": entry.last_turn_excerpt,
+                    "model": entry.last_turn_model,
+                    "started_at": (
+                        entry.last_turn_started_at.isoformat()
+                        if entry.last_turn_started_at
+                        else None
+                    ),
+                    # The drain marks resume_pending at the moment it
+                    # interrupts, so that timestamp IS the interruption.  A
+                    # crash has no such moment; the recovery pass stamps
+                    # discovery time and the cause clause says "crash".
+                    "interrupted_at": identity,
+                    "reason": entry.resume_reason,
+                    "cause": cause,
+                }
+                armed += 1
+
+            if armed:
+                self._save()
+
+        return armed
+
+    def pending_interrupt_notices(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """``(session_key, notice)`` for every notice still owed, oldest first."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            pending = [
+                (entry.session_key, dict(entry.interrupt_notice))
+                for entry in self._entries.values()
+                if isinstance(entry.interrupt_notice, dict)
+                and not entry.interrupt_notice.get("delivered_at")
+            ]
+        pending.sort(key=lambda item: str(item[1].get("interrupted_at") or ""))
+        return pending
+
+    def settle_interrupt_notice(
+        self,
+        session_key: str,
+        delivered: bool = True,
+    ) -> bool:
+        """Retire a notice — delivered, or aged out past the delivery window.
+
+        The record is stamped rather than deleted: ``interrupted_at`` is what
+        tells the next boot's :meth:`arm_interrupt_notices` that this
+        interruption has already been announced, and ``resume_pending``
+        alone cannot (it outlives the notice by design, until a successful
+        resumed turn clears it).
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not isinstance(entry.interrupt_notice, dict):
+                return False
+            if entry.interrupt_notice.get("delivered_at"):
+                return False
+            notice = dict(entry.interrupt_notice)
+            notice["delivered_at"] = _now().isoformat()
+            if not delivered:
+                notice["dropped"] = True
+            entry.interrupt_notice = notice
+            self._save()
+            return True
 
     def mark_resume_pending(
         self,

@@ -3043,6 +3043,15 @@ DEFAULT_CONFIG = {
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
 
+        # After a stop that cut turns mid-flight, the next startup posts one
+        # notice into each affected conversation ("interrupted at HH:MM
+        # while working on: …") and one summary to the home channel. The
+        # evidence is the durable active-turn marker, so this survives
+        # SIGKILL/OOM, unlike the shutdown-time warning. Set false to keep
+        # cut turns silent. Per-platform ``gateway_restart_notification``
+        # still suppresses it per surface.
+        "interrupted_turn_notification": True,
+
         # OpenAI-compatible API server platform
         # (gateway/platforms/api_server.py).
         "api_server": {

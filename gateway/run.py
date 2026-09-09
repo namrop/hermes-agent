@@ -12653,9 +12653,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Recover exact active turns, then run the legacy recency fallback."""
         exact = 0
         fallback = 0
+        agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
+        marker_max_age = max(60 * 60, int(agent_timeout * 2))
+        cause = self._interrupt_cause_from_lifecycle()
+
         try:
-            agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
-            marker_max_age = max(60 * 60, int(agent_timeout * 2))
             exact = await self.async_session_store.recover_interrupted_turns(
                 max_age_seconds=marker_max_age
             )
@@ -12667,7 +12669,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception as exc:
             logger.warning("Legacy session recovery on startup failed: %s", exc)
+        # Arm the notices AFTER both passes: recovery is what settles
+        # ``resume_pending`` and its mark time, and that mark time is the
+        # identity a notice is deduplicated on.  Covers exact markers and the
+        # legacy recency fallback in one sweep.
+        await self._arm_interrupt_notices(cause, marker_max_age)
         return exact, fallback
+
+    def _interrupt_cause_from_lifecycle(self) -> str:
+        """Name the stop when the lifecycle sentinel knows it, else "restart".
+
+        ``lifecycle_ledger.record_startup`` (already run before the runner
+        starts) carries its verdict on the PREVIOUS life onto this life's
+        sentinel, which is the only durable record of an unclean death —
+        ``shutdown_forensics`` only logs.
+        """
+        from gateway.interrupted_turns import CAUSE_OOM, CAUSE_RESTART, CAUSE_UNCLEAN
+
+        try:
+            from gateway.lifecycle_ledger import read_prior_life_flags
+
+            flags = read_prior_life_flags()
+        except Exception as exc:
+            logger.debug("Lifecycle cause lookup failed: %s", exc)
+            return CAUSE_RESTART
+        if flags.get("prior_suspected_oom"):
+            return CAUSE_OOM
+        if flags.get("prior_unclean_exit"):
+            return CAUSE_UNCLEAN
+        return CAUSE_RESTART
+
+    def _interrupted_turn_notification_enabled(self) -> bool:
+        """``gateway.interrupted_turn_notification`` (default on).
+
+        getattr-guarded: recovery-path tests drive these helpers from bare
+        doubles that carry no ``config``, the same way the shutdown-path
+        helpers are exercised.
+        """
+        return bool(
+            getattr(getattr(self, "config", None), "interrupted_turn_notification", True)
+        )
+
+    async def _arm_interrupt_notices(self, cause: str, max_age_seconds: int) -> int:
+        """Record that these turns owe their conversation a notice."""
+        if not self._interrupted_turn_notification_enabled():
+            return 0
+        try:
+            armed = await self.async_session_store.arm_interrupt_notices(
+                cause=cause, max_age_seconds=max_age_seconds
+            )
+        except Exception as exc:
+            logger.warning("Arming interrupted-turn notices failed: %s", exc)
+            return 0
+        if armed:
+            logger.info(
+                "Armed %d interrupted-turn notice(s) (cause=%s)", armed, cause
+            )
+        return armed
 
     def _start_loop_heartbeat_task(self) -> None:
         """Start the loop-liveness heartbeat task (#66892), idempotent.
@@ -13532,6 +13590,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             finally:
                 _clear_planned_restart_notification()
+
+        # A cut turn is never silent: tell each affected conversation that its
+        # turn was interrupted, and the owner once, for everything the last
+        # stop killed.  Runs BEFORE the resume pass so the notice lands
+        # promptly — an auto-resume that works is a bonus, not a substitute
+        # (it is silent, and it does not always fire).
+        try:
+            await self._notify_interrupted_turns()
+        except Exception as exc:
+            logger.warning("Interrupted-turn notification pass failed: %s", exc)
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -18878,14 +18946,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._async_session_store = facade
         return facade
 
+    def _turn_model_label(self, session_entry, source) -> Optional[str]:
+        """Best-effort model name for the turn about to run (marker metadata).
+
+        Session ``/model`` override first, then the platform default. Never
+        credentials — ``model_override`` is already sanitized by the store.
+        """
+        try:
+            override = getattr(session_entry, "model_override", None) or {}
+            model = override.get("model")
+            if model:
+                return str(model)
+            platform = getattr(source, "platform", None)
+            platform_cfg = self.config.platforms.get(platform) if platform else None
+            return getattr(platform_cfg, "model", None)
+        except Exception:
+            return None
+
     async def _mark_durable_active_turn(
         self,
         event: "MessageEvent",
         session_key: str,
+        model: Optional[str] = None,
     ) -> bool:
-        """Persist the exact resolved routing key for this running turn."""
+        """Persist the exact resolved routing key for this running turn.
+
+        The user's message and the model ride along on the same durable
+        write: after an unclean death the next boot can then say *what* was
+        cut, not merely that something was (``gateway.interrupted_turns``).
+        """
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                excerpt=getattr(event, "text", None),
+                model=model,
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
@@ -19490,7 +19585,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # explicitly degraded past) the per-session lease.  Marking before the
         # await above would falsely recover an alias-routed message that never
         # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        await self._mark_durable_active_turn(
+            event,
+            session_entry.session_key,
+            model=self._turn_model_label(session_entry, source),
+        )
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -24638,6 +24737,242 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
+        return delivered
+
+    async def _notify_interrupted_turns(self) -> int:
+        """Announce every turn the last stop cut: per thread, then to the owner.
+
+        The shutdown side (``_notify_active_sessions_of_shutdown``) can only
+        speak while it is still alive and connected. A SIGKILL, an OOM kill,
+        or an adapter that is already down leaves the user with a request
+        that never comes back and no word about it — the failure Luis
+        reported on 2026-09-09: "the request that I sent just dies. And I
+        don't even get a ping."
+
+        This is the startup half: the interruption was already recorded
+        durably by ``arm_interrupt_notices`` before the adapters connected,
+        so all that is left is delivery. A notice is cleared only once it
+        has actually been delivered (to its thread, or to the owner in the
+        summary), which is what makes this exactly-once rather than
+        best-effort — an undelivered notice waits for the next boot.
+
+        Returns the number of per-thread notices delivered.
+        """
+        if not self._interrupted_turn_notification_enabled():
+            return 0
+        try:
+            pending = await self.async_session_store.pending_interrupt_notices()
+        except Exception as exc:
+            logger.warning("Reading pending interrupted-turn notices failed: %s", exc)
+            return 0
+        if not pending:
+            return 0
+
+        from gateway.interrupted_turns import (
+            InterruptedTurn,
+            format_owner_summary,
+            format_thread_notice,
+            select_deliverable,
+        )
+        import hermes_time
+
+        tz = hermes_time.get_timezone()
+        zone_name = str(tz) if tz is not None else None
+
+        turns = [
+            turn
+            for turn in (
+                InterruptedTurn.from_notice(session_key, notice)
+                for session_key, notice in pending
+            )
+            if turn is not None
+        ]
+        fresh = select_deliverable(turns, datetime.now())
+        fresh_keys = {turn.session_key for turn in fresh}
+        for turn in turns:
+            if turn.session_key not in fresh_keys:
+                logger.info(
+                    "Dropping interrupted-turn notice for %s — past the delivery window",
+                    turn.session_key,
+                )
+                await self.async_session_store.settle_interrupt_notice(
+                    turn.session_key, delivered=False
+                )
+        if not fresh:
+            return 0
+
+        delivered_keys: set[str] = set()
+        thread_targets: set[tuple[str, str, Optional[str]]] = set()
+
+        for turn in fresh:
+            try:
+                source = self._build_process_event_source(
+                    {"session_key": turn.session_key}
+                )
+                if source is None:
+                    continue
+                platform = source.platform
+                platform_cfg = self.config.platforms.get(platform)
+                if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                    logger.info(
+                        "Interrupted-turn notice suppressed: %s has "
+                        "gateway_restart_notification=false",
+                        platform.value,
+                    )
+                    continue
+                transport = resolve_delivery_transport(
+                    platform, self.config, self.adapters
+                )
+                if transport is None:
+                    logger.info(
+                        "Interrupted-turn notice deferred: no live transport for %s",
+                        platform.value,
+                    )
+                    continue
+
+                metadata = self._thread_metadata_for_target(
+                    platform,
+                    source.chat_id,
+                    source.thread_id,
+                    chat_type=source.chat_type,
+                    adapter=transport.adapter,
+                )
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if source.user_id:
+                        metadata["user_id"] = str(source.user_id)
+                    if source.scope_id:
+                        metadata["scope_id"] = str(source.scope_id)
+
+                result = await transport.send(
+                    platform,
+                    str(source.chat_id),
+                    format_thread_notice(turn, tz),
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.warning(
+                        "Interrupted-turn notice to %s:%s was not delivered: %s",
+                        platform.value,
+                        source.chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    continue
+
+                delivered_keys.add(turn.session_key)
+                thread_targets.add(
+                    (
+                        platform.value,
+                        str(source.chat_id),
+                        str(source.thread_id) if source.thread_id else None,
+                    )
+                )
+                logger.info(
+                    "Sent interrupted-turn notice to %s:%s (session %s)",
+                    platform.value,
+                    source.chat_id,
+                    turn.session_key,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Interrupted-turn notice failed for %s: %s", turn.session_key, exc
+                )
+
+        summary_delivered = await self._send_interrupted_turn_summary(
+            fresh, thread_targets, tz, zone_name
+        )
+
+        # Settle only what actually reached someone.  A turn whose thread
+        # send failed is still settled when the owner summary landed — Luis
+        # has been told, which is the whole point — but if NEITHER left the
+        # process, the notice stays owed and the next boot retries it.
+        for turn in fresh:
+            if turn.session_key in delivered_keys or summary_delivered:
+                await self.async_session_store.settle_interrupt_notice(turn.session_key)
+
+        return len(delivered_keys)
+
+    async def _send_interrupted_turn_summary(
+        self,
+        turns,
+        thread_targets,
+        tz,
+        zone_name: Optional[str],
+    ) -> bool:
+        """One roll-up of everything the stop cut, to the configured home.
+
+        The home channel is the owner surface every other unprompted
+        lifecycle message already uses (``_send_home_channel_startup_
+        notifications``); it is resolved from ``platforms.<p>.home_channel``,
+        which ``gateway/config.py`` also populates from
+        ``<PLATFORM>_HOME_CHANNEL``. When a single cut turn WAS the home
+        channel, its own notice is the summary — sending both is spam.
+        """
+        from gateway.interrupted_turns import format_owner_summary
+
+        summary = format_owner_summary(turns, tz, zone_name)
+        if not summary:
+            return False
+
+        delivered = False
+        for platform, platform_cfg in self.config.platforms.items():
+            home = getattr(platform_cfg, "home_channel", None)
+            if not home or not home.chat_id:
+                continue
+            if not platform_cfg.gateway_restart_notification:
+                continue
+            target = (
+                platform.value,
+                str(home.chat_id),
+                str(home.thread_id) if home.thread_id else None,
+            )
+            if len(turns) == 1 and target in thread_targets:
+                continue
+
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                continue
+            try:
+                metadata = self._thread_metadata_for_target(
+                    platform,
+                    home.chat_id,
+                    home.thread_id,
+                    adapter=transport.adapter,
+                )
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if home.user_id:
+                        metadata["user_id"] = home.user_id
+                    if home.scope_id:
+                        metadata["scope_id"] = home.scope_id
+                result = await transport.send(
+                    platform,
+                    str(home.chat_id),
+                    summary,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.warning(
+                        "Interrupted-turn summary to %s:%s was not delivered: %s",
+                        platform.value,
+                        home.chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    continue
+                delivered = True
+                logger.info(
+                    "Sent interrupted-turn summary (%d turn(s)) to home channel %s:%s",
+                    len(turns),
+                    platform.value,
+                    home.chat_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Interrupted-turn summary failed for %s:%s: %s",
+                    platform.value,
+                    home.chat_id,
+                    exc,
+                )
         return delivered
 
     async def _send_session_db_warning_notifications(self) -> None:

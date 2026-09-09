@@ -999,6 +999,13 @@ class GatewayConfig:
     # default; set gateway.loop_watchdog: false in config.yaml to disable.
     loop_watchdog: bool = True
 
+    # Startup announcement for turns that a stop cut mid-flight: one notice
+    # into each affected conversation plus one summary to the home channel.
+    # On by default; set gateway.interrupted_turn_notification: false in
+    # config.yaml to keep cut turns silent.  The existing per-platform
+    # ``gateway_restart_notification`` flag still suppresses it per surface.
+    interrupted_turn_notification: bool = True
+
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
@@ -1138,6 +1145,7 @@ class GatewayConfig:
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
+            "interrupted_turn_notification": self.interrupted_turn_notification,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -1221,6 +1229,11 @@ class GatewayConfig:
         else:
             loop_watchdog_raw = nested_gateway.get("loop_watchdog")
         loop_watchdog = _coerce_bool(loop_watchdog_raw, True)
+        if "interrupted_turn_notification" in data:
+            interrupted_turn_raw = data.get("interrupted_turn_notification")
+        else:
+            interrupted_turn_raw = nested_gateway.get("interrupted_turn_notification")
+        interrupted_turn_notification = _coerce_bool(interrupted_turn_raw, True)
         if multiplex_profiles is None and isinstance(nested_gateway, dict):
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
@@ -1283,6 +1296,7 @@ class GatewayConfig:
             multiplex_profile_allowlist=multiplex_profile_allowlist,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
+            interrupted_turn_notification=interrupted_turn_notification,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
