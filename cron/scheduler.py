@@ -7064,11 +7064,12 @@ _last_dead_owner_reap_at: Optional[float] = None
 # lost until the next occurrence. _collect_resume_jobs finds the attempts a
 # per-job `resume` policy says to run once more.
 #
-# Bounded at ONE per tick on purpose. The class's worst day is 2026-08-27,
+# Bounded at ONE per pass on purpose. The class's worst day is 2026-08-27,
 # when a gateway init stall killed nine jobs at once; firing all nine back
-# into a gateway that has just come up is the same stall again. One per 60s
-# tick drains a backlog without a thundering herd, and the resume pass rides
-# the same throttle as the dead-owner reap so idle ticks pay no ledger read.
+# into a gateway that has just come up is the same stall again. The pass
+# rides the dead-owner reap's throttle (first tick after a start, then every
+# _DEAD_OWNER_REAP_INTERVAL_SECONDS), so idle ticks pay no ledger read and a
+# backlog drains at one job per 5 minutes rather than in a herd.
 _MAX_RESUMES_PER_TICK = 1
 
 
