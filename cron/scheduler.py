@@ -1243,7 +1243,9 @@ class _ReadWriteLock:
 
     Writer preference bounds the wait for a workdir job (dispatched on the
     single-thread sequential pool) so a stream of workdir-less readers cannot
-    starve it.
+    starve it.  Readers pay for that preference, so a workdir job whose
+    override is redundant takes the read path instead — see
+    ``_workdir_override_is_noop``.
     """
 
     def __init__(self) -> None:
@@ -1363,6 +1365,52 @@ def _cwd_lock_timeout_seconds() -> float:
         max(inactivity, _CWD_LOCK_TIMEOUT_FLOOR_SECONDS)
         + _CWD_LOCK_TIMEOUT_MARGIN_SECONDS
     )
+
+
+def _workdir_override_is_noop(workdir: str) -> bool:
+    """True when applying ``workdir`` as the TERMINAL_CWD override changes
+    nothing any other job could observe.
+
+    A workdir job is a *writer* because it retargets the process-global
+    ``TERMINAL_CWD`` that workdir-less readers resolve their shell / file /
+    code-exec cwd from.  When the configured workdir already IS the directory
+    every reader resolves anyway, there is nothing to exclude them from: the
+    override is a rename of the same path.  Such a job takes a READ lock
+    instead, so it no longer blocks unrelated readers for the length of its
+    agent run (#79768 follow-up — a redundant ``workdir`` on a long-running
+    job cost three Chief-of-Staff packets, 2026-08-29..2026-09-07).
+
+    Deliberately conservative, and both halves matter:
+
+    * ``workdir`` must resolve to the process cwd.  Readers with no override
+      fall through to ``os.getcwd()``.
+    * ``TERMINAL_CWD``, if set, must resolve to the process cwd too.  A
+      differing live value means some *other* holder is mid-override (the
+      classic case: writer X on ``/foo`` is active and this job's workdir is
+      also ``/foo``).  Downgrading then would let this job start before X
+      restores the env, and its ``os.getenv("TERMINAL_CWD")`` call sites would
+      read the restored gateway directory rather than ``/foo``.  Treat it as a
+      real writer and take the exclusive path.
+
+    Anything unreadable or unresolvable returns False — the writer path is
+    always the safe answer.
+    """
+    try:
+        target = Path(workdir).expanduser().resolve()
+        process_cwd = Path(os.getcwd()).resolve()
+    except (OSError, ValueError):
+        return False
+    if target != process_cwd:
+        return False
+    raw_override = os.environ.get("TERMINAL_CWD", "").strip()
+    if not raw_override:
+        return True
+    try:
+        # "." is the bridged default (config terminal.cwd) and resolves to the
+        # process cwd, so it counts as "no effective override".
+        return Path(raw_override).expanduser().resolve() == process_cwd
+    except (OSError, ValueError):
+        return False
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -5264,6 +5312,8 @@ def run_job(
     # file / code-exec commands in the wrong directory.  For workdir-less jobs
     # we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
+    # A workdir that resolves to the scheduler's own directory is likewise left
+    # untouched and holds the lock as a reader — see _workdir_override_is_noop.
     #
     # The critical path (resolve_context_cwd / build_context_files_prompt)
     # checks _SESSION_CWD first, so gateway sessions with no override see
@@ -5275,7 +5325,17 @@ def run_job(
     # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
     _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
 
-    _holds_cwd_write = _job_workdir is not None
+    # A workdir that resolves to the directory readers already use is not an
+    # override at all: it excludes them from nothing.  Downgrade it to a reader
+    # so it stops serialising the schedule behind its whole agent run.  Pool
+    # placement and context-file discovery are deliberately UNCHANGED (it still
+    # queues on the sequential pool and still gets skip_context_files=False) —
+    # only the lock mode and the redundant env write are dropped.
+    _cwd_override_is_noop = bool(_job_workdir) and _workdir_override_is_noop(
+        _job_workdir
+    )
+    _holds_cwd_write = _job_workdir is not None and not _cwd_override_is_noop
+    _cwd_env_mutated = False
     _cwd_lock_timeout = _cwd_lock_timeout_seconds()
     _cwd_lock_acquired = True
     if _holds_cwd_write:
@@ -5335,9 +5395,17 @@ def run_job(
         # concurrent cron jobs on the parallel pool.  contextvars.copy_context()
         # at the run_conversation hop carries this into the agent thread.
         _non_dispatcher_token = enter_non_dispatcher_owned_context()
-        if _job_workdir:
+        if _job_workdir and not _cwd_override_is_noop:
             os.environ["TERMINAL_CWD"] = _job_workdir
+            _cwd_env_mutated = True
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
+        elif _job_workdir:
+            logger.info(
+                "Job '%s': workdir %s already is the scheduler's working "
+                "directory — no TERMINAL_CWD override, holding the cwd lock "
+                "as a reader",
+                job_id, _job_workdir,
+            )
 
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart. Route through
@@ -6146,12 +6214,13 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir AND actually held
-        # the write lock — a fail-closed timeout raised before the env-set,
-        # so restoring there would replay a pre-wait snapshot over the
-        # ACTIVE holder's live override.
-        if _job_workdir and _cwd_lock_acquired:
+        # Restore TERMINAL_CWD to whatever it was before this job ran, and
+        # ONLY if this job actually wrote it.  A fail-closed timeout raises
+        # before the env-set, and a no-op workdir never writes at all — in
+        # both cases restoring would replay a pre-wait snapshot over whatever
+        # the live value is now (the ACTIVE holder's override, or a value a
+        # gateway session set outside the lock).
+        if _cwd_env_mutated:
             if _prior_terminal_cwd == "_UNSET_":
                 os.environ.pop("TERMINAL_CWD", None)
             else:
@@ -7218,9 +7287,13 @@ def tick(
                 verbose=verbose,
             )
 
-        # Partition due jobs: those with a per-job workdir mutate
+        # Partition due jobs: those with a per-job workdir may mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
         # they queue on the single-thread sequential pool to run one at a time.
+        # Partitioning stays keyed on the raw `workdir` field even when run_job
+        # later finds the override redundant (_workdir_override_is_noop): that
+        # downgrade drops the *lock* to a reader, deliberately without changing
+        # which pool a job runs on, so no live job's concurrency shifts.
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.

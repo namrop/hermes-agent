@@ -1,5 +1,67 @@
 # Architecture Decision Records
 
+## 2026-09-09: A redundant `workdir` is not a writer — the TERMINAL_CWD lock downgrade
+
+Status: Accepted
+
+Context:
+Cron serialises the process-global `os.environ["TERMINAL_CWD"]` override with a
+writer-preferring readers-writer lock (`cron/scheduler.py::_ReadWriteLock`,
+#79768). Jobs with a `workdir` are writers and hold it exclusively for their
+whole agent run; jobs without one are readers and **fail closed** after
+`HERMES_CRON_TIMEOUT + 60s` (660 s by default) rather than run against another
+job's directory.
+
+On sol's primary profile, eight frontier-watch jobs carried
+`workdir: /var/lib/hermes/primary` — which is the gateway unit's own
+`WorkingDirectory`. They were therefore writers that overrode the shared cwd
+with the value every reader already resolves. Between 2026-08-29 and
+2026-09-07 that cost three Chief-of-Staff morning packets: the 08:30 packet
+job (a reader) timed out at 08:41 while a frontier-watch job scheduled at
+08:00/08:10/08:30 was still running (completions at 08:44, 08:47, 08:55).
+
+Two repairs were on the table.
+
+- **Reader priority / bounded writer preference** — reorder the *queue* so a
+  reader near its deadline is admitted ahead of newly-arriving writers. This
+  does not fix the observed failures: in all three the writer was **active**,
+  not queued, and a reader can never run alongside an active writer without
+  reintroducing exactly the wrong-directory corruption the lock exists to
+  prevent. Rejected as not addressing the reproduction.
+- **Drop `workdir` from the jobs** — live immediately with no deploy, but it
+  flips `skip_context_files` from False to True (the job loses its
+  workdir's AGENTS.md and friends, `run_job` ~line 5900) and moves the job
+  from the sequential pool to the parallel pool. Two behaviour changes to jobs
+  owned by someone else, to remove one redundant field. Rejected.
+
+Decision:
+Classify the override, not the field. `_workdir_override_is_noop(workdir)` is
+true iff the workdir resolves to the process cwd **and** any live
+`TERMINAL_CWD` also resolves to the process cwd. Such a job takes the **read**
+lock and skips the env write; everything else about it is unchanged — same
+sequential pool, same `skip_context_files=False`, same context files, same
+`_SESSION_CWD` pin (which takes precedence over `TERMINAL_CWD` in
+`agent/runtime_cwd.py` anyway).
+
+The second half of the predicate is the conservative half: if some other
+holder is mid-override with a *different* directory, this job is treated as a
+real writer. Downgrading there would let it start before that holder restored
+the env, and its `os.getenv("TERMINAL_CWD")` call sites (`cli.py`,
+`agent/tool_executor.py`, `agent/prompt_builder.py`) would read a value that
+was never its own.
+
+Consequences:
+- The env restore in `run_job`'s `finally` is now gated on "this job actually
+  wrote the variable" (`_cwd_env_mutated`) rather than on "this job has a
+  workdir", so a no-op job can never replay a stale snapshot over a live value.
+- Two workdir jobs that both resolve to the process cwd are now concurrent as
+  far as the lock is concerned — but they still queue on the single-thread
+  sequential pool, so nothing observable changes for them.
+- A workdir job that genuinely retargets the cwd is untouched: still exclusive,
+  still fails its waiters loudly past the bound.
+- Schedule staggering remains valid defence in depth for real writers; it is
+  not superseded by this change.
+
 ## 2026-09-09: A cut turn is never silent — startup interrupted-turn notices
 
 Status: Accepted (keeper ruling 2026-09-09, Luis)

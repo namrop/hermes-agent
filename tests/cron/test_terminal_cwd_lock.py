@@ -298,3 +298,172 @@ def test_cwd_lock_timeout_derivation(monkeypatch):
     assert sched._cwd_lock_timeout_seconds() == 660.0
     monkeypatch.setenv("HERMES_CRON_TIMEOUT", "bogus")
     assert sched._cwd_lock_timeout_seconds() == 660.0
+
+
+# ── Redundant-workdir downgrade (#79768 follow-up) ──────────────────────────
+#
+# A workdir that resolves to the directory readers already use excludes them
+# from nothing, so run_job takes the READ path for it instead of holding the
+# writer lock for its whole agent run. Three Chief-of-Staff packets (readers)
+# were lost 2026-08-29..2026-09-07 waiting on frontier-watch jobs whose
+# `workdir` was the gateway's own WorkingDirectory.
+
+
+def _probe_reader_can_acquire(lock, timeout: float = 1.0) -> bool:
+    """Can a *separate* thread take the read lock right now?
+
+    False iff a writer holds (or is queued for) the lock — the exact
+    observation that distinguishes the write path from the read path.
+    """
+    got: list = []
+
+    def run():
+        ok = lock.acquire_read(timeout=timeout)
+        got.append(ok)
+        if ok:
+            lock.release_read()
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(timeout=timeout + 2)
+    assert got, "reader probe thread did not finish"
+    return got[0]
+
+
+def test_workdir_override_is_noop_when_it_is_the_process_cwd(monkeypatch, tmp_path):
+    import cron.scheduler as sched
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    assert sched._workdir_override_is_noop(str(tmp_path)) is True
+
+
+def test_workdir_override_is_noop_with_dot_bridged_terminal_cwd(monkeypatch, tmp_path):
+    """`terminal.cwd: .` (the primary profile's config) bridges to a literal
+    "." — an override in name only, so it must not block the downgrade."""
+    import cron.scheduler as sched
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TERMINAL_CWD", ".")
+    assert sched._workdir_override_is_noop(str(tmp_path)) is True
+
+
+def test_workdir_override_is_not_noop_for_a_different_directory(monkeypatch, tmp_path):
+    import cron.scheduler as sched
+
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    assert sched._workdir_override_is_noop(str(other)) is False
+
+
+def test_workdir_override_is_not_noop_while_another_holder_overrides(
+    monkeypatch, tmp_path
+):
+    """The race the conservative half of the predicate exists for.
+
+    Writer X (workdir /foo) is active and has set TERMINAL_CWD=/foo. Job Z's
+    workdir is the process cwd. If Z were downgraded it could start the moment
+    X released and restored the env — but Z's own os.getenv("TERMINAL_CWD")
+    call sites would then read a value that was never Z's. Only classify Z as
+    a no-op when the live override already resolves to the process cwd.
+    """
+    import cron.scheduler as sched
+
+    foo = tmp_path / "foo"
+    foo.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TERMINAL_CWD", str(foo))
+    assert sched._workdir_override_is_noop(str(tmp_path)) is False
+
+
+def _run_job_capturing_lock_state(monkeypatch, tmp_path, job, marker):
+    """Run run_job far enough to observe the lock/env state it established.
+
+    Aborts the body by raising from the workdir log line (the same hook the
+    leak regression above uses), so no agent turn is attempted.
+    """
+    from unittest.mock import MagicMock, patch
+    import cron.scheduler as sched
+
+    observed = {}
+    real_info = sched.logger.info
+
+    def _capture(msg, *args, **kwargs):
+        if isinstance(msg, str) and marker in msg:
+            observed["terminal_cwd"] = os.environ.get("TERMINAL_CWD", "_UNSET_")
+            observed["reader_can_acquire"] = _probe_reader_can_acquire(
+                sched._terminal_cwd_lock
+            )
+            raise RuntimeError("stop-after-observation")
+        return real_info(msg, *args, **kwargs)
+
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch.object(sched.logger, "info", side_effect=_capture), \
+         patch("hermes_state.SessionDB", return_value=MagicMock()):
+        sched.run_job(job)
+
+    assert observed, f"run_job never logged a line containing {marker!r}"
+    return observed
+
+
+def test_redundant_workdir_job_holds_the_lock_as_a_reader(monkeypatch, tmp_path):
+    """The repair: a workdir equal to the scheduler's own cwd no longer
+    excludes concurrent readers, and never writes TERMINAL_CWD."""
+    import cron.scheduler as sched
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    job = {
+        "id": "noop-workdir",
+        "name": "noop-workdir",
+        "prompt": "hi",
+        "workdir": str(tmp_path),
+    }
+    observed = _run_job_capturing_lock_state(
+        monkeypatch, tmp_path, job, "no TERMINAL_CWD override"
+    )
+
+    assert observed["terminal_cwd"] == "_UNSET_", (
+        "a redundant workdir must not write the process-global override"
+    )
+    assert observed["reader_can_acquire"] is True, (
+        "a redundant workdir still excluded a concurrent reader"
+    )
+    # And it released cleanly: a writer can take the lock afterwards.
+    assert sched._terminal_cwd_lock.acquire_write(timeout=5) is True
+    sched._terminal_cwd_lock.release_write()
+    assert os.environ.get("TERMINAL_CWD") is None
+
+
+def test_real_workdir_job_still_holds_the_writer_lock(monkeypatch, tmp_path):
+    """Contract preserved: a workdir that IS an override still excludes
+    readers for the whole run and still sets the env."""
+    import cron.scheduler as sched
+
+    other = tmp_path / "project"
+    other.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    job = {
+        "id": "real-workdir",
+        "name": "real-workdir",
+        "prompt": "hi",
+        "workdir": str(other),
+    }
+    observed = _run_job_capturing_lock_state(
+        monkeypatch, tmp_path, job, "using workdir"
+    )
+
+    assert observed["terminal_cwd"] == str(other)
+    assert observed["reader_can_acquire"] is False, (
+        "a real workdir override must still exclude concurrent readers"
+    )
+    assert sched._terminal_cwd_lock.acquire_write(timeout=5) is True
+    sched._terminal_cwd_lock.release_write()
+    # Restored on the way out.
+    assert os.environ.get("TERMINAL_CWD") is None
