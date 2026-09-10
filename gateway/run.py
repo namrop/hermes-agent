@@ -6270,10 +6270,34 @@ class TurnRunner:
             # the redacted value.
             cmd = _redact_approval_command(cmd)
 
+            # Delivery-facts pocket (2026-08-31 closure): first-hand send
+            # facts, stamped for the post_approval_response hook / ledger.
+            # ``approval_data["_delivery"]`` is the SAME dict the gate
+            # pocketed before enqueuing (shallow copy keeps it shared), so
+            # writing here is visible to the gate at resolution time.
+            _delivery = approval_data.get("_delivery")
+            if not isinstance(_delivery, dict):
+                # Defensive: a caller that bypassed _await_gateway_decision's
+                # pocketing still gets facts — they simply go unread.
+                _delivery = {}
+                approval_data["_delivery"] = _delivery
+
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+                # The metadata this branch passes to send_exec_approval —
+                # ping hints included — is exactly what "the prompt carried
+                # a mention" means; remember it for the delivery facts.
+                _button_metadata = _approval_metadata_with_ping(
+                    ctx._status_thread_metadata,
+                    ctx.source,
+                )
+                _delivery["notification_ping"] = bool(
+                    _button_metadata.get("approval_ping_user_id")
+                    if isinstance(_button_metadata, dict)
+                    else None
+                )
                 try:
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
@@ -6281,10 +6305,7 @@ class TurnRunner:
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=_approval_metadata_with_ping(
-                                ctx._status_thread_metadata,
-                                ctx.source,
-                            ),
+                            metadata=_button_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -6296,6 +6317,7 @@ class TurnRunner:
                     if _approval_fut is None:
                         raise RuntimeError("send_exec_approval: loop unavailable")
                     _outcome = _approval_send_outcome(_approval_fut, timeout=15)
+                    _delivery["notification_send"] = _outcome
                     if _outcome == "sent":
                         return
                     if _outcome == "ambiguous":
@@ -6340,6 +6362,9 @@ class TurnRunner:
             _attention = _blocking_attention_prefix(ctx.source)
             if _attention:
                 msg = f"{_attention}🔔 {msg}"
+            # The prefix IS the ping on this branch — its presence in the
+            # outgoing message is the first-hand fact.
+            _delivery["notification_ping"] = bool(_attention)
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
                     ctx._status_adapter.send(
@@ -6352,8 +6377,11 @@ class TurnRunner:
                     log_message="Approval text-send scheduling error",
                 )
                 if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                    _delivery["notification_send"] = _approval_send_outcome(
+                        _approval_send_fut, timeout=15
+                    )
             except Exception as _e:
+                _delivery["notification_send"] = "failed"
                 logger.error("Failed to send approval request: %s", _e)
 
         # Keep real user text separate from API-only recovery guidance.  If

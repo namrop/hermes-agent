@@ -4306,8 +4306,72 @@ def _transport_denied_result(
     }
 
 
+# ---------------------------------------------------------------------------
+# Notification-delivery facts — the 2026-08-31 scar's closure, built 2026-09-10
+#
+# The approval hooks historically carried no notification-delivery facts:
+# pre_approval_request fires before the gateway notify callback runs, so an
+# observer plugin could not tell whether the human-facing prompt was ever
+# delivered. The approval_ledger therefore left ``ping_dispatched`` a
+# permanent explicit null and had no honest ``never_notified`` bucket.
+#
+# Closure: the gateway notify callback (gateway/run.py
+# ``_approval_notify_sync``) stamps FIRST-HAND send facts into a shallow
+# ``_delivery`` pocket of the same ``approval_data`` dict it already
+# receives; the wait loop below forwards the pocket's contents into
+# ``post_approval_response`` as ``notification_ping`` / ``notification_send``
+# kwargs at resolution time. Delivery facts are observations, not secrets.
+#
+# ``notification_ping``: True only when the outgoing prompt message itself
+# carried a requester mention (native metadata ping or the plain-text
+# ``<@id>`` attention prefix). False when the prompt went out without a
+# mention. None/absent when unknown — the notify callback never ran, or an
+# older surface that does not stamp facts.
+#
+# ``notification_send``: ``sent`` | ``ambiguous`` | ``failed`` — the
+# ``_approval_send_outcome`` classification of the actual platform send, or
+# None/absent when unknown. ``ambiguous`` means the send future timed out;
+# the card may still have posted (see gateway/run.py), so it is not a
+# failure claim.
+# ---------------------------------------------------------------------------
+
+
+def _new_delivery_facts(approval_data: dict) -> dict:
+    """Create the shared delivery-facts pocket for one approval request.
+
+    The gateway notify callback writes first-hand send facts into THIS dict
+    (never a copy). ``_ApprovalEntry`` shallow-copies ``approval_data``, so
+    the entry's ``data["_delivery"]`` is the same pocket object and facts
+    stamped during the send are visible here at resolution time without any
+    new coupling between the gate and the gateway layer.
+    """
+    facts: dict = {"notification_ping": None, "notification_send": None}
+    approval_data["_delivery"] = facts
+    return facts
+
+
+def _delivery_hook_kwargs(approval_data: dict) -> dict:
+    """Extract validated delivery facts for hook kwargs; empty when unstamped.
+
+    Never raises and never invents values: an absent or malformed pocket
+    yields an empty dict, and the hooks stay exactly as informative as they
+    were before this closure existed.
+    """
+    facts = approval_data.get("_delivery")
+    if not isinstance(facts, dict):
+        return {}
+    ping = facts.get("notification_ping")
+    send = facts.get("notification_send")
+    out: dict = {}
+    if ping is True or ping is False:
+        out["notification_ping"] = ping
+    if send in ("sent", "ambiguous", "failed"):
+        out["notification_send"] = send
+    return out
+
+
 def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
-                            *, surface: str = "gateway"):
+                            *, surface: str = "gateway") -> Optional[dict]:
     """Wait on an already-pending identical approval instead of re-prompting.
 
     Called by ``_await_gateway_decision`` when an identical approval (same
@@ -4459,6 +4523,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             return adopted
         # Leader resolved "once" — fall through to a fresh prompt below.
 
+    # Delivery-facts pocket — created BEFORE the entry so the entry's
+    # shallow copy of approval_data carries the same pocket object the
+    # gateway notify callback will stamp into (see _new_delivery_facts).
+    _new_delivery_facts(approval_data)
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
@@ -4565,6 +4633,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         session_key=session_key,
         surface=surface,
         choice=_outcome,
+        # First-hand notification-delivery facts stamped by the gateway
+        # notify callback into the shared pocket, if any (2026-08-31
+        # closure). Absent for surfaces that do not stamp.
+        **_delivery_hook_kwargs(approval_data),
     )
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 

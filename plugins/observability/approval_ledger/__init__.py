@@ -290,7 +290,9 @@ def _persistence_scope(choice: Any) -> str | None:
 # Escalation — did this reach a human tier, and was anything dispatched?
 # ---------------------------------------------------------------------------
 
-def _escalation(surface: str, choice: Any) -> dict[str, Any]:
+def _escalation(surface: str, choice: Any,
+                notification_ping: Any = None,
+                notification_send: Any = None) -> dict[str, Any]:
     """Separate "the aux approver decided" from "a human was asked".
 
     This is the diagnostic axis. A layer-8 resolution means no human was ever
@@ -298,21 +300,27 @@ def _escalation(surface: str, choice: Any) -> dict[str, Any]:
     and then the question becomes whether anything was actually dispatched to
     a human, and on which channel.
 
-    ``ping_dispatched`` is deliberately always ``None``. The hook payloads
-    carry no notification-delivery facts, so whether a *push notification*
-    (as opposed to a card silently posted into a channel) reached the keeper
-    is not determinable from this vantage. That is the ledger's headline blind
-    spot; see schema.md. It is left as an explicit null rather than inferred,
-    so a future field that can answer it has somewhere honest to land.
+    ``ping_dispatched`` comes from FIRST-HAND delivery facts when the surface
+    provides them (``notification_ping`` kwarg, stamped by the gateway notify
+    callback since the 2026-09-10 closure of the 2026-08-31 scar): ``True``
+    only when the outgoing prompt message itself carried a requester mention,
+    ``False`` when it demonstrably went out without one, ``None`` when
+    unknown (older surfaces, unstamped payloads). It is never inferred.
+
+    ``notification_dispatched`` is refined the same way when a first-hand
+    ``notification_send`` classification (``sent``/``ambiguous``/``failed``)
+    is present; otherwise it falls back to the choice-based inference the
+    ledger has always used.
     """
     family = surface.split(":", 1)[0] if surface else ""
     choice_s = choice if isinstance(choice, str) else ""
+    ping_known = notification_ping is True or notification_ping is False
 
     esc: dict[str, Any] = {
         "human_tier_reached": None,
         "notification_channel": None,
         "notification_dispatched": None,
-        "ping_dispatched": None,
+        "ping_dispatched": bool(notification_ping) if ping_known else None,
     }
 
     if family == "smart":
@@ -327,11 +335,20 @@ def _escalation(surface: str, choice: Any) -> dict[str, Any]:
 
     esc["human_tier_reached"] = True
 
+    def _dispatched(fallback: Any) -> Any:
+        # First-hand send classification wins; the choice-based fallback
+        # keeps rows from unstamped surfaces as informative as before.
+        if notification_send == "sent":
+            return True
+        if notification_send == "failed":
+            return False
+        return fallback
+
     if family == "gateway":
         # A gateway card was handed to the platform notify callback. If that
         # callback raised, the host emits choice="notify_failed".
         esc["notification_channel"] = "gateway_card"
-        esc["notification_dispatched"] = choice_s != "notify_failed"
+        esc["notification_dispatched"] = _dispatched(choice_s != "notify_failed")
     elif family == "cli":
         # A local terminal panel. Rendered, never pushed — there is nothing
         # to deliver and nothing that could fail to deliver.
@@ -344,26 +361,30 @@ def _escalation(surface: str, choice: Any) -> dict[str, Any]:
         # A transport TIMEOUT means it was presented and then expired —
         # dispatch succeeded. Only an error or an unavailable transport means
         # nothing reached the human.
-        esc["notification_dispatched"] = choice_s not in (
+        esc["notification_dispatched"] = _dispatched(choice_s not in (
             "transport_error",
             "transport_unavailable",
-        )
+        ))
     return esc
 
 
 def _outcome_class(surface: str, decision: str, escalation: dict[str, Any]) -> str:
     """The queryable bucket, restricted to what is actually observable.
 
-    Deliberately does NOT include a ``never_notified`` bucket. Whether the
-    keeper was pinged is not visible here (see :func:`_escalation`), so
-    claiming it would be an inference dressed as a measurement. These four
-    classes are all first-hand.
+    ``never_notified`` (added 2026-09-10 with the delivery-facts closure):
+    a timeout on a human-tier row whose first-hand facts show the prompt
+    went out with NO requester mention. Only a first-hand ``ping_dispatched
+    is False`` lands here — a timeout with an unknown ping stays
+    ``human_never_answered``, and a timeout on a pinged prompt is exactly
+    that: the human was notified and did not answer.
     """
     if escalation.get("human_tier_reached") is False:
         return "resolved_by_aux"
     if decision == "error":
         return "dispatch_failed"
     if decision == "timed_out":
+        if escalation.get("ping_dispatched") is False:
+            return "never_notified"
         return "human_never_answered"
     if decision in ("approved", "denied"):
         return "human_answered"
@@ -476,7 +497,12 @@ def on_post_approval_response(**kwargs: Any) -> None:
         choice = kwargs.get("choice")
         layer, layer_name = _resolving_layer(surface)
         decision = _decision_class(choice)
-        escalation = _escalation(surface, choice)
+        escalation = _escalation(
+            surface,
+            choice,
+            notification_ping=kwargs.get("notification_ping"),
+            notification_send=kwargs.get("notification_send"),
+        )
 
         row = {
             "schema_version": SCHEMA_VERSION,
