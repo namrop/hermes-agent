@@ -602,6 +602,115 @@ def effective_job_state(job: Dict[str, Any]) -> str:
     return stored or "scheduled"
 
 
+# ── Resume-after-interruption policy (per job) ──────────────────────────────
+#
+# A gateway restart cuts every in-flight cron run. recover_interrupted_executions
+# marks the abandoned attempts ``unknown`` "without scheduling retries", and the
+# job's next_run_at advanced at fire time, so the run is simply lost until the
+# next occurrence — a weekly watcher killed on Monday is silent for a week
+# (nine jobs at once on 2026-08-27; two more on 2026-09-09).
+#
+# ``resume`` on the job record says what to do about that. It is deliberately
+# per-job and deliberately opt-in: a rerun of a job that delivers to a chat
+# posts a second message, and the ledger cannot know whether the interrupted
+# attempt already posted one (that is exactly what ``unknown`` means).
+RESUME_POLICY_SKIP = "skip"
+RESUME_POLICY_RERUN_ONCE = "rerun_once"
+RESUME_WITHIN_HOURS_PREFIX = "rerun_if_within_hours:"
+
+
+class InvalidResumePolicy(ValueError):
+    """Raised for a resume policy outside the grammar."""
+
+
+def normalize_resume_policy(value: Any) -> Optional[str]:
+    """Canonicalize a resume policy, or None to clear it (follow the default).
+
+    Grammar: ``skip`` | ``rerun_once`` | ``rerun_if_within_hours:<n>`` where
+    ``n`` is a positive number of hours. Raises InvalidResumePolicy otherwise
+    — a typo must not silently become "never resume".
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {RESUME_POLICY_SKIP, RESUME_POLICY_RERUN_ONCE}:
+        return text
+    if text.startswith(RESUME_WITHIN_HOURS_PREFIX):
+        raw = text[len(RESUME_WITHIN_HOURS_PREFIX):].strip()
+        try:
+            hours = float(raw)
+        except (TypeError, ValueError):
+            raise InvalidResumePolicy(
+                f"resume policy {value!r}: hours must be a number"
+            ) from None
+        if hours <= 0:
+            raise InvalidResumePolicy(
+                f"resume policy {value!r}: hours must be positive"
+            )
+        # Render integers without a trailing .0 so round-trips are stable.
+        rendered = str(int(hours)) if hours == int(hours) else repr(hours)
+        return f"{RESUME_WITHIN_HOURS_PREFIX}{rendered}"
+    raise InvalidResumePolicy(
+        f"Unknown resume policy {value!r}. Use 'skip', 'rerun_once', or "
+        f"'rerun_if_within_hours:<n>'."
+    )
+
+
+def default_resume_policy(job: Dict[str, Any]) -> str:
+    """The policy for a job that has not set one.
+
+    Only one case is safe to turn on without being asked: a ``no_agent``
+    script job with no delivery target. It is a deterministic producer whose
+    whole output is a side effect on disk (a ledger row, a state file), it
+    costs no inference, and re-running it posts nothing to anybody. Every
+    other job — anything with a ``deliver`` target, and every agent job —
+    defaults to ``skip``, because a rerun can duplicate an external side
+    effect that the interrupted attempt may or may not have performed.
+
+    Note for operators: every job on a typical profile carries a ``deliver``
+    value (``origin`` counts), so in practice resume is opt-in per job via
+    ``hermes cron resume-policy <job> rerun_once``. That is the intended
+    posture — the machine does not decide on its own to post a second copy of
+    something.
+    """
+    deliver = job.get("deliver")
+    deliver = str(deliver).strip().lower() if isinstance(deliver, str) else ""
+    if bool(job.get("no_agent")) and deliver in {"", "none", "silent"}:
+        return RESUME_POLICY_RERUN_ONCE
+    return RESUME_POLICY_SKIP
+
+
+def effective_resume_policy(job: Dict[str, Any]) -> str:
+    """The policy actually in force for a job (explicit, else the default)."""
+    try:
+        explicit = normalize_resume_policy(job.get("resume"))
+    except InvalidResumePolicy:
+        logger.warning(
+            "Job '%s' has an unreadable resume policy %r — treating as 'skip'",
+            job.get("id"), job.get("resume"),
+        )
+        return RESUME_POLICY_SKIP
+    return explicit or default_resume_policy(job)
+
+
+def resume_policy_window_hours(policy: str) -> Optional[float]:
+    """Hours bound for a ``rerun_if_within_hours:<n>`` policy, else None."""
+    text = str(policy or "").strip().lower()
+    if not text.startswith(RESUME_WITHIN_HOURS_PREFIX):
+        return None
+    try:
+        return float(text[len(RESUME_WITHIN_HOURS_PREFIX):])
+    except (TypeError, ValueError):
+        return None
+
+
+def set_resume_policy(job_id: str, policy: Any) -> Optional[Dict[str, Any]]:
+    """Set (or clear, with None/'') a job's resume policy."""
+    return update_job(job_id, {"resume": normalize_resume_policy(policy)})
+
+
 def _secure_dir(path: Path):
     """Set directory to owner-only access (0700). No-op on Windows."""
     try:

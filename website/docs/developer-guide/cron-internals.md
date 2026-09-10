@@ -76,6 +76,71 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
+## Resume After an Interrupted Run
+
+A gateway restart — a NixOS switch, `hermes update`, an OOM, a crash — cuts
+every cron run that is in flight. `recover_interrupted_executions()` marks the
+abandoned attempts `unknown` once their owner process is *proved* gone, and
+stops there. Because `next_run_at` already advanced at fire time, the cut run
+is otherwise lost until the schedule comes round again: a weekly watcher killed
+on Monday morning is silent for a week.
+
+The optional `resume` field on a job record says what to do about that.
+
+| Policy | Meaning |
+|---|---|
+| `skip` | Do nothing. The loss is recorded and the job waits for its next occurrence. |
+| `rerun_once` | Run the job one more time, as soon as the scheduler notices, while the window is open. |
+| `rerun_if_within_hours:<n>` | `rerun_once`, additionally bounded to `<n>` hours since the interrupted attempt was claimed. |
+
+**The window is the schedule's own next occurrence.** A resume only fires while
+`now < next_run_at`, so a rerun can never land next to the job's own fresh run,
+and no configuration is needed to get the right window for a given cadence.
+
+**The bound is one rerun per interruption.** The rerun's execution row carries
+`resume_of = <interrupted execution id>`; the ledger refuses to offer an
+attempt that already has a rerun, and refuses to resume a resume. A job cut
+three weeks running gets one rerun, not three.
+
+**Defaults are conservative and deliberately opt-in.** The only automatic
+`rerun_once` is a `no_agent` script job with no `deliver` target: a
+deterministic producer whose whole output is a side effect on disk, costing no
+inference and posting nothing to anybody. Everything else defaults to `skip`,
+because `unknown` means precisely that we cannot tell whether the interrupted
+attempt already delivered its message — a rerun could post a second copy.
+Since `deliver: origin` counts as a delivery target, on most profiles resume is
+something you turn on per job:
+
+```bash
+hermes cron resume-policy                              # every job's policy
+hermes cron resume-policy <job_id>                     # one job (and its default)
+hermes cron resume-policy <job_id> rerun_once          # set it
+hermes cron resume-policy <job_id> rerun_if_within_hours:6
+hermes cron resume-policy <job_id> default             # clear the explicit setting
+```
+
+### What resume will not do
+
+- **It never changes a schedule.** Only `schedule.kind == "cron"` jobs are
+  eligible. `claim_job_for_fire` and `mark_job_run` both recompute
+  `next_run_at`; for a cron expression that reproduces the same next
+  occurrence, but an `interval` job would be *re-anchored* from the resume
+  time. One-shots are governed by `claim_dispatch`'s at-most-once counter and
+  are out of scope for the same reason.
+- **It never resumes a job that is due, paused, disabled, currently running,
+  or has since completed successfully.** The due fire (or the live run) is the
+  recovery.
+- **It never floods a restarting gateway.** At most one job is resumed per
+  tick (`_MAX_RESUMES_PER_TICK`), and the scan rides the dead-owner reap's
+  throttle, so a backlog drains one per cycle rather than firing nine jobs
+  into a gateway that has just come up.
+- **It is off during a drain or an e-stop.** The pass sits inside `tick()`
+  after the `check_paused` and `can_dispatch` gates.
+
+Observability: resumed attempts appear in `hermes cron runs` with
+`source=resume`, and the scheduler logs a WARNING naming the job, the
+interrupted attempt and the policy that allowed the rerun.
+
 ## Scheduler Runtime
 
 ### Tick Cycle
@@ -294,6 +359,7 @@ hermes cron create                  # Interactive job creation (alias: add)
 hermes cron edit <job_id>           # Edit job configuration
 hermes cron pause <job_id>          # Pause a running job
 hermes cron resume <job_id>         # Resume a paused job
+hermes cron resume-policy [<job_id>] [<policy>]  # View/set resume-after-interruption
 hermes cron run <job_id>            # Trigger immediate execution
 hermes cron remove <job_id>         # Delete a job
 ```

@@ -64,6 +64,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    # resume_of: the id of the interrupted attempt this row is the single
+    # permitted rerun of (NULL for a normal fire). Added by migration, not by
+    # the CREATE above — the live ledger on a running host already exists, and
+    # CREATE TABLE IF NOT EXISTS never touches it. Idempotent.
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(executions)")
+    }
+    if "resume_of" not in columns:
+        conn.execute("ALTER TABLE executions ADD COLUMN resume_of TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_resume_of "
+        "ON executions(resume_of)"
+    )
 
 
 @contextmanager
@@ -136,8 +149,16 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
-def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
-    """Persist a claimed attempt before executor/provider dispatch."""
+def create_execution(
+    job_id: str, *, source: str, resume_of: Optional[str] = None
+) -> Dict[str, Any]:
+    """Persist a claimed attempt before executor/provider dispatch.
+
+    ``resume_of`` names the interrupted attempt this row reruns. It is the
+    bound on resume as well as the record of it: ``find_resumable`` refuses
+    any row that already has a rerun pointing at it, and refuses to resume a
+    resume, so one interruption yields at most one extra run.
+    """
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
@@ -145,10 +166,11 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                status, claimed_at, resume_of)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
+             _process_start_time(pid), now,
+             str(resume_of) if resume_of else None),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -235,6 +257,56 @@ def recover_interrupted_executions() -> int:
     for record in recovered:
         _emit_execution_state(record)
     return changed
+
+
+def find_resumable(limit: int = 10) -> List[Dict[str, Any]]:
+    """Interrupted attempts that are candidates for a single rerun.
+
+    Policy lives in ``cron.jobs`` and the schedule/window checks live in the
+    scheduler; this is only the ledger half of the question — "which attempts
+    ended without a result and were never superseded?".
+
+    A row qualifies when all of these hold:
+
+    * its status is ``unknown`` (owner died before a terminal write) or
+      ``failed`` (the run reached a terminal error);
+    * it is not itself a resume (``resume_of IS NULL``) and nothing already
+      resumes it — together these bound resume at one rerun per interruption;
+    * it is the newest non-successful attempt for its job, so a job that was
+      cut three times gets one rerun, not three;
+    * no later attempt of the same job completed — a job that has since run
+      successfully has nothing to recover;
+    * no attempt of the same job is currently ``claimed``/``running`` — a live
+      run is the recovery.
+
+    Oldest first, so a backlog drains in the order it was lost.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT e.* FROM executions e
+               WHERE e.status IN ('unknown','failed')
+                 AND (e.resume_of IS NULL OR e.resume_of = '')
+                 AND NOT EXISTS (
+                       SELECT 1 FROM executions r WHERE r.resume_of = e.id)
+                 AND NOT EXISTS (
+                       SELECT 1 FROM executions l
+                       WHERE l.job_id = e.job_id
+                         AND l.status = 'completed'
+                         AND l.claimed_at > e.claimed_at)
+                 AND NOT EXISTS (
+                       SELECT 1 FROM executions a
+                       WHERE a.job_id = e.job_id
+                         AND a.status IN ('claimed','running'))
+                 AND e.id = (
+                       SELECT e2.id FROM executions e2
+                       WHERE e2.job_id = e.job_id
+                         AND e2.status IN ('unknown','failed')
+                       ORDER BY e2.claimed_at DESC, e2.id DESC LIMIT 1)
+               ORDER BY e.claimed_at ASC, e.id ASC
+               LIMIT ?""",
+            (max(1, min(int(limit), 200)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_executions(

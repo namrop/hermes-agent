@@ -269,6 +269,25 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_remove.add_argument("job_id", help="Job ID to remove")
 
+    # cron resume-policy — what happens to this job's run when the gateway
+    # restarts mid-execution. Named resume-POLICY because `cron resume` above
+    # already means "unpause".
+    cron_resume_policy = cron_subparsers.add_parser(
+        "resume-policy",
+        help="Show or set what a job does after an interrupted run",
+    )
+    cron_resume_policy.add_argument(
+        "job_id", nargs="?", help="Job ID (omit to list every job's policy)"
+    )
+    cron_resume_policy.add_argument(
+        "policy",
+        nargs="?",
+        help=(
+            "skip | rerun_once | rerun_if_within_hours:<n>. Omit to show the "
+            "current policy; pass 'default' to clear an explicit setting."
+        ),
+    )
+
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 

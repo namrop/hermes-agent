@@ -7058,6 +7058,119 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
 _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
+# Resume-after-interruption (2026-09-09). A restart cuts every in-flight run;
+# recover_interrupted_executions marks the abandoned attempts unknown and
+# stops there, and next_run_at already advanced at fire time, so the run is
+# lost until the next occurrence. _collect_resume_jobs finds the attempts a
+# per-job `resume` policy says to run once more.
+#
+# Bounded at ONE per tick on purpose. The class's worst day is 2026-08-27,
+# when a gateway init stall killed nine jobs at once; firing all nine back
+# into a gateway that has just come up is the same stall again. One per 60s
+# tick drains a backlog without a thundering herd, and the resume pass rides
+# the same throttle as the dead-owner reap so idle ticks pay no ledger read.
+_MAX_RESUMES_PER_TICK = 1
+
+
+def _resume_window_open(
+    job: dict, execution: dict, policy: str, now: datetime
+) -> bool:
+    """Is a rerun of *execution* still inside its allowed window?
+
+    The window is the schedule's own next occurrence: resume only while the
+    job has not come round again. That needs no configuration, is right for
+    every cadence (a daily job has hours, a monthly has weeks), and stops a
+    long-dead attempt firing next to its own fresh run. A
+    ``rerun_if_within_hours:<n>`` policy tightens it with a second bound
+    measured from the interrupted attempt's claim time.
+    """
+    from cron.jobs import _ensure_aware as _ensure_aware_dt
+
+    raw_next = job.get("next_run_at")
+    if not raw_next:
+        return False
+    try:
+        next_run = _ensure_aware_dt(datetime.fromisoformat(str(raw_next)))
+    except (TypeError, ValueError):
+        return False
+    if now >= next_run:
+        return False
+
+    from cron.jobs import resume_policy_window_hours
+
+    hours = resume_policy_window_hours(policy)
+
+    if hours is None:
+        return True
+    try:
+        claimed_at = _ensure_aware_dt(
+            datetime.fromisoformat(str(execution.get("claimed_at")))
+        )
+    except (TypeError, ValueError):
+        return False
+    return (now - claimed_at).total_seconds() <= hours * 3600.0
+
+
+def _collect_resume_jobs(limit: int = _MAX_RESUMES_PER_TICK) -> List[dict]:
+    """Job records to rerun once because their last attempt was interrupted.
+
+    Each returned record is the live job dict plus a private ``_resume_of``
+    key naming the execution being resumed; ``tick`` dispatches them through
+    the same claim/guard/pool path as a due job, so the in-flight dedupe,
+    the fire claim and delivery all behave identically. The key never reaches
+    storage — claim_job_for_fire re-reads the record from disk.
+    """
+    if limit <= 0:
+        return []
+    try:
+        from cron.executions import find_resumable
+        from cron.jobs import (
+            RESUME_POLICY_SKIP,
+            effective_resume_policy,
+            get_job,
+            is_job_runnable,
+        )
+    except Exception:
+        return []
+
+    now = _hermes_now()
+    out: List[dict] = []
+    try:
+        candidates = find_resumable(limit=max(limit * 8, 8))
+    except Exception as exc:
+        logger.debug("Resume scan failed: %s", exc)
+        return []
+
+    for execution in candidates:
+        job = get_job(execution["job_id"])
+        if job is None or not is_job_runnable(job):
+            continue
+        # Cron-kind only. claim_job_for_fire and mark_job_run both recompute
+        # next_run_at; for a cron expression that reproduces the same next
+        # occurrence, but an interval job would be RE-ANCHORED from the resume
+        # time — a schedule change, which resume must never make. One-shots are
+        # governed by claim_dispatch's at-most-once counter and are out of
+        # scope for the same reason.
+        kind = (job.get("schedule") or {}).get("kind")
+        if kind != "cron":
+            continue
+        policy = effective_resume_policy(job)
+        if policy == RESUME_POLICY_SKIP:
+            continue
+        if not _resume_window_open(job, execution, policy, now):
+            continue
+        logger.warning(
+            "Resuming job '%s': attempt %s ended '%s' and was never "
+            "superseded (policy %s)",
+            job.get("name", job["id"]), execution["id"],
+            execution.get("status"), policy,
+        )
+        out.append(dict(job, _resume_of=execution["id"]))
+        if len(out) >= limit:
+            break
+    return out
+
+
 
 def tick(
     verbose: bool = True,
@@ -7157,6 +7270,7 @@ def tick(
         # runs in other processes are never rewritten. Throttled so idle
         # 60s ticks don't pay a ledger connection every cycle (#33612).
         global _last_dead_owner_reap_at
+        _resume_jobs: List[dict] = []
         _reap_now = time.monotonic()
         if (
             _last_dead_owner_reap_at is None
@@ -7175,8 +7289,21 @@ def tick(
                     )
             except Exception as _reap_exc:
                 logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
+            # Resume pass rides the reap's throttle: the reap is what turns a
+            # dead owner's row into the 'unknown' this scan looks for, so
+            # running it here means a restart is noticed on the FIRST tick
+            # (_last_dead_owner_reap_at is None then) and every 5 min after.
+            try:
+                _resume_jobs = _collect_resume_jobs()
+            except Exception as _resume_exc:
+                logger.debug("Resume pass failed: %s", _resume_exc)
 
         due_jobs = get_due_jobs()
+        if _resume_jobs:
+            # A job that is due right now needs no resume — the due fire IS
+            # the recovery, and dispatching both would double-run it.
+            _due_ids = {j.get("id") for j in due_jobs if isinstance(j, dict)}
+            _resume_jobs = [j for j in _resume_jobs if j["id"] not in _due_ids]
 
         # Bound the in-flight set BEFORE the dedup guard is consulted, so a
         # leaked claim is force-released in-cycle rather than silently eating
@@ -7201,7 +7328,7 @@ def tick(
             except Exception as e:
                 logger.warning("Stale in-flight sweep failed: %s", e)
 
-        if not due_jobs:
+        if not due_jobs and not _resume_jobs:
             # Idle tick: skip config load + pool partitioning entirely
             # (#33612 — the gateway ticker calls tick(verbose=False) every
             # 60s, so idle ticks previously fell through to load_config()).
@@ -7219,6 +7346,11 @@ def tick(
 
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            if _resume_jobs:
+                logger.info(
+                    "%s - %s interrupted job(s) being resumed",
+                    _hermes_now().strftime('%H:%M:%S'), len(_resume_jobs),
+                )
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
@@ -7230,6 +7362,9 @@ def tick(
         # cron-kind jobs both compute the same next occurrence; interval jobs
         # re-anchor from their own "now" at claim time (harmless for
         # at-most-once — mark_job_run re-anchors at completion regardless).
+        # Resume jobs are deliberately NOT advanced: their next_run_at is the
+        # window the resume lives inside (_resume_window_open), and bumping it
+        # would both widen that window and move a live job's schedule.
         advance_next_runs([job["id"] for job in due_jobs])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
@@ -7297,8 +7432,9 @@ def tick(
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        _dispatch_jobs = due_jobs + _resume_jobs
+        sequential_jobs = [j for j in _dispatch_jobs if (j.get("workdir") or "").strip()]
+        parallel_jobs = [j for j in _dispatch_jobs if not (j.get("workdir") or "").strip()]
 
         _results: list = []
         _all_futures: list = []
@@ -7358,7 +7494,15 @@ def tick(
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             try:
-                execution = create_execution(job_id, source="builtin")
+                _resume_of = job.get("_resume_of")
+                # Keep the ordinary call shape byte-identical for the normal
+                # path: resume_of is only passed when this dispatch IS a
+                # resume, so existing callers and test doubles are untouched.
+                execution = (
+                    create_execution(job_id, source="resume", resume_of=_resume_of)
+                    if _resume_of
+                    else create_execution(job_id, source="builtin")
+                )
                 dispatched_job = dict(job, execution_id=execution["id"])
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:

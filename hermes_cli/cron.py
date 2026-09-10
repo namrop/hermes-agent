@@ -244,6 +244,77 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             print(f"    {record['error']}")
 
 
+def cron_resume_policy(args) -> int:
+    """Show or set a job's resume-after-interruption policy."""
+    from cron.jobs import (
+        AmbiguousJobReference,
+        InvalidResumePolicy,
+        default_resume_policy,
+        effective_resume_policy,
+        list_jobs,
+        normalize_resume_policy,
+        resolve_job_ref,
+        set_resume_policy,
+    )
+
+    job_ref = getattr(args, "job_id", None)
+    policy = getattr(args, "policy", None)
+
+    if not job_ref:
+        rows = list_jobs(include_disabled=True)
+        if not rows:
+            print("No cron jobs.")
+            return 0
+        print(f"{'JOB':<14} {'POLICY':<26} {'SOURCE':<9} NAME")
+        for job in rows:
+            explicit = job.get("resume")
+            print(
+                f"{str(job.get('id', '?')):<14} "
+                f"{effective_resume_policy(job):<26} "
+                f"{('set' if explicit else 'default'):<9} "
+                f"{job.get('name', '')}"
+            )
+        print(
+            "\nDefault is 'skip' for anything that delivers or runs an agent: "
+            "a rerun can post a second copy of a message the interrupted run "
+            "may already have sent."
+        )
+        return 0
+
+    try:
+        job = resolve_job_ref(job_ref)
+    except AmbiguousJobReference as exc:
+        print(color(str(exc), Colors.RED))
+        for m in exc.matches:
+            print(f"  {m['id']}  (name: {m.get('name')!r})")
+        return 1
+    if not job:
+        print(color(f"Job not found: {job_ref}", Colors.RED))
+        return 1
+
+    if policy is None:
+        explicit = job.get("resume")
+        print(f"{job['id']}  {job.get('name', '')}")
+        print(f"  Policy:  {effective_resume_policy(job)}")
+        print(f"  Source:  {'set on the job' if explicit else 'default'}")
+        print(f"  Default: {default_resume_policy(job)}")
+        return 0
+
+    raw = "" if str(policy).strip().lower() == "default" else policy
+    try:
+        normalize_resume_policy(raw)
+    except InvalidResumePolicy as exc:
+        print(color(str(exc), Colors.RED))
+        return 1
+    updated = set_resume_policy(job["id"], raw)
+    if updated is None:
+        print(color(f"Failed to update job: {job['id']}", Colors.RED))
+        return 1
+    print(color(f"Resume policy for {job['id']}: "
+                f"{effective_resume_policy(updated)}", Colors.GREEN))
+    return 0
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
@@ -646,6 +717,9 @@ def cron_command(args):
     if subcmd == "notepad":
         return cron_notepad(args)
 
+    if subcmd == "resume-policy":
+        return cron_resume_policy(args)
+
     if subcmd in {"create", "add"}:
         return cron_create(args)
 
@@ -665,5 +739,8 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print(
+        "Usage: hermes cron [list|create|edit|pause|resume|resume-policy|run|"
+        "remove|status|runs|tick]"
+    )
     sys.exit(1)

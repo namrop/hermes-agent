@@ -1,5 +1,67 @@
 # Architecture Decision Records
 
+## 2026-09-09: Cron resume after a gateway restart — per-job policy, one rerun, the schedule's own window
+
+Status: Accepted
+
+Context:
+A gateway restart cuts every in-flight cron run. `recover_interrupted_executions`
+marks the abandoned attempts `unknown` "without scheduling retries" (its own
+docstring), and the job's `next_run_at` advanced at fire time, so the cut run is
+lost until the schedule comes round again. `catch_up_occurrences` is a counter
+for `hermes cron status`, not a queue — the parallel pass says so outright ("No
+catch-up queue needed"). Nine jobs died this way in one restart on 2026-08-27,
+two more on 2026-09-09 07:30. Luis, 19:07 EDT: "figure out how to make the cron
+jobs resume if they get interrupted by a gateway restart."
+
+Decision:
+An opt-in per-job `resume` policy — `skip` | `rerun_once` |
+`rerun_if_within_hours:<n>` — resolved by `effective_resume_policy`, surfaced by
+`hermes cron resume-policy`, and acted on by a scan in `tick()` that rides the
+dead-owner reap's throttle (so it runs on the first tick after a restart and
+every 5 minutes after, and idle ticks pay no ledger read).
+
+Four bounds, each answering a specific way this could go wrong:
+
+- **The window is the schedule's own next occurrence.** Resume only while
+  `now < next_run_at`. No hours to configure, correct for every cadence, and a
+  rerun can never land beside the job's own fresh run.
+- **One rerun per interruption**, enforced in SQL: the rerun's execution row
+  carries `resume_of`, and `find_resumable` refuses an attempt that already has
+  a rerun and refuses to resume a resume. Added as an idempotent `ALTER TABLE`
+  behind a `PRAGMA table_info` check — the live ledger predates the column and
+  `CREATE TABLE IF NOT EXISTS` would never add it.
+- **Cron-kind only.** `claim_job_for_fire` and `mark_job_run` both recompute
+  `next_run_at`. For a cron expression that reproduces the same occurrence; for
+  an `interval` job it re-anchors from the resume time, which is a schedule
+  change. Resume must never move a schedule, so interval and one-shot jobs are
+  out of scope.
+- **One job per tick.** The class's worst day is the 2026-08-27 init stall,
+  which killed nine jobs at once. Firing nine back into a gateway that has just
+  come up is the same stall. A backlog drains one per cycle.
+
+Defaults are conservative on purpose: only a `no_agent` script job with no
+`deliver` target defaults to `rerun_once`. Everything else defaults to `skip`,
+because `unknown` means exactly that we cannot tell whether the interrupted
+attempt already delivered — a rerun of a delivering job posts a second copy.
+`deliver: origin` counts, so on a typical profile every job defaults to skip and
+resume is turned on per job. That is the intended posture: the machine does not
+decide on its own to say something twice.
+
+Consequences:
+- Resume jobs are dispatched through the existing `_submit_with_guard` /
+  `_process_job` path (in-flight dedupe, fire claim, delivery), joined into the
+  tick's pool partition, and excluded from `advance_next_runs` — so nothing
+  about the normal fire path changed and the resume gets every existing guard.
+- A due job is never also resumed: the due fire is the recovery.
+- The pass sits after `check_paused` and `can_dispatch`, so a drain or e-stop
+  suppresses it like everything else.
+- Resumed attempts are visible as `source=resume` in `hermes cron runs`, with a
+  WARNING naming the job, the interrupted attempt and the policy.
+- Not covered: interval and one-shot jobs, and any job whose loss is older than
+  its next occurrence. `hermes cron run <id>` remains the operator's recovery
+  for both.
+
 ## 2026-09-09: A redundant `workdir` is not a writer — the TERMINAL_CWD lock downgrade
 
 Status: Accepted

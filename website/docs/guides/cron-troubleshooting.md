@@ -49,6 +49,36 @@ date
 hermes cron list   # Compare next_run times with local time
 ```
 
+### Check 5: Was the run cut by a gateway restart?
+
+A restart kills every run that is in flight. The attempt is recorded as
+`unknown` — meaning the scheduler cannot tell whether the job's side effects
+ran — and, because `next_run_at` advanced when the job fired, the run is not
+retried on its own.
+
+```bash
+hermes cron runs <job_id>          # look for status 'unknown'
+```
+
+A job with no `resume` policy waits for its next occurrence. To have it run
+once more after an interruption:
+
+```bash
+hermes cron resume-policy <job_id> rerun_once
+```
+
+The rerun only happens while the job's next occurrence is still in the future,
+happens at most once per interruption, and is recorded with `source=resume`.
+See [Cron Internals → Resume After an Interrupted Run](/developer-guide/cron-internals)
+for the full contract, including why the default is `skip` for anything that
+delivers.
+
+To recover a specific lost run right now, regardless of policy:
+
+```bash
+hermes cron run <job_id>
+```
+
 ---
 
 ## Delivery Failures
