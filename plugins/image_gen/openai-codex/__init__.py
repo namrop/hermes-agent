@@ -7,12 +7,19 @@ the Codex Responses API ``image_generation`` tool instead of the
 authenticated with Codex/ChatGPT generate images without configuring a
 separate ``OPENAI_API_KEY``.
 
+GPT-Image-2.5 support (2026-09-10): the catalog now spans two generations —
+``gpt-image-2.5-flare`` / ``gpt-image-2.5-sunburst`` tiers and the legacy
+``gpt-image-2`` tiers — each tier pinning its ``api_model`` inside the
+Responses ``image_generation`` tool config. Transparent backgrounds are
+native to 2.5 and engaged by prompt detection or an explicit
+``background="transparent"`` kwarg.
+
 Selection precedence for the tier (first hit wins):
 
 1. ``OPENAI_IMAGE_MODEL`` env var (escape hatch for scripts / tests)
 2. ``image_gen.openai-codex.model`` in ``config.yaml``
 3. ``image_gen.model`` in ``config.yaml`` (when it's one of our tier IDs)
-4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
+4. :data:`DEFAULT_MODEL` — ``gpt-image-2.5-flare-medium``
 
 Output is saved as PNG under ``$HERMES_HOME/cache/images/``. Source images for
 image-to-image/editing are sent as Responses ``input_image`` content parts.
@@ -24,6 +31,7 @@ import base64
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -80,33 +88,89 @@ def _summarize_error_body(body: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model catalog — mirrors the ``openai`` plugin so the picker UX is identical.
-# ---------------------------------------------------------------------------
+# Model catalog — generation × quality tiers. Each tier ID resolves to an
+# (api_model, quality) pair: ``api_model`` is what gets pinned inside the
+# Responses ``image_generation`` tool config; ``quality`` is the per-request
+# fidelity knob.
+#
+# GPT-Image-2.5 (2026-09-10) ships two API variants alongside the previous
+# generation, so both stay selectable:
+#
+# - ``gpt-image-2.5-flare``    — OpenAI's default choice; ~50% lower latency
+#   than Images 2.0 with the same quality/editing improvements.
+# - ``gpt-image-2.5-sunburst`` — extra precision for detailed creative work,
+#   longer generation times. No ``low`` tier: low quality defeats the reason
+#   to pick Sunburst (use Flare for fast drafts).
+# - ``gpt-image-2``            — previous generation, kept for regression
+#   comparison and reproducing earlier outputs.
 
-API_MODEL = "gpt-image-2"
+_API_MODEL_V2 = "gpt-image-2"
+_API_MODEL_FLARE = "gpt-image-2.5-flare"
+_API_MODEL_SUNBURST = "gpt-image-2.5-sunburst"
 
 _MODELS: Dict[str, Dict[str, Any]] = {
-    "gpt-image-2-low": {
-        "display": "GPT Image 2 (Low)",
-        "speed": "~15s",
+    # --- GPT-Image-2.5 Flare ---
+    "gpt-image-2.5-flare-low": {
+        "api_model": _API_MODEL_FLARE,
+        "display": "GPT Image 2.5 Flare (Low)",
+        "speed": "~10s",
         "strengths": "Fast iteration, lowest cost",
         "quality": "low",
     },
+    "gpt-image-2.5-flare-medium": {
+        "api_model": _API_MODEL_FLARE,
+        "display": "GPT Image 2.5 Flare (Medium)",
+        "speed": "~20s",
+        "strengths": "Balanced 2.5 default — transparency, multi-turn edits",
+        "quality": "medium",
+    },
+    "gpt-image-2.5-flare-high": {
+        "api_model": _API_MODEL_FLARE,
+        "display": "GPT Image 2.5 Flare (High)",
+        "speed": "~1min",
+        "strengths": "2.5 quality at full fidelity, still fast",
+        "quality": "high",
+    },
+    # --- GPT-Image-2.5 Sunburst ---
+    "gpt-image-2.5-sunburst-medium": {
+        "api_model": _API_MODEL_SUNBURST,
+        "display": "GPT Image 2.5 Sunburst (Medium)",
+        "speed": "~1min",
+        "strengths": "Premium precision workflows",
+        "quality": "medium",
+    },
+    "gpt-image-2.5-sunburst-high": {
+        "api_model": _API_MODEL_SUNBURST,
+        "display": "GPT Image 2.5 Sunburst (High)",
+        "speed": "~2min+",
+        "strengths": "Maximum precision/control — detailed creative work",
+        "quality": "high",
+    },
+    # --- GPT-Image-2 (previous generation) ---
+    "gpt-image-2-low": {
+        "api_model": _API_MODEL_V2,
+        "display": "GPT Image 2 (Low)",
+        "speed": "~15s",
+        "strengths": "Legacy — fast iteration",
+        "quality": "low",
+    },
     "gpt-image-2-medium": {
+        "api_model": _API_MODEL_V2,
         "display": "GPT Image 2 (Medium)",
         "speed": "~40s",
-        "strengths": "Balanced — default",
+        "strengths": "Legacy — balanced",
         "quality": "medium",
     },
     "gpt-image-2-high": {
+        "api_model": _API_MODEL_V2,
         "display": "GPT Image 2 (High)",
         "speed": "~2min",
-        "strengths": "Highest fidelity, strongest prompt adherence",
+        "strengths": "Legacy — highest fidelity of previous generation",
         "quality": "high",
     },
 }
 
-DEFAULT_MODEL = "gpt-image-2-medium"
+DEFAULT_MODEL = "gpt-image-2.5-flare-medium"
 
 _SIZES = {
     "landscape": "1536x1024",
@@ -116,7 +180,7 @@ _SIZES = {
 
 # Codex Responses surface used for the request. The chat model itself is only
 # the host that calls the ``image_generation`` tool; the actual image work is
-# done by ``API_MODEL``.
+# done by the tier's ``api_model`` (2.5 Flare/Sunburst or legacy 2).
 _CODEX_CHAT_MODEL = "gpt-5.5"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _CODEX_INSTRUCTIONS = (
@@ -303,6 +367,20 @@ _PARTIAL_IMAGES_REQUESTED = 0
 # Content-agnostic retries when the stream does not yield a final result
 # (empty stream or progressive-only). No prompt-class branching.
 _NONFINAL_RETRIES = 1
+# Prompt-level transparency detection for GPT-Image-2.5 native transparent
+# backgrounds. Deliberately conservative: specific art/production phrases,
+# not a bare "transparent" (which frequently means glass/translucent
+# materials rather than an alpha channel).
+_TRANSPARENCY_PROMPT_RE = re.compile(
+    r"\btransparent\s+(?:background|layers?|layered|png|sprite)"
+    r"|\bbackground\s+transparent\b"
+    r"|\b(?:with|and)\s+transparency\b"
+    r"|\balpha\s+channel\b"
+    r"|\bcutout\b"
+    r"|\bsticker\b"
+    r"|\bsprite\s+sheet\b",
+    re.IGNORECASE,
+)
 
 
 def _build_responses_payload(
@@ -311,8 +389,16 @@ def _build_responses_payload(
     size: str,
     quality: str,
     input_images: Optional[List[Dict[str, str]]] = None,
+    api_model: str = _API_MODEL_FLARE,
+    background: str = "opaque",
 ) -> Dict[str, Any]:
-    """Build the Codex Responses request body for an image_generation call."""
+    """Build the Codex Responses request body for an image_generation call.
+
+    ``api_model`` pins the image model inside the tool config (the chat
+    model is only the host); ``background`` accepts ``transparent`` for
+    GPT-Image-2.5's native transparent-background generation and remains
+    ``opaque`` by default for backward compatibility.
+    """
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     if input_images:
         content.extend(input_images)
@@ -327,11 +413,11 @@ def _build_responses_payload(
         }],
         "tools": [{
             "type": "image_generation",
-            "model": API_MODEL,
+            "model": api_model,
             "size": size,
             "quality": quality,
             "output_format": "png",
-            "background": "opaque",
+            "background": background,
             # Prefer 0 progressive preview frames. Preview frames can arrive
             # without a later final ``result`` and look like smeared /
             # unfinished images if saved as the deliverable. Even when the
@@ -459,6 +545,8 @@ def _collect_image_b64(
     size: str,
     quality: str,
     input_images: Optional[List[Dict[str, str]]] = None,
+    api_model: str = _API_MODEL_FLARE,
+    background: str = "opaque",
 ) -> Optional[Dict[str, str]]:
     """Stream a Codex Responses image_generation call.
 
@@ -482,6 +570,8 @@ def _collect_image_b64(
         size=size,
         quality=quality,
         input_images=input_images,
+        api_model=api_model,
+        background=background,
     )
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
@@ -555,7 +645,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         return {
             "name": "OpenAI (Codex auth)",
             "badge": "free",
-            "tag": "gpt-image-2 via ChatGPT/Codex OAuth — no API key required; supports text and image inputs",
+            "tag": "gpt-image-2.5 (Flare/Sunburst) and gpt-image-2 via ChatGPT/Codex OAuth — no API key required; supports text and image inputs, native transparent backgrounds on 2.5",
             "env_vars": [],
             "post_setup_hint": (
                 "Sign in with `hermes auth codex` (or `hermes setup` → Codex) "
@@ -613,6 +703,20 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
 
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
+        api_model = meta["api_model"]
+
+        # Transparent backgrounds are native to GPT-Image-2.5 (Flare and
+        # Sunburst). Honor an explicit ``background`` kwarg — supplied by
+        # direct Python callers or, in the future, an agent-facing schema
+        # field — and default to transparent when the prompt itself asks
+        # for transparency (a no-op for opaque images: PNG with alpha 0
+        # everywhere outside the subject).
+        background = "opaque"
+        explicit_bg = kwargs.get("background")
+        if isinstance(explicit_bg, str) and explicit_bg.strip().lower() in ("transparent", "opaque"):
+            background = explicit_bg.strip().lower()
+        elif _TRANSPARENCY_PROMPT_RE.search(prompt):
+            background = "transparent"
 
         token = _read_codex_access_token()
         if not token:
@@ -649,6 +753,8 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                     size=size,
                     quality=meta["quality"],
                     input_images=input_images or None,
+                    api_model=api_model,
+                    background=background,
                 )
                 if collected and collected.get("source") == "final" and collected.get("b64"):
                     break
@@ -752,6 +858,8 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             extra={
                 "size": size,
                 "quality": meta["quality"],
+                "api_model": api_model,
+                "background": background,
                 "input_image_count": len(input_images),
                 "image_source": image_source,
                 "requested_size": size,
