@@ -1054,25 +1054,100 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+#: Additional production auth-store roots to refuse under test (beyond the
+#: platform default ``~/.hermes``). The hermetic conftest injects the
+#: pre-sandbox ``HERMES_HOME`` here so a deployment whose LIVE gateway runs
+#: from a custom home is covered. Mirrors ``hermes_state``'s
+#: ``_STATE_DB_GUARD_EXTRA_DENY_ROOTS``. On 2026-09-11 a Sol operator shell
+#: carrying ``HERMES_HOME=/var/lib/hermes/primary`` ran the suite, the old
+#: ``~/.hermes``-only comparison let every path through, and the live
+#: auth.json lost its Codex OAuth credential ten minutes into the sweep.
+_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS: "tuple[Path, ...]" = ()
+
+#: Env-carried opt-out for a test that deliberately points a *child* process
+#: at a live store (a module global cannot cross a process boundary).
+_AUTH_STORE_GUARD_BYPASS_ENV = "HERMES_AUTH_STORE_GUARD_BYPASS"
+
+
+def _auth_store_guard_running_under_test() -> bool:
+    """True inside pytest, or in a child that inherited the isolation marker.
+
+    ``PYTEST_CURRENT_TEST`` alone is unset during collection and routinely
+    stripped from rebuilt child environments; ``PYTEST_VERSION`` and the
+    conftest's own ``HERMES_TEST_ISOLATION`` marker close both gaps (the same
+    trio ``hermes_state._running_under_pytest`` reads).
+    """
+    return bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("PYTEST_VERSION")
+        or os.environ.get("HERMES_TEST_ISOLATION")
+    )
+
+
+def _real_platform_auth_root() -> Optional[Path]:
+    """The REAL platform-default Hermes root, ignoring test monkeypatches.
+
+    Deliberately not ``Path.home()``: the hermetic fixture redirects HOME per
+    test, so ``Path.home()`` names the test's own tempdir and the comparison
+    could never match the operator's store. ``os.path.expanduser`` reads the
+    passwd entry when HOME is unset and the env otherwise — the conftest never
+    rewrites the passwd entry, and this mirrors ``hermes_state``.
+    """
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA", "").strip()
+            root = Path(base) / "hermes" if base else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
+        else:
+            root = Path(os.path.expanduser("~")) / ".hermes"
+        return root.resolve(strict=False)
+    except Exception:
+        return None
+
+
+def _auth_store_guard_denied_roots() -> "list[Path]":
+    roots: "list[Path]" = []
+    real_root = _real_platform_auth_root()
+    if real_root is not None:
+        roots.append(real_root)
+    for extra in _AUTH_STORE_GUARD_EXTRA_DENY_ROOTS:
+        try:
+            roots.append(Path(extra).expanduser().resolve(strict=False))
+        except Exception:
+            continue
+    return roots
+
+
+def _refuse_if_live_auth_store(path: Path, *, what: str = "real user auth store") -> None:
+    """Seat belt: under test, refuse a path inside any live Hermes root.
+
+    Catches tests that forgot to monkeypatch HERMES_HOME, tests invoked
+    without the hermetic conftest, and sandbox escapes via threads or
+    subprocesses. In production (no test markers) this is three dict
+    lookups.
+    """
+    if not _auth_store_guard_running_under_test():
+        return
+    if os.environ.get(_AUTH_STORE_GUARD_BYPASS_ENV, "").strip() in ("1", "true", "yes"):
+        return
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    for root in _auth_store_guard_denied_roots():
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        raise RuntimeError(
+            f"Refusing to touch {what} during test run: {path} (live root {root}). "
+            "Set HERMES_HOME to a tmp_path in your test fixture, or run "
+            "via scripts/run_tests.sh for hermetic CI-parity env."
+        )
+
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
-    # Seat belt: if pytest is running and HERMES_HOME resolves to the real
-    # user's auth store, refuse rather than silently corrupt it. This catches
-    # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
-    # hermetic conftest, or sandbox escapes via threads/subprocesses. In
-    # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
-        try:
-            resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
-        if resolved == real_home_auth:
-            raise RuntimeError(
-                f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-                "via scripts/run_tests.sh for hermetic CI-parity env."
-            )
+    _refuse_if_live_auth_store(path)
     return path
 
 
@@ -4674,15 +4749,11 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
     # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
     # (mirrors the read-side guard in _load_global_auth_store). Uses the
     # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
-            except Exception:
-                return
+    if _auth_store_guard_running_under_test():
+        try:
+            _refuse_if_live_auth_store(global_path, what="real user global auth store")
+        except RuntimeError:
+            return
     try:
         _persist_provider_state_to_store(
             "xai-oauth",

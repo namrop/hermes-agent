@@ -86,7 +86,52 @@ def _hermes_home_points_at_production(value: str) -> bool:
     return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
 
 
-if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
+def _scratch_roots() -> list:
+    """Directories a pre-set HERMES_HOME may live under and still be honored.
+
+    A CI runner or a developer exporting ``HERMES_HOME=/tmp/hermes-ci`` is
+    handing pytest a throwaway home; anything else is somebody's live
+    install. ``tempfile.gettempdir()`` covers ``$TMPDIR``; the fixed POSIX
+    temp roots are listed so a resolver quirk cannot un-scratch them.
+    """
+    candidates = [tempfile.gettempdir(), "/tmp", "/var/tmp"]
+    roots = []
+    for value in candidates:
+        try:
+            roots.append(Path(value).resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _hermes_home_is_scratch(value: str) -> bool:
+    """True when a pre-set HERMES_HOME lives under a temp root."""
+    if not value:
+        return False
+    try:
+        resolved = Path(value).expanduser().resolve()
+    except Exception:
+        return False
+    for root in _scratch_roots():
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+# Sandbox unless the pre-set home is a throwaway under a temp root. The
+# earlier rule sandboxed only ``~/.hermes`` (and its profiles), on the theory
+# that a custom HERMES_HOME is a CI scratch dir. On a host whose LIVE gateway
+# runs from a custom home (Sol: /var/lib/hermes/primary, exported into every
+# operator shell) that theory handed pytest the production home: import-time
+# logging handlers wrote test noise into the live agent.log, and on
+# 2026-09-11 the live auth.json lost its Codex OAuth credential ten minutes
+# after such a sweep started. Production is now "anything not obviously
+# scratch"; the pre-sandbox value is still captured above so the kanban and
+# state-db deny-lists keep pointing at the real root.
+if not _hermes_home_is_scratch(os.environ.get("HERMES_HOME", "")):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
@@ -665,7 +710,7 @@ def _capture_real_kanban_root() -> Path:
         return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
     if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
         _PRE_SANDBOX_HERMES_HOME
-    ):
+    ) and not _hermes_home_is_scratch(_PRE_SANDBOX_HERMES_HOME):
         # HERMES_HOME was genuinely set to a CUSTOM root before the sandbox
         # (production-pointing values are sandboxed away above, in which case
         # the env still holds the tempdir and the resolver would be wrong) —
@@ -771,6 +816,13 @@ def _state_db_write_guard(request, monkeypatch):
     monkeypatch.setattr(
         _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
     )
+    # The auth store gets the same deny-list (2026-09-11): a custom live home
+    # is exactly the case the seat belt's ``~/.hermes`` comparison missed.
+    _auth = sys.modules.get("hermes_cli.auth")
+    if _auth is not None and hasattr(_auth, "_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS"):
+        monkeypatch.setattr(
+            _auth, "_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
+        )
     yield
 
 

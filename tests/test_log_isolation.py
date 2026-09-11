@@ -86,3 +86,33 @@ class TestLogIsolation:
             "the test session is writing into the operator's real Hermes logs:\n  "
             + "\n  ".join(offenders)
         )
+
+
+class TestScratchHomeRule:
+    """The session sandbox treats any pre-set HERMES_HOME as production unless
+    it lives under a temp root (2026-09-11: Sol's live gateway home is
+    /var/lib/hermes/primary, exported into every operator shell, and the old
+    ~/.hermes-only rule handed it to pytest)."""
+
+    def test_custom_live_home_is_not_scratch(self):
+        from tests.conftest import _hermes_home_is_scratch
+
+        assert _hermes_home_is_scratch("/var/lib/hermes/primary") is False
+        assert _hermes_home_is_scratch(str(Path.home() / ".hermes")) is False
+        assert _hermes_home_is_scratch("") is False
+
+    def test_temp_homes_are_scratch(self, tmp_path):
+        import tempfile
+
+        from tests.conftest import _hermes_home_is_scratch
+
+        assert _hermes_home_is_scratch(str(tmp_path)) is True
+        assert _hermes_home_is_scratch(str(Path(tempfile.gettempdir()) / "hermes-ci")) is True
+
+    def test_session_home_is_a_scratch_dir(self):
+        from tests.conftest import HERMES_HOME_AT_CONFTEST_IMPORT as home, _hermes_home_is_scratch
+
+        assert _hermes_home_is_scratch(home), (
+            f"conftest handed the session a non-scratch HERMES_HOME ({home}); "
+            "import-time logging and any collection-time write would hit a live install"
+        )
