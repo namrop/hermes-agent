@@ -642,6 +642,14 @@ def _dispatch_search(provider, query: str, limit: int):
     if _fb.is_exhausted(configured):
         alternate = _fb.pick_fallback_provider("search", exclude=configured)
         if alternate is None:
+            # Nothing configured can serve search. The keyless ring is the
+            # last resort, but only when the user left it enabled — a
+            # cooldown must not override ``web.keyless_rescue: false``.
+            if not _rescue_eligible(provider):
+                return (
+                    {"success": False, "error": _cooldown_error(configured)},
+                    configured, None, "cooldown",
+                )
             response = _rescue_search(
                 configured, _cooldown_error(configured), query, limit,
                 log_level=logging.DEBUG,
@@ -651,7 +659,7 @@ def _dispatch_search(provider, query: str, limit: int):
             "web_search: '%s' cooling down; serving via '%s'",
             configured, alternate.name,
         )
-        active, fallback_from = alternate, configured
+        active, fallback_from, error_code = alternate, configured, "cooldown"
 
     logger.info("Web search via %s: '%s' (limit: %d)", active.name, query, limit)
     raised = None
@@ -717,6 +725,10 @@ async def _dispatch_extract(provider, safe_urls: list, format):
                 {"url": u, "title": "", "content": "", "error": _cooldown_error(configured)}
                 for u in safe_urls
             ]
+            # Same config-gate as search: a cooldown never forces the ring on
+            # a user who turned the keyless rescue off.
+            if not _rescue_eligible(provider):
+                return failed, configured, None, "cooldown"
             results = await asyncio.to_thread(
                 _rescue_extract, configured, safe_urls, failed,
                 log_level=logging.DEBUG,
@@ -726,7 +738,7 @@ async def _dispatch_extract(provider, safe_urls: list, format):
             "web_extract: '%s' cooling down; serving via '%s'",
             configured, alternate.name,
         )
-        active, fallback_from = alternate, configured
+        active, fallback_from, error_code = alternate, configured, "cooldown"
 
     logger.info("Web extract via %s: %d URL(s)", active.name, len(safe_urls))
     raised = None

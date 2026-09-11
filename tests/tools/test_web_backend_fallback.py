@@ -301,3 +301,72 @@ class TestSearchAuditRow:
         fb.write_search_audit(
             tool="web_search", backend="zai", status="error", latency_ms=1
         )  # must not raise
+
+
+class TestKeylessRescueConfigGate:
+    """A cooldown must not override ``web.keyless_rescue: false``.
+
+    The pre-fallback code never touched the keyless ring when the user turned
+    it off; routing around an exhausted backend must not quietly re-enable it.
+    """
+
+    @pytest.fixture
+    def rescue_disabled(self, backends, monkeypatch):
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"backend": "zai", "search_backend": "zai", "keyless_rescue": False},
+        )
+        # No fallback can serve: brave-free is out of the configured order.
+        monkeypatch.setattr(fb, "fallback_backends", lambda capability: [])
+        return backends
+
+    def test_search_cooldown_does_not_force_the_ring(self, rescue_disabled, monkeypatch):
+        zai, _ = rescue_disabled
+        fb.mark_exhausted("zai", fb.parse_exhaustion(ZAI_SEARCH_ERROR))
+        called = []
+        monkeypatch.setattr(
+            web_tools, "_rescue_search",
+            lambda *a, **kw: called.append(a) or {"success": True, "data": {}},
+        )
+        response, served, fallback_from, code = web_tools._dispatch_search(zai, "q", 3)
+        assert called == [], "keyless_rescue is off; the ring must not be called"
+        assert response["success"] is False
+        assert "cooling down" in response["error"]
+        assert served == "zai" and fallback_from is None and code == "cooldown"
+        assert zai.search_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_extract_cooldown_does_not_force_the_ring(
+        self, rescue_disabled, monkeypatch
+    ):
+        zai, _ = rescue_disabled
+        fb.mark_exhausted("zai", fb.parse_exhaustion(ZAI_EXTRACT_ERROR))
+        called = []
+        monkeypatch.setattr(
+            web_tools, "_rescue_extract", lambda *a, **kw: called.append(a) or []
+        )
+        results, served, fallback_from, code = await web_tools._dispatch_extract(
+            zai, ["https://example.com/a"], "markdown"
+        )
+        assert called == []
+        assert "cooling down" in results[0]["error"]
+        assert served == "zai" and fallback_from is None and code == "cooldown"
+        assert zai.extract_calls == 0
+
+
+class TestCooldownErrorCodeIsConsistent:
+    def test_brave_served_during_an_existing_cooldown_is_tagged_cooldown(self, backends):
+        """First call reports the vendor code 1310; every later call during the
+        cooldown reports "cooldown" on BOTH tools, so the ingest lane sees one
+        vocabulary rather than a null on search and "cooldown" on extract."""
+        zai, _ = backends
+        web_tools.web_search_tool("first", limit=3)
+        web_tools.web_search_tool("second", limit=3)
+        rows = [
+            json.loads(l)
+            for l in fb._search_audit_path().read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+        assert [r["error_code"] for r in rows] == ["1310", "cooldown"]
+        assert all(r["fallback_from"] == "zai" and r["backend"] == "brave" for r in rows)
+        assert all(r["status"] == "ok" for r in rows)

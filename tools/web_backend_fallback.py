@@ -386,6 +386,14 @@ def _audit_session_id() -> Optional[str]:
 
 
 def _audit_job_id() -> Optional[str]:
+    """Cron job id for the row, when the scheduler publishes one.
+
+    As of 2026-09-10 NOTHING sets ``HERMES_JOB_ID`` — cron/scheduler.py keeps
+    per-job state in ContextVars and does not export a job identifier, so this
+    is always ``None`` and the composer's own rows are unattributed. Left as a
+    forward-compatible read: the scheduler lane owns that file, and the field
+    starts populating the moment it exports the variable.
+    """
     return os.environ.get("HERMES_JOB_ID") or None
 
 
