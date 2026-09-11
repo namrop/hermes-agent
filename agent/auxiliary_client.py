@@ -1540,6 +1540,10 @@ class _CodexCompletionsAdapter:
         timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
+        # Per-request HTTP headers (OpenCode session affinity) map to real
+        # headers via the SDK kwarg — forward them.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -2103,6 +2107,14 @@ class _AnthropicCompletionsAdapter:
             from agent.anthropic_adapter import _forbids_sampling_params
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
+        # Per-request HTTP headers (OpenCode session affinity) — the Anthropic
+        # SDK accepts ``extra_headers`` on messages.create/stream too. Merge so
+        # an anthropic-beta header already built here is preserved.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **kwargs["extra_headers"],
+            }
 
         # Pass through caller-supplied extra_body so providers behind
         # Anthropic-compatible gateways receive their per-vendor request
@@ -8831,7 +8843,18 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
-    return kwargs
+    # OpenCode relay session affinity — same key as the main turn so
+    # compression/title/vision calls stay on the conversation's warm backend
+    # (and are not rejected with 400 MissingSessionID). Prefer the
+    # rotation-stable cache scope, matching build_api_kwargs.
+    from agent.opencode_affinity import merge_opencode_session_headers
+
+    return merge_opencode_session_headers(
+        kwargs,
+        provider,
+        base_url,
+        _runtime_main_value("cache_scope") or _runtime_main_value("session_id") or None,
+    )
 
 
 def _validate_llm_response(
@@ -9576,7 +9599,14 @@ def _call_llm_impl(
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+        # Merge, never assign: _build_call_kwargs may have already put the
+        # OpenCode x-opencode-session affinity header here, and an assign
+        # would drop it (the relay 400s without it). Caller headers win.
+        _existing_headers = kwargs.get("extra_headers")
+        kwargs["extra_headers"] = {
+            **(_existing_headers if isinstance(_existing_headers, dict) else {}),
+            **dict(extra_headers),
+        }
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")

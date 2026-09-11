@@ -1823,6 +1823,37 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+    """Build the keyword arguments dict for the active API mode.
+
+    Wraps the per-api_mode builder so the OpenCode ``x-opencode-session``
+    affinity header rides on every OpenCode request regardless of transport
+    (chat_completions / codex_responses / anthropic_messages all route
+    OpenCode models). The relay rejects header-less requests with
+    ``400 MissingSessionID``. No-op for every other provider.
+
+    Merging here — *after* the per-mode builder — is load-bearing: the
+    Anthropic transport assigns ``extra_headers`` outright for
+    ``anthropic-beta`` and the Codex transport rebuilds it for
+    ``session_id`` / ``x-grok-conv-id``. A pre-merge would be overwritten.
+    """
+    from agent.opencode_affinity import (
+        is_opencode_target,
+        merge_opencode_session_headers,
+    )
+
+    kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
+    provider = getattr(agent, "provider", None)
+    base_url = str(getattr(agent, "base_url", "") or "")
+    if not is_opencode_target(provider, base_url):
+        return kwargs
+    # Prefer the rotation-stable logical scope so the header survives a
+    # compression rotation, exactly like prompt_cache_key; the auxiliary
+    # path resolves the same scope from the runtime-main context.
+    scope = _prompt_cache_scope_for_agent(agent) or getattr(agent, "session_id", None)
+    return merge_opencode_session_headers(kwargs, provider, base_url, scope)
+
+
+def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
