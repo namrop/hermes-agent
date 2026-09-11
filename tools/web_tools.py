@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import time
 import asyncio
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
@@ -98,6 +99,7 @@ from tools.tool_backend_helpers import (  # noqa: F401
     prefers_gateway,
 )
 from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
+import tools.web_backend_fallback as _fb
 import sys
 
 logger = logging.getLogger(__name__)
@@ -499,7 +501,14 @@ def _rescue_eligible(provider) -> bool:
         return False
 
 
-def _rescue_search(provider_name: str, original_error: str, query: str, limit: int) -> dict:
+def _rescue_search(
+    provider_name: str,
+    original_error: str,
+    query: str,
+    limit: int,
+    *,
+    log_level: int = logging.WARNING,
+) -> dict:
     """One-shot keyless-ring rescue for a failed keyed/configured search.
 
     Stateless by design: this call alone routes to the free-tier ring; the
@@ -509,7 +518,8 @@ def _rescue_search(provider_name: str, original_error: str, query: str, limit: i
     """
     from plugins.web.keyless_mcp import search_with_failover
 
-    logger.warning(
+    logger.log(
+        log_level,
         "web_search backend '%s' failed (%s); one-shot keyless rescue",
         provider_name, (original_error or "")[:200],
     )
@@ -545,7 +555,13 @@ def _policy_blocked_result(result: dict) -> bool:
     return "blocked by website policy" in str(result.get("error") or "").lower()
 
 
-def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
+def _rescue_extract(
+    provider_name: str,
+    urls: list,
+    results: list,
+    *,
+    log_level: int = logging.WARNING,
+) -> list:
     """One-shot keyless-ring rescue for a failed keyed/configured extract.
 
     Fires only when EVERY url failed (whole-backend failure); partial
@@ -571,7 +587,8 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
         (results[i].get("error") for i in rescue_idx if results[i].get("error")),
         "extract failed",
     )
-    logger.warning(
+    logger.log(
+        log_level,
         "web_extract backend '%s' failed all %d URL(s) (%s); one-shot keyless rescue",
         provider_name, len(rescue_urls), (original_error or "")[:200],
     )
@@ -591,6 +608,166 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
             merged[i] = rescued[pos]
         return merged
     return rescued
+
+
+# ─── Quota-exhaustion fallback dispatch ──────────────────────────────────────
+#
+# Keeper ruling 2026-09-10 (Luis): "we can fallback to my brave API search tool
+# if z.ai is exhausted". When a backend answers with a quota-exhausted error
+# (Z.AI code 1310 / MCP -429 naming a reset time) it is parked in the cooldown
+# table until the reset the vendor named, and search/extract route to the
+# configured fallback (``web.fallback_backends``, default brave-free) for the
+# duration — BEFORE the one-shot keyless rescue. During a cooldown the dead
+# backend is not called at all, and the rescue's per-call WARNING drops to
+# DEBUG so a two-week exhaustion logs one switch line, not one line per call.
+
+
+def _cooldown_error(backend: str) -> str:
+    return f"backend '{backend}' cooling down until {_fb.cooldown_until(backend)}"
+
+
+def _dispatch_search(provider, query: str, limit: int):
+    """Search through *provider* with quota-cooldown fallback + keyless rescue.
+
+    Returns ``(response, served_backend, fallback_from, error_code)``. Re-raises
+    the provider's exception when nothing is eligible to rescue it (preserving
+    the pre-existing contract with ``web_search_tool``'s outer handler).
+    """
+    configured = getattr(provider, "name", "") or ""
+    active = provider
+    fallback_from = None
+    error_code = None
+
+    # 1. Known-exhausted backend: do not call it, route around it.
+    if _fb.is_exhausted(configured):
+        alternate = _fb.pick_fallback_provider("search", exclude=configured)
+        if alternate is None:
+            response = _rescue_search(
+                configured, _cooldown_error(configured), query, limit,
+                log_level=logging.DEBUG,
+            )
+            return response, "keyless", configured, "cooldown"
+        logger.debug(
+            "web_search: '%s' cooling down; serving via '%s'",
+            configured, alternate.name,
+        )
+        active, fallback_from = alternate, configured
+
+    logger.info("Web search via %s: '%s' (limit: %d)", active.name, query, limit)
+    raised = None
+    try:
+        response = active.search(query, limit)
+    except Exception as exc:  # noqa: BLE001 — candidate for fallback/rescue
+        raised, response = exc, {"success": False, "error": str(exc)}
+
+    # 2. Just-observed exhaustion: park the backend, retry once on the fallback.
+    if not response.get("success"):
+        signal = _fb.parse_exhaustion(response.get("error", ""))
+        if signal is not None:
+            error_code = signal.code
+            _fb.mark_exhausted(active.name, signal, route_summary=_fb.route_summary)
+            alternate = _fb.pick_fallback_provider("search", exclude=active.name)
+            if alternate is not None:
+                fallback_from, active, raised = active.name, alternate, None
+                try:
+                    response = alternate.search(query, limit)
+                except Exception as exc:  # noqa: BLE001
+                    raised, response = exc, {"success": False, "error": str(exc)}
+
+    # 3. Existing one-shot keyless rescue.
+    if not response.get("success"):
+        if _rescue_eligible(active):
+            response = _rescue_search(
+                active.name, str(response.get("error", "")), query, limit,
+                log_level=logging.DEBUG if fallback_from else logging.WARNING,
+            )
+            if response.get("success"):
+                return response, "keyless", active.name, error_code
+        elif raised is not None:
+            raise raised
+    return response, active.name, fallback_from, error_code
+
+
+async def _dispatch_extract(provider, safe_urls: list, format):
+    """Extract through *provider* with the same cooldown/fallback/rescue chain.
+
+    Brave is search-only, so with no keyed extract backend configured a Z.AI
+    cooldown routes straight to the keyless ring — the win there is skipping
+    the doomed call, not a Brave extract.
+    """
+    import inspect
+
+    def _call(target):
+        if inspect.iscoroutinefunction(target.extract):
+            return target.extract(safe_urls, format=format)
+        return asyncio.to_thread(target.extract, safe_urls, format=format)
+
+    def _all_failed(rows) -> bool:
+        return bool(rows) and all(r.get("error") for r in rows)
+
+    configured = getattr(provider, "name", "") or ""
+    active = provider
+    fallback_from = None
+    error_code = None
+
+    if _fb.is_exhausted(configured):
+        alternate = _fb.pick_fallback_provider("extract", exclude=configured)
+        if alternate is None:
+            failed = [
+                {"url": u, "title": "", "content": "", "error": _cooldown_error(configured)}
+                for u in safe_urls
+            ]
+            results = await asyncio.to_thread(
+                _rescue_extract, configured, safe_urls, failed,
+                log_level=logging.DEBUG,
+            )
+            return results, "keyless", configured, "cooldown"
+        logger.debug(
+            "web_extract: '%s' cooling down; serving via '%s'",
+            configured, alternate.name,
+        )
+        active, fallback_from = alternate, configured
+
+    logger.info("Web extract via %s: %d URL(s)", active.name, len(safe_urls))
+    raised = None
+    try:
+        results = await _call(active)
+    except Exception as exc:  # noqa: BLE001 — candidate for fallback/rescue
+        raised = exc
+        results = [
+            {"url": u, "title": "", "content": "", "error": str(exc)} for u in safe_urls
+        ]
+
+    if _all_failed(results):
+        first_error = next((r.get("error") for r in results if r.get("error")), "")
+        signal = _fb.parse_exhaustion(first_error)
+        if signal is not None:
+            error_code = signal.code
+            _fb.mark_exhausted(active.name, signal, route_summary=_fb.route_summary)
+            alternate = _fb.pick_fallback_provider("extract", exclude=active.name)
+            if alternate is not None:
+                fallback_from, active, raised = active.name, alternate, None
+                try:
+                    results = await _call(alternate)
+                except Exception as exc:  # noqa: BLE001
+                    raised = exc
+                    results = [
+                        {"url": u, "title": "", "content": "", "error": str(exc)}
+                        for u in safe_urls
+                    ]
+
+    if _all_failed(results):
+        if _rescue_eligible(active):
+            rescued = await asyncio.to_thread(
+                _rescue_extract, active.name, safe_urls, results,
+                log_level=logging.DEBUG if fallback_from else logging.WARNING,
+            )
+            if not _all_failed(rescued):
+                return rescued, "keyless", active.name, error_code
+            results = rescued
+        elif raised is not None:
+            raise raised
+    return results, active.name, fallback_from, error_code
 
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -976,32 +1153,25 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     ),
                 }
         else:
-            logger.info(
-                "Web search via %s: '%s' (limit: %d)",
-                provider.name, query, limit,
+            _audit_start = time.monotonic()
+            response_data, _served, _fallback_from, _error_code = _dispatch_search(
+                provider, query, limit
             )
-            try:
-                response_data = provider.search(query, limit)
-            except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                if _rescue_eligible(provider):
-                    response_data = _rescue_search(
-                        provider.name, str(exc), query, limit
-                    )
-                else:
-                    raise
-            else:
-                if (
-                    not response_data.get("success")
-                    and _rescue_eligible(provider)
-                ):
-                    # One-shot keyless rescue: THIS call rides the free-tier
-                    # ring; the next call attempts the chosen backend again.
-                    response_data = _rescue_search(
-                        provider.name,
-                        str(response_data.get("error", "")),
-                        query,
-                        limit,
-                    )
+            _fb.write_search_audit(
+                tool="web_search",
+                backend=_served,
+                status=_fb.audit_status(
+                    bool(response_data.get("success")), _error_code
+                ),
+                latency_ms=(time.monotonic() - _audit_start) * 1000,
+                query=query,
+                url_count=0,
+                result_count=len(
+                    (response_data.get("data") or {}).get("web") or []
+                ),
+                error_code=_error_code,
+                fallback_from=_fallback_from,
+            )
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -1237,45 +1407,22 @@ async def web_extract_tool(
                         ensure_ascii=False,
                     )
 
-            logger.info(
-                "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
+            _audit_start = time.monotonic()
+            results, _served, _fallback_from, _error_code = await _dispatch_extract(
+                provider, safe_urls, format
             )
-
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
-            import inspect
-            try:
-                if inspect.iscoroutinefunction(provider.extract):
-                    results = await provider.extract(safe_urls, format=format)
-                else:
-                    # Run sync extract() in a thread so we don't block the
-                    # event loop on network I/O.
-                    results = await asyncio.to_thread(
-                        provider.extract, safe_urls, format=format
-                    )
-            except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                if _rescue_eligible(provider):
-                    failed = [
-                        {"url": u, "title": "", "content": "", "error": str(exc)}
-                        for u in safe_urls
-                    ]
-                    results = await asyncio.to_thread(
-                        _rescue_extract, provider.name, safe_urls, failed
-                    )
-                else:
-                    raise
-            else:
-                # One-shot keyless rescue when the WHOLE batch failed
-                # (backend-level outage, not per-page problems). Stateless:
-                # the next web_extract call uses the chosen backend again.
-                if (
-                    results
-                    and all(r.get("error") for r in results)
-                    and _rescue_eligible(provider)
-                ):
-                    results = await asyncio.to_thread(
-                        _rescue_extract, provider.name, safe_urls, results
-                    )
+            _audit_ok = [r for r in (results or []) if not r.get("error")]
+            _fb.write_search_audit(
+                tool="web_extract",
+                backend=_served,
+                status=_fb.audit_status(bool(_audit_ok), _error_code),
+                latency_ms=(time.monotonic() - _audit_start) * 1000,
+                query=None,
+                url_count=len(safe_urls),
+                result_count=len(_audit_ok),
+                error_code=_error_code,
+                fallback_from=_fallback_from,
+            )
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
