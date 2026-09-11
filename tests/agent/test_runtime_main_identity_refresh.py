@@ -76,8 +76,8 @@ class TestRefreshRuntimeMainIdentity:
 
 
 class TestForwardersSyncTheBinding:
-    """The three mid-turn identity switches all go through AIAgent
-    forwarders, which is where the refresh is wired."""
+    """Both mid-turn identity switches go through AIAgent forwarders, which
+    is where the refresh is wired. The prologue restore deliberately is not."""
 
     def _agent(self):
         from run_agent import AIAgent
@@ -109,13 +109,16 @@ class TestForwardersSyncTheBinding:
             assert agent._try_activate_fallback() is False
             assert _read_main_provider() == "openai-codex"
 
-    def test_primary_restore_refreshes(self, monkeypatch):
+    def test_primary_restore_does_not_touch_the_binding(self, monkeypatch):
+        """The prologue restore runs BEFORE this turn's set_runtime_main, so
+        the bound dict may still be the previous turn's — refreshing it there
+        would scribble on another session. turn_context rebinds right after."""
         import agent.agent_runtime_helpers as arh
 
         monkeypatch.setattr(arh, "restore_primary_runtime", lambda a: True)
         agent = self._agent()
-        with scoped_runtime_main({"provider": "zai", "model": "glm-5.3"}):
-            agent.provider, agent.model = "openai-codex", "gpt-6-astra"
+        with scoped_runtime_main(dict(_PINNED)):
+            agent.provider, agent.model = "kimi-coding", "k3"
             assert agent._restore_primary_runtime() is True
             assert _read_main_provider() == "openai-codex"
 

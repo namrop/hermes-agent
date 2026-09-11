@@ -7160,8 +7160,9 @@ class AIAgent:
         """Publish the live provider/model to the auxiliary runtime-main binding.
 
         ``set_runtime_main()`` binds once per turn, before the first API call.
-        Every mid-turn identity switch goes through one of the three
-        forwarders below, so refreshing here keeps tool-side readers of
+        Both mid-turn identity switches — fallback activation and primary
+        transport recovery — go through forwarders below, so refreshing from
+        there keeps tool-side readers of
         ``_read_main_provider()`` / ``_read_main_model()`` — chiefly
         ``vision_analyze``'s native fast path — pointed at the provider that
         is actually answering rather than a benched pin.
@@ -7197,10 +7198,14 @@ class AIAgent:
     def _restore_primary_runtime(self) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
         from agent.agent_runtime_helpers import restore_primary_runtime
-        restored = restore_primary_runtime(self)
-        if restored:
-            self._sync_runtime_main_identity()
-        return restored
+        # Deliberately NOT calling _sync_runtime_main_identity() here. This
+        # runs in the turn prologue, BEFORE set_runtime_main() binds this
+        # turn's runtime, so on a reused worker thread the context still holds
+        # the previous turn's dict — possibly another session's — and
+        # refreshing would scribble this agent's identity onto it in place.
+        # Both callers (turn_context, cli one-turn restore) rebind right
+        # after, so there is nothing to gain and a cross-session leak to lose.
+        return restore_primary_runtime(self)
 
     def _try_recover_primary_transport(
         self, api_error: Exception, *, retry_count: int, max_retries: int,
