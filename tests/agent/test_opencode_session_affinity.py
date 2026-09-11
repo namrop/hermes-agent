@@ -112,6 +112,21 @@ class TestMerge:
 # ── 3. The main turn, on every transport ─────────────────────────────────────
 
 
+
+def _patch_mode_builder(monkeypatch, fake):
+    """Swap the per-mode builder that ``build_api_kwargs`` actually calls.
+
+    Patched through ``build_api_kwargs.__globals__`` rather than by dotted
+    module path: under a whole-directory run something imports this module
+    under a second identity, so ``monkeypatch.setattr("agent.chat_completion_
+    helpers._build_api_kwargs_for_mode", ...)`` can patch a module object the
+    live function never reads. The globals dict is the one it does read.
+    """
+    monkeypatch.setitem(
+        build_api_kwargs.__globals__, "_build_api_kwargs_for_mode", fake
+    )
+
+
 def _stub_agent(provider, base_url, session_id="sess-affinity-1"):
     return SimpleNamespace(
         provider=provider,
@@ -130,9 +145,8 @@ class TestMainTurn:
         [("opencode-go", _GO_URL), ("opencode-zen", ""), ("custom", _GO_URL)],
     )
     def test_header_is_merged_onto_every_mode(self, provider, base_url, monkeypatch):
-        monkeypatch.setattr(
-            "agent.chat_completion_helpers._build_api_kwargs_for_mode",
-            lambda agent, msgs, tools=None: {"model": "glm-5.3", "messages": msgs},
+        _patch_mode_builder(
+            monkeypatch, lambda agent, msgs, tools=None: {"model": "glm-5.3", "messages": msgs}
         )
         kwargs = build_api_kwargs(_stub_agent(provider, base_url), _MSGS)
         assert kwargs["extra_headers"][OPENCODE_SESSION_HEADER] == "sess-affinity-1"
@@ -141,8 +155,8 @@ class TestMainTurn:
         """The Anthropic transport ASSIGNS extra_headers for anthropic-beta and
         the Codex transport rebuilds it for x-grok-conv-id/session_id. Merging
         after them must add to that dict, never replace it."""
-        monkeypatch.setattr(
-            "agent.chat_completion_helpers._build_api_kwargs_for_mode",
+        _patch_mode_builder(
+            monkeypatch,
             lambda agent, msgs, tools=None: {
                 "extra_headers": {"anthropic-beta": "context-1m-2025-08-07"},
             },
@@ -152,10 +166,7 @@ class TestMainTurn:
         assert headers[OPENCODE_SESSION_HEADER] == "sess-affinity-1"
 
     def test_other_providers_are_untouched(self, monkeypatch):
-        monkeypatch.setattr(
-            "agent.chat_completion_helpers._build_api_kwargs_for_mode",
-            lambda agent, msgs, tools=None: {"model": "x"},
-        )
+        _patch_mode_builder(monkeypatch, lambda agent, msgs, tools=None: {"model": "x"})
         agent = _stub_agent("openrouter", "https://openrouter.ai/api/v1")
         kwargs = build_api_kwargs(agent, _MSGS)
         assert OPENCODE_SESSION_HEADER not in (kwargs.get("extra_headers") or {})
