@@ -816,13 +816,45 @@ def _state_db_write_guard(request, monkeypatch):
     monkeypatch.setattr(
         _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
     )
-    # The auth store gets the same deny-list (2026-09-11): a custom live home
-    # is exactly the case the seat belt's ``~/.hermes`` comparison missed.
+    yield
+
+
+# ── Auth-store write guard: deny-list for a custom LIVE home ────────────────
+# The auth-store seat belt in ``hermes_cli.auth`` refuses the platform root
+# (~/.hermes) on its own; a deployment whose live gateway runs from a custom
+# HERMES_HOME (Sol: /var/lib/hermes/primary, exported into every operator
+# shell) needs that root injected, exactly as the state-db guard above gets
+# it. Its own fixture, deliberately: the state-db fixture returns early when
+# ``hermes_state`` is not imported, and the modules that only import
+# ``hermes_cli.auth`` are precisely the population this guard exists for
+# (2026-09-11: the live auth.json lost its Codex OAuth credential ten minutes
+# into a bare ``pytest tests/agent/`` from such a shell).
+
+
+def _pre_sandbox_live_home_deny_roots() -> tuple:
+    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
+        _PRE_SANDBOX_HERMES_HOME
+    ):
+        try:
+            return (Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve(),)
+        except Exception:
+            return ()
+    return ()
+
+
+@pytest.fixture(autouse=True)
+def _auth_store_write_guard(request, monkeypatch):
     _auth = sys.modules.get("hermes_cli.auth")
-    if _auth is not None and hasattr(_auth, "_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS"):
-        monkeypatch.setattr(
-            _auth, "_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
-        )
+    if _auth is None or not hasattr(_auth, "_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS"):
+        yield
+        return
+    if request.node.get_closest_marker("live_system_guard_bypass") is not None:
+        monkeypatch.setenv("HERMES_AUTH_STORE_GUARD_BYPASS", "1")
+        yield
+        return
+    monkeypatch.setattr(
+        _auth, "_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS", _pre_sandbox_live_home_deny_roots()
+    )
     yield
 
 

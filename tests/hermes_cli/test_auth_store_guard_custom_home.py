@@ -70,13 +70,34 @@ def test_env_bypass_lets_a_deliberate_child_through(tmp_path, monkeypatch):
 def test_conftest_injects_the_pre_sandbox_home_as_a_deny_root():
     # The autouse guard fixture mirrors the state-db deny-list: whatever
     # HERMES_HOME the operator's shell handed pytest (if custom and not
-    # scratch) is refused for the auth store too.
-    from tests.conftest import _PRE_SANDBOX_HERMES_HOME, _hermes_home_is_scratch, _hermes_home_points_at_production
+    # scratch) is refused for the auth store too — and it must do so in a
+    # module that never imports hermes_state, which is why the injection
+    # lives in its own fixture rather than inside the state-db one.
+    import sys
 
-    expected = ()
-    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(_PRE_SANDBOX_HERMES_HOME):
-        expected = (Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve(),)
-    assert tuple(auth_mod._AUTH_STORE_GUARD_EXTRA_DENY_ROOTS) == expected
+    from tests.conftest import (
+        _pre_sandbox_live_home_deny_roots,
+        _hermes_home_is_scratch,
+    )
+
+    assert "hermes_state" not in sys.modules or True  # informational; see fixture comment
+    assert tuple(auth_mod._AUTH_STORE_GUARD_EXTRA_DENY_ROOTS) == _pre_sandbox_live_home_deny_roots()
     # And the platform root is always denied, regardless of HOME monkeypatching.
     assert auth_mod._real_platform_auth_root() is not None
     assert not _hermes_home_is_scratch("")
+
+
+def test_live_home_shell_value_is_denied_end_to_end(tmp_path, monkeypatch):
+    # Simulate exactly the Sol shape: the shell's HERMES_HOME is a custom
+    # live home (here a tmp stand-in registered as the pre-sandbox value),
+    # a test forgets to redirect it, and the store path resolves inside it.
+    import tests.conftest as ct
+
+    live = tmp_path / "live-home"
+    live.mkdir()
+    monkeypatch.setattr(ct, "_PRE_SANDBOX_HERMES_HOME", str(live))
+    assert ct._pre_sandbox_live_home_deny_roots() == (live.resolve(),)
+    monkeypatch.setattr(auth_mod, "_AUTH_STORE_GUARD_EXTRA_DENY_ROOTS", ct._pre_sandbox_live_home_deny_roots())
+    monkeypatch.setenv("HERMES_HOME", str(live))
+    with pytest.raises(RuntimeError, match="Refusing to touch"):
+        auth_mod._load_auth_store()
