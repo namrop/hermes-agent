@@ -247,3 +247,61 @@ class TestHandleVisionAnalyzeFastPath:
         assert isinstance(result, str)
         assert json.loads(result) == {"sentinel": "aux-path"}
         mock_aux.assert_called_once()
+
+
+# ─── Fast path follows the live (post-fallback) runtime ──────────────────────
+
+
+class TestFastPathFollowsLiveRuntime:
+    """The predicate must read the provider that is actually serving the
+    session, not the pin the turn started on.
+
+    2026-09-10: the composer job was pinned to ``openai-codex``/``gpt-6-astra``,
+    the Codex pool was benched, and every turn was served by ``zai``/``glm-5.3``
+    (text-only). The turn-scoped runtime-main binding still said
+    ``openai-codex``, so this predicate returned True and seven
+    ``vision_analyze`` calls returned "answer using built-in vision" to a model
+    with no vision.
+    """
+
+    def test_pinned_primary_takes_the_fast_path(self):
+        from agent.auxiliary_client import scoped_runtime_main
+        from tools.vision_tools import _should_use_native_vision_fast_path
+
+        with patch(
+            "agent.image_routing.decide_image_input_mode", return_value="native",
+        ), patch(
+            "agent.image_routing._lookup_supports_vision", return_value=False,
+        ):
+            with scoped_runtime_main(
+                {"provider": "openai-codex", "model": "gpt-6-astra"}
+            ):
+                assert _should_use_native_vision_fast_path() is True
+
+    def test_text_only_fallback_does_not(self):
+        from agent.auxiliary_client import (
+            refresh_runtime_main_identity,
+            scoped_runtime_main,
+        )
+        from tools.vision_tools import _should_use_native_vision_fast_path
+
+        class _Agent:
+            provider = "zai"
+            model = "glm-5.3"
+            requested_provider = "zai"
+            base_url = ""
+            api_key = ""
+            api_mode = ""
+            auth_mode = ""
+
+        with patch(
+            "agent.image_routing.decide_image_input_mode", return_value="native",
+        ), patch(
+            "agent.image_routing._lookup_supports_vision", return_value=False,
+        ):
+            with scoped_runtime_main(
+                {"provider": "openai-codex", "model": "gpt-6-astra"}
+            ):
+                assert _should_use_native_vision_fast_path() is True
+                refresh_runtime_main_identity(_Agent())
+                assert _should_use_native_vision_fast_path() is False

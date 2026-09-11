@@ -3534,6 +3534,72 @@ def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
         _RUNTIME_MAIN_CONTEXT.reset(token)
 
 
+def refresh_runtime_main_identity(agent: Any) -> bool:
+    """Re-point the bound runtime main at whatever is serving the turn NOW.
+
+    ``set_runtime_main()`` runs once per turn (agent/turn_context.py, right
+    after primary restoration). A mid-turn provider switch —
+    ``try_activate_fallback`` / ``try_recover_primary_transport`` — rewrites
+    ``agent.provider`` / ``agent.model`` in place and never re-binds, so every
+    reader of ``_read_main_provider()`` keeps seeing the pinned primary for
+    the rest of the turn. That is how a benched ``openai-codex`` pin made
+    ``vision_analyze``'s native fast path fire while a text-only ``zai``
+    fallback was actually answering (2026-09-10 composer scar).
+
+    The bound dict is mutated in place, deliberately: turn_context holds a
+    reset token for it and contexts already copied into tool tasks reference
+    the same object, so both see the update. ``session_id`` / ``cache_scope``
+    are left alone — the session did not change, only who is serving it.
+
+    Returns True when the binding changed. Never blanks an existing binding:
+    an agent with no resolvable provider/model is a no-op.
+    """
+    runtime = _RUNTIME_MAIN_CONTEXT.get()
+    if not isinstance(runtime, dict):
+        return False
+
+    api_key = getattr(agent, "api_key", "") or ""
+    updates = {
+        "provider": (getattr(agent, "provider", "") or "").strip().lower(),
+        "requested_provider": (
+            getattr(agent, "requested_provider", "") or ""
+        ).strip().lower(),
+        "model": (getattr(agent, "model", "") or "").strip(),
+        "base_url": (getattr(agent, "base_url", "") or "").strip(),
+        "api_key": (
+            api_key.strip()
+            if isinstance(api_key, str)
+            else api_key if callable(api_key) else ""
+        ),
+        "api_mode": (getattr(agent, "api_mode", "") or "").strip(),
+        "auth_mode": (getattr(agent, "auth_mode", "") or "").strip().lower(),
+    }
+    if not updates["provider"] or not updates["model"]:
+        return False
+    if all(runtime.get(field) == value for field, value in updates.items()):
+        return False
+
+    runtime.update(updates)
+    # Keep the legacy mirrors and their snapshot moving together so
+    # ``_compat_runtime_main`` still only reports deliberate external patches.
+    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
+    global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+    with _RUNTIME_MAIN_COMPAT_LOCK:
+        (
+            _RUNTIME_MAIN_PROVIDER,
+            _RUNTIME_MAIN_MODEL,
+            _RUNTIME_MAIN_BASE_URL,
+            _RUNTIME_MAIN_API_KEY,
+            _RUNTIME_MAIN_API_MODE,
+            _RUNTIME_MAIN_AUTH_MODE,
+        ) = (runtime[field] for field in _MAIN_RUNTIME_FIELDS)
+        _RUNTIME_MAIN_COMPAT_SNAPSHOT = tuple(
+            runtime[field] for field in _MAIN_RUNTIME_FIELDS
+        )
+    return True
+
+
 def clear_runtime_main() -> None:
     """Clear the runtime override in the current context."""
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL

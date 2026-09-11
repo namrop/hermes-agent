@@ -7156,10 +7156,29 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
+    def _sync_runtime_main_identity(self) -> None:
+        """Publish the live provider/model to the auxiliary runtime-main binding.
+
+        ``set_runtime_main()`` binds once per turn, before the first API call.
+        Every mid-turn identity switch goes through one of the three
+        forwarders below, so refreshing here keeps tool-side readers of
+        ``_read_main_provider()`` / ``_read_main_model()`` — chiefly
+        ``vision_analyze``'s native fast path — pointed at the provider that
+        is actually answering rather than a benched pin.
+        """
+        try:
+            from agent.auxiliary_client import refresh_runtime_main_identity
+            refresh_runtime_main_identity(self)
+        except Exception:
+            logger.debug("runtime-main identity refresh failed", exc_info=True)
+
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        activated = try_activate_fallback(self, reason)
+        if activated:
+            self._sync_runtime_main_identity()
+        return activated
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.
@@ -7178,14 +7197,20 @@ class AIAgent:
     def _restore_primary_runtime(self) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
         from agent.agent_runtime_helpers import restore_primary_runtime
-        return restore_primary_runtime(self)
+        restored = restore_primary_runtime(self)
+        if restored:
+            self._sync_runtime_main_identity()
+        return restored
 
     def _try_recover_primary_transport(
         self, api_error: Exception, *, retry_count: int, max_retries: int,
     ) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.try_recover_primary_transport``."""
         from agent.agent_runtime_helpers import try_recover_primary_transport
-        return try_recover_primary_transport(self, api_error, retry_count=retry_count, max_retries=max_retries)
+        recovered = try_recover_primary_transport(self, api_error, retry_count=retry_count, max_retries=max_retries)
+        if recovered:
+            self._sync_runtime_main_identity()
+        return recovered
 
     @staticmethod
     def _content_has_image_parts(content: Any) -> bool:
@@ -7504,14 +7529,126 @@ class AIAgent:
                 "text_summary": summary,
             })
 
+        # The active model cannot see the pixels — but the auxiliary vision
+        # model usually can (it has its own provider/credentials and is
+        # deliberately kept off the main model's quota bench). Describe the
+        # image there and hand the model real analysis instead of a
+        # content-free "image attached natively" note. See the 2026-09-10
+        # composer scar: seven vision_analyze calls resolved to that note.
+        analysis = self._aux_vision_analysis_for_tool_result(tool_name, result)
+        if analysis:
+            return analysis
+
         logger.warning(
-            "Tool %s returned image content for non-vision model %s/%s; "
-            "falling back to text summary",
+            "Tool %s returned image content for non-vision model %s/%s and the "
+            "auxiliary vision path did not answer; falling back to text summary",
             tool_name,
             self.provider,
             self.model,
         )
         return summary
+
+    def _aux_vision_analysis_for_tool_result(
+        self, tool_name: str, result: Any,
+    ) -> str:
+        """Describe a tool result's image parts with the auxiliary vision model.
+
+        Returns a JSON string shaped like the legacy ``vision_analyze`` aux
+        result (``success`` / ``analysis``), or ``""`` when there is nothing to
+        analyze or the aux path fails — the caller then falls back to the text
+        summary. Never raises.
+        """
+        try:
+            content = result.get("content") or []
+            image_parts = [
+                part for part in content
+                if isinstance(part, dict)
+                and part.get("type") in {"image_url", "input_image"}
+            ]
+            if not image_parts:
+                return ""
+            # One aux call per tool result; extra frames are rare and each one
+            # multiplies latency and cost on a path that is already a recovery.
+            part = image_parts[0]
+            raw_url = part.get("image_url")
+            url = raw_url.get("url") if isinstance(raw_url, dict) else raw_url
+            if not isinstance(url, str) or not url.strip():
+                return ""
+            # Normalize Responses-style ``input_image`` to the chat-completions
+            # shape the auxiliary client speaks.
+            image_parts = [{"type": "image_url", "image_url": {"url": url}}]
+
+            question = ""
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = str(part.get("text", "") or "")
+                    # The native envelope prefixes boilerplate about built-in
+                    # vision that is false on this path; keep only the ask.
+                    marker = "Question:"
+                    question = (
+                        text.split(marker, 1)[1].strip()
+                        if marker in text else text.strip()
+                    )
+                    if question:
+                        break
+
+            prompt = (
+                "Fully describe and explain everything about this image"
+                + (
+                    ", then answer the following question:\n\n" + question
+                    if question else "."
+                )
+            )
+
+            try:
+                from hermes_cli.config import cfg_get, load_config
+                _vision_cfg = cfg_get(load_config(), "auxiliary", "vision", default={}) or {}
+                timeout = float(_vision_cfg.get("timeout", 120))
+                temperature = float(_vision_cfg.get("temperature", 0.1))
+            except Exception:
+                timeout, temperature = 120.0, 0.1
+
+            from agent.auxiliary_client import call_llm
+            response = call_llm(
+                messages=[{
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}] + image_parts,
+                }],
+                task="vision",
+                temperature=temperature,
+                timeout=timeout,
+            )
+            analysis = (
+                (response.choices[0].message.content or "").strip()
+                if getattr(response, "choices", None) else ""
+            )
+            if not analysis:
+                return ""
+            try:
+                from agent.redact import redact_sensitive_text
+                analysis = redact_sensitive_text(analysis)
+            except Exception:
+                pass
+
+            logger.info(
+                "Tool %s: image content re-routed through the auxiliary vision "
+                "model (%s) because main model %s/%s has no vision",
+                tool_name,
+                getattr(response, "model", "") or "auxiliary.vision",
+                self.provider,
+                self.model,
+            )
+            return json.dumps({
+                "success": True,
+                "analysis": analysis,
+                "via": "auxiliary_vision",
+            }, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(
+                "Tool %s: auxiliary vision fallback failed (%s)",
+                tool_name, exc,
+            )
+            return ""
 
     def _try_shrink_image_parts_in_messages(
         self,

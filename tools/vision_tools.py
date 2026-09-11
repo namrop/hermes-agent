@@ -1046,6 +1046,14 @@ def _should_use_native_vision_fast_path() -> bool:
     The override is the escape hatch for custom/local providers that aren't in
     the static allowlist. Best-effort: any resolution failure returns False so
     the caller falls back to the legacy aux-LLM path.
+
+    ``_read_main_provider()`` / ``_read_main_model()`` must report whoever is
+    serving the session RIGHT NOW, not the identity the turn was pinned to:
+    a mid-turn switch republishes the binding through
+    ``auxiliary_client.refresh_runtime_main_identity``. Without that, a benched
+    pin on a vision-capable provider makes a text-only fallback model look
+    vision-capable and the image is attached to a model that cannot see it
+    (2026-09-10 composer scar).
     """
     try:
         from agent.auxiliary_client import _read_main_provider, _read_main_model
