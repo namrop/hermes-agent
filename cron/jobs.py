@@ -1801,6 +1801,45 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_max_turns(value: Any) -> Optional[Any]:
+    """Validate a per-job ``max_turns`` (tool-calling iteration cap).
+
+    Same grammar as the global ``agent.max_turns`` knob, decided by the SAME
+    parser (``hermes_cli.config.resolve_turn_limit``) so the per-job pin can
+    never be stricter or looser than its config.yaml sibling:
+
+      - a positive integer (or numeric string) → stored as that int;
+      - an "unlimited" spelling (``none``, ``unlimited``, ``0``, ``-1``, …)
+        → stored as the canonical string ``"unlimited"``;
+      - None / empty string → None (unset: the job follows ``agent.max_turns``);
+      - anything else raises ValueError so garbage never persists.
+
+    Motivation (2026-09-10): the newspaper composer job runs ~180 model turns
+    of readiness, research, compose-and-fit, copy desk and fact-check in one
+    session and was cut off by the global ``agent.max_turns: 180`` before its
+    publish and commit steps. One long job should not force the global cap
+    up for every other job.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Invalid max_turns: booleans are not accepted.")
+    if isinstance(value, str) and not value.strip():
+        return None
+    from hermes_cli.config import TURN_LIMIT_UNLIMITED, resolve_turn_limit
+
+    sentinel = object()
+    resolved = resolve_turn_limit(value, default=sentinel)  # type: ignore[arg-type]
+    if resolved is sentinel:
+        raise ValueError(
+            f"Invalid max_turns {value!r}. Use a positive integer, or "
+            "none/unlimited for no cap (empty string clears the override)."
+        )
+    if resolved == TURN_LIMIT_UNLIMITED:
+        return "unlimited"
+    return int(resolved)
+
+
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Validate a per-job reasoning effort against the canonical grammar.
 
@@ -1942,6 +1981,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_turns: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2042,6 +2082,7 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_max_turns = _normalize_max_turns(max_turns)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2155,6 +2196,9 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Same rule for the per-job iteration cap: absent key = agent.max_turns.
+    if normalized_max_turns is not None:
+        job["max_turns"] = normalized_max_turns
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2269,6 +2313,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
                 )
+            # Per-job max_turns: same validate-before-merge rule; empty
+            # string (or None) clears the pin back to agent.max_turns.
+            if "max_turns" in updates:
+                updates["max_turns"] = _normalize_max_turns(updates["max_turns"])
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

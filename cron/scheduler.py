@@ -477,6 +477,55 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         return None
 
 
+def _resolve_job_max_iterations(job: dict, cfg: dict) -> int:
+    """Resolve the tool-calling iteration cap for a cron run.
+
+    Precedence: per-job ``max_turns`` pin (validated at the store choke
+    point, ``cron/jobs.py::_normalize_max_turns``) wins outright over the
+    global ``agent.max_turns`` (legacy top-level ``max_turns`` as fallback).
+    Both go through ``resolve_turn_limit`` so ``none`` / ``unlimited`` /
+    ``0`` are honored as "no cap".
+
+    A stored pin that no longer parses (hand-edited jobs.json) logs a warning
+    and falls back to config resolution — it must never silently become
+    unlimited, which is what ``resolve_turn_limit``'s default would do.
+    """
+    from hermes_cli.config import resolve_turn_limit
+
+    cfg = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    _mt = agent_cfg.get("max_turns")
+    if _mt is None:
+        _mt = cfg.get("max_turns")
+    config_limit = resolve_turn_limit(_mt)
+
+    pinned = job.get("max_turns")
+    if pinned is None:
+        return config_limit
+    try:
+        from cron.jobs import _normalize_max_turns
+
+        normalized = _normalize_max_turns(pinned)
+    except ValueError:
+        normalized = None
+    if normalized is None:
+        logger.warning(
+            "Job '%s': invalid stored max_turns %r — ignoring the pin and "
+            "using agent.max_turns. Fix with `hermes cron edit %s --max-turns "
+            "<n|unlimited>` (empty string clears).",
+            job.get("id", "?"), pinned, job.get("id", "?"),
+        )
+        return config_limit
+    resolved = resolve_turn_limit(normalized)
+    logger.info(
+        "Job '%s': using per-job max_turns %s (agent.max_turns would be %s)",
+        job.get("id", "?"),
+        "unlimited" if normalized == "unlimited" else normalized,
+        "unlimited" if _mt is None else _mt,
+    )
+    return resolved
+
+
 def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
     """Resolve the effective reasoning config for a cron run.
 
@@ -5545,14 +5594,11 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations — resolved through resolve_turn_limit() so that
-        # agent.max_turns: none / unlimited → sys.maxsize sentinel, and
-        # explicit 0 / null / "none" are honored instead of skipped by `or`.
-        from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
-        _mt = _cfg.get("agent", {}).get("max_turns")
-        if _mt is None:
-            _mt = _cfg.get("max_turns")
-        max_iterations = _resolve_turn_limit(_mt)
+        # Max iterations — per-job ``max_turns`` pin first, then
+        # agent.max_turns, both through resolve_turn_limit() so that
+        # none / unlimited → sys.maxsize sentinel, and explicit 0 / null /
+        # "none" are honored instead of skipped by `or`.
+        max_iterations = _resolve_job_max_iterations(job, _cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
