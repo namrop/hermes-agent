@@ -837,6 +837,22 @@ class CredentialPool:
             updated_extra["failure_reason"] = failure_reason
         else:
             updated_extra.pop("failure_reason", None)
+        # A reactive mark must not erase a cliff we already know about. Most
+        # provider errors carry no reset time (Kimi's weekly-limit 403 is the
+        # worked example), and writing that None over a bench written by
+        # tools/quota_bench.py — which DID measure the window and DID know the
+        # cliff — downgraded a hard "dead until 2026-09-12T22:45" into an
+        # untimed TTL cooldown that aged out in minutes. The chain then walked
+        # straight back into the benched provider (2026-09-10). Keep the more
+        # informative value: only an error that actually carries a reset time,
+        # or a cliff that has already passed, may replace it.
+        _new_reset_at = normalized_error.get("reset_at")
+        if _new_reset_at is None and terminal_status == STATUS_EXHAUSTED:
+            _existing_reset_at = _parse_absolute_timestamp(
+                getattr(entry, "last_error_reset_at", None)
+            )
+            if _existing_reset_at is not None and _existing_reset_at > time.time():
+                _new_reset_at = _existing_reset_at
         updated = replace(
             entry,
             last_status=terminal_status,
@@ -844,7 +860,7 @@ class CredentialPool:
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
-            last_error_reset_at=normalized_error.get("reset_at"),
+            last_error_reset_at=_new_reset_at,
             extra=updated_extra,
         )
         self._replace_entry(entry, updated)

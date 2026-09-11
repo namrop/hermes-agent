@@ -2454,6 +2454,88 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+def _fallback_pool_for_entry(fb: dict):
+    """Load the credential pool backing fallback entry *fb*.
+
+    Returns ``(pool, pool_key)``, either of which may be None. A named custom
+    endpoint's pool is keyed ``custom:<name>`` rather than by the runtime
+    provider name, so only its base_url can resolve it; no match means no
+    pool. The caller reuses the returned pool for the post-activation attach
+    when ``pool_key`` equals the entry's provider, so one activation reads
+    auth.json once.
+    """
+    fb_provider = (fb.get("provider") or "").strip().lower()
+    if not fb_provider:
+        return None, None
+    try:
+        from agent.credential_pool import get_custom_provider_pool_key, load_pool
+
+        pool_key = fb_provider
+        if fb_provider == "custom":
+            pool_key = get_custom_provider_pool_key(
+                (fb.get("base_url") or "").strip()
+            ) or ""
+            if not pool_key:
+                return None, None
+        return load_pool(pool_key), pool_key
+    except Exception:
+        logger.debug(
+            "Fallback pool load failed for %s; treating as usable",
+            fb_provider,
+            exc_info=True,
+        )
+        return None, None
+
+
+def _pool_quota_benched_until(pool) -> "float | None":
+    """Return the cliff when *pool*'s whole credential set is quota-benched.
+
+    ``tools/quota_bench.py`` runs hourly off ai-quota-bench.timer and, at
+    ``--apply``, writes ``last_status: exhausted`` plus an absolute
+    ``last_error_reset_at`` onto every entry of a provider it has measured
+    over its window. That is a *proactive* statement — "this provider is
+    known-dead until T" — but the fallback candidate loop never read it, so
+    the chain kept walking into benched providers and collecting the 403 the
+    bench already predicted (2026-09-10: kimi-coding benched at 21:26 and
+    22:26, walked into at 22:07, 22:21, 22:30 and 22:56).
+
+    Only a bench-shaped cliff counts: EVERY entry exhausted AND carrying a
+    reset time still in the future. An exhausted entry with no reset time is
+    a plain TTL cooldown — that is the reactive path's business and this must
+    not pre-empt it. Fails open on anything unexpected: a fallback that might
+    work is strictly better than a chain that stops early.
+    """
+    if pool is None:
+        return None
+    try:
+        from agent.credential_pool import STATUS_EXHAUSTED, _parse_absolute_timestamp
+
+        if not pool.has_credentials():
+            return None
+        entries = pool.entries()
+        if not entries:
+            return None
+        now = time.time()
+        cliffs = []
+        for entry in entries:
+            if getattr(entry, "last_status", None) != STATUS_EXHAUSTED:
+                return None
+            reset_at = _parse_absolute_timestamp(
+                getattr(entry, "last_error_reset_at", None)
+            )
+            if reset_at is None or reset_at <= now:
+                return None
+            cliffs.append(reset_at)
+        return min(cliffs) if cliffs else None
+    except Exception:
+        logger.debug(
+            "Fallback quota-bench check failed for %s; treating as usable",
+            getattr(pool, "provider", "?"),
+            exc_info=True,
+        )
+        return None
+
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -2554,6 +2636,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback skip: chain entry %s/%s resolves to the same backend "
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
+        )
+        return agent._try_activate_fallback(reason)
+
+    # Honour the quota bench: a provider whose whole credential pool is
+    # benched past a future cliff will 403/429 on the first request, so
+    # walking to it costs a round trip and a reactive mark for nothing.
+    # Deliberately NOT added to ``_unavailable_fallback_keys`` — that set is
+    # session-permanent and benches expire, often within the same session.
+    _fb_pool, _fb_pool_key = _fallback_pool_for_entry(fb)
+    _benched_until = _pool_quota_benched_until(_fb_pool)
+    if _benched_until is not None:
+        logger.debug(
+            "Fallback skip: %s/%s — every %s credential is quota-benched "
+            "until %s (not suppressed for the session; benches expire)",
+            fb_provider, fb_model, fb_provider,
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_benched_until)),
         )
         return agent._try_activate_fallback(reason)
 
@@ -2714,9 +2812,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 agent._credential_pool_entry_id = None
         if getattr(agent, "_credential_pool", None) is None:
             try:
-                from agent.credential_pool import load_pool
+                # Reuse the pool the quota-bench gate above already loaded for
+                # this same entry — one activation, one auth.json read. Only
+                # when it is the same pool: a named custom endpoint is keyed
+                # ``custom:<name>``, not by the runtime provider name.
+                fallback_pool = _fb_pool if _fb_pool_key == fb_provider else None
+                if fallback_pool is None:
+                    from agent.credential_pool import load_pool
 
-                fallback_pool = load_pool(fb_provider)
+                    fallback_pool = load_pool(fb_provider)
                 if fallback_pool and fallback_pool.has_credentials():
                     agent._credential_pool = fallback_pool
                     logger.info(
