@@ -1738,6 +1738,9 @@ _POOL_STATUS_FIELDS = (
     "last_error_message",
     "last_error_reset_at",
 )
+# ``extra`` keys that describe the same failure as the status fields above
+# and must travel with them when one side's status is adopted.
+_POOL_STATUS_EXTRA_FIELDS = ("failure_reason", "bench_basis")
 
 
 def _merge_disk_cooldown_state(
@@ -1756,6 +1759,15 @@ def _merge_disk_cooldown_state(
     marker, or an EXHAUSTED cooldown that has not yet expired.  Expired
     cooldowns are not resurrected, so the pool's own expiry-clear (which
     resets ``last_status_at`` to None) is never overridden.
+
+    The rule is symmetric for an *explicit* clear.  ``CredentialPool.
+    clear_status`` (``hermes auth reset``, the quota-bench un-bench) writes
+    an idle status stamped with the time of the clear.  When that stamp is
+    strictly newer than an in-memory EXHAUSTED/DEAD marker, the clear wins —
+    otherwise a long-lived gateway pool re-saving the snapshot it took before
+    the operator's reset silently reinstates the cooldown (2026-09-12).  A
+    stampless idle entry (the expiry-clear) is not an event and never wins.
+    ``failure_reason`` travels with whichever side's status is adopted.
     """
     if not isinstance(disk_entry, dict):
         return entry
@@ -1769,8 +1781,16 @@ def _merge_disk_cooldown_state(
         )
 
         disk_status = disk_entry.get("last_status")
+        disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
+        mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
-            return entry
+            # Disk is idle. Only a newer explicit clear may override a
+            # binding in-memory marker; anything else keeps the snapshot.
+            if entry.get("last_status") not in (STATUS_DEAD, STATUS_EXHAUSTED):
+                return entry
+            if disk_ts <= 0.0 or disk_ts <= mem_ts:
+                return entry
+            return _adopt_disk_status(entry, disk_entry)
         # A token change means the caller re-authed/refreshed this entry and
         # intentionally cleared its status (e.g. _sync_codex_entry_from_
         # auth_store after a fresh device-code login) — never resurrect the
@@ -1779,8 +1799,6 @@ def _merge_disk_cooldown_state(
         disk_access = disk_entry.get("access_token") or ""
         if mem_access and disk_access and mem_access != disk_access:
             return entry
-        disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
-        mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
         if disk_ts <= mem_ts:
             return entry
         if disk_status == STATUS_EXHAUSTED:
@@ -1789,12 +1807,22 @@ def _merge_disk_cooldown_state(
             )
             if until is None or until <= time.time():
                 return entry
-        merged_entry = dict(entry)
-        for status_field in _POOL_STATUS_FIELDS:
-            merged_entry[status_field] = disk_entry.get(status_field)
-        return merged_entry
+        return _adopt_disk_status(entry, disk_entry)
     except Exception:  # pragma: no cover - best-effort merge
         return entry
+
+
+def _adopt_disk_status(entry: Dict[str, Any], disk_entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy the on-disk status fields (and their failure semantics) onto *entry*."""
+    merged_entry = dict(entry)
+    for status_field in _POOL_STATUS_FIELDS:
+        merged_entry[status_field] = disk_entry.get(status_field)
+    for extra_field in _POOL_STATUS_EXTRA_FIELDS:
+        if disk_entry.get(extra_field) is not None:
+            merged_entry[extra_field] = disk_entry[extra_field]
+        else:
+            merged_entry.pop(extra_field, None)
+    return merged_entry
 
 
 def write_credential_pool(

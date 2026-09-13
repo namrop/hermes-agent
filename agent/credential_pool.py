@@ -176,7 +176,26 @@ _EXTRA_KEYS = frozenset({
     # with the entry so a restart doesn't downgrade a billing bench back to a
     # 60s transient cooldown.
     "failure_reason",
+    # Set by tools/quota_bench.py on the benches IT writes (the value is the
+    # bench's basis, e.g. "resets_at"). A reactive 429/403 landing on a
+    # benched entry rewrites last_error_message but copies ``extra`` through,
+    # so this marker — not the message — is what tells the un-bench pass
+    # "this cooldown is ours to lift". Never set by the reactive mark path.
+    "bench_basis",
 })
+
+# The six status fields every entry emits, and the ``extra`` keys that
+# describe the last failure — together, the whole exhaustion/cooldown state
+# an explicit clear (``CredentialPool.clear_status``) lifts.
+_STATUS_FIELD_NAMES = (
+    "last_status",
+    "last_status_at",
+    "last_error_code",
+    "last_error_reason",
+    "last_error_message",
+    "last_error_reset_at",
+)
+_CLEARABLE_EXTRA_KEYS = ("failure_reason", "bench_basis")
 
 
 def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
@@ -2344,30 +2363,103 @@ class CredentialPool:
             self._current_id = refreshed.id
         return refreshed
 
-    def reset_statuses(self) -> int:
+    def clear_status(
+        self,
+        credential_id: Optional[str] = None,
+        *,
+        message: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Explicitly lift the exhaustion/cooldown state of one entry, or all.
+
+        This is the operator's clear (``hermes auth reset``) and the
+        un-bench written by ``tools/quota_bench.py`` — as opposed to the
+        pool's own expiry-clear in ``_available_entries``, which only fires
+        once a cooldown has lapsed.
+
+        The clear is a *timestamped status event*: it writes ``last_status``
+        None with ``last_status_at = now``. The stamp is load-bearing.
+        ``write_credential_pool`` merges status fields by ``last_status_at``
+        recency so a stale snapshot cannot erase a cooldown another process
+        just wrote; a clear stamped ``None`` is older than any marker, and on
+        2026-09-12 ``hermes auth reset openai-codex`` printed "Reset status
+        on 1" while its own persist re-adopted the still-binding bench from
+        disk. Stamped ``now``, the clear is the newer state on the writer's
+        side, and the merge's symmetric rule lets it beat a long-lived
+        gateway pool re-saving the exhausted snapshot it took before.
+
+        ``failure_reason`` and ``bench_basis`` (classified failure semantics
+        and the quota-bench marker, both in ``extra``) are cleared as well;
+        ``last_error_message`` becomes *message* so the entry carries a
+        human trace of why it is idle.
+
+        Returns one record per cleared entry — ``id``, ``label``, and
+        ``cleared`` mapping each field to the value it held — for the caller
+        to print. Never includes tokens.
+        """
         with self._lock:
-            count = 0
-            new_entries = []
+            now = time.time()
+            report: List[Dict[str, Any]] = []
+            new_entries: List[PooledCredential] = []
             for entry in self._entries:
-                if entry.last_status or entry.last_status_at or entry.last_error_code:
-                    new_entries.append(
-                        replace(
-                            entry,
-                            last_status=None,
-                            last_status_at=None,
-                            last_error_code=None,
-                            last_error_reason=None,
-                            last_error_message=None,
-                            last_error_reset_at=None,
-                        )
-                    )
-                    count += 1
-                else:
+                if credential_id and entry.id != credential_id:
                     new_entries.append(entry)
-            if count:
+                    continue
+                if not self._has_exhaustion_state(entry):
+                    new_entries.append(entry)
+                    continue
+                cleared_fields: Dict[str, Any] = {}
+                for name in _STATUS_FIELD_NAMES:
+                    value = getattr(entry, name, None)
+                    if value is not None:
+                        cleared_fields[name] = value
+                updated_extra = dict(entry.extra)
+                for name in _CLEARABLE_EXTRA_KEYS:
+                    if updated_extra.get(name) is not None:
+                        cleared_fields[name] = updated_extra[name]
+                    updated_extra.pop(name, None)
+                new_entries.append(
+                    replace(
+                        entry,
+                        last_status=None,
+                        last_status_at=now,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=message,
+                        last_error_reset_at=None,
+                        extra=updated_extra,
+                    )
+                )
+                report.append(
+                    {"id": entry.id, "label": entry.label, "cleared": cleared_fields}
+                )
+            if report:
                 self._entries = new_entries
                 self._persist()
-            return count
+            return report
+
+    @staticmethod
+    def _has_exhaustion_state(entry: PooledCredential) -> bool:
+        """True when an entry carries anything an explicit clear should lift.
+
+        A cleared entry keeps its stamp and its clear message, so "has a
+        ``last_status_at``" is not the test — that would report a just-cleared
+        entry as something to reset again.
+        """
+        if entry.last_status in (STATUS_EXHAUSTED, STATUS_DEAD):
+            return True
+        if entry.last_error_code is not None or entry.last_error_reset_at is not None:
+            return True
+        if entry.last_error_reason:
+            return True
+        return any(entry.extra.get(name) is not None for name in _CLEARABLE_EXTRA_KEYS)
+
+    def reset_statuses(self) -> int:
+        """Clear exhaustion state on every entry; returns how many changed.
+
+        Thin wrapper over :meth:`clear_status` kept for the existing callers
+        and the locking contract tests.
+        """
+        return len(self.clear_status())
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         with self._lock:
