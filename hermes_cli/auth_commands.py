@@ -6,6 +6,7 @@ from hermes_cli.cli_output import line_input
 import math
 import sys
 import time
+from datetime import datetime
 from types import SimpleNamespace
 import uuid
 
@@ -15,6 +16,7 @@ from agent.credential_pool import (
     CUSTOM_POOL_PREFIX,
     SOURCE_MANUAL,
     SOURCE_MANUAL_DEVICE_CODE,
+    STATUS_DEAD,
     STATUS_EXHAUSTED,
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
@@ -500,11 +502,66 @@ def auth_remove_command(args) -> None:
         print(line)
 
 
+def _format_cleared_value(field: str, value) -> str:
+    """Render one cleared status field for the reset report (never a token)."""
+    if field.endswith("_at") and isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value)).astimezone().isoformat(timespec="seconds")
+    text = str(value)
+    return text if len(text) <= 72 else text[:69] + "..."
+
+
 def auth_reset_command(args) -> None:
+    """Clear the whole exhaustion/cooldown state of a provider's credentials.
+
+    Lifts ``last_status``, ``last_status_at``'s marker semantics,
+    ``last_error_code`` / ``_reason`` / ``_message`` / ``_reset_at``, and the
+    classified ``failure_reason`` / ``bench_basis`` — the full set that
+    ``hermes auth list`` and the router read. Prints each field it cleared,
+    then verifies the on-disk result instead of trusting the in-memory count:
+    on 2026-09-12 this command reported "Reset status on 1" while its own
+    persist re-adopted the still-binding cooldown from disk.
+    """
     provider = _normalize_provider(getattr(args, "provider", ""))
     pool = load_pool(provider)
-    count = pool.reset_statuses()
-    print(f"Reset status on {count} {provider} credentials")
+    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    cleared = pool.clear_status(message=f"cleared by `hermes auth reset` at {stamp}")
+    if not cleared:
+        print(f"No exhaustion state on {provider} credentials; nothing to reset")
+        return
+    for item in cleared:
+        fields = ", ".join(
+            f"{name}={_format_cleared_value(name, value)}"
+            for name, value in item["cleared"].items()
+        )
+        print(f"  ✓ {item['label']} ({item['id']}): cleared {fields}")
+
+    # Verify from disk. The write goes through the recency merge; a marking
+    # stamped after this reset legitimately wins, and then the honest report
+    # is "did not land", not a count.
+    from hermes_cli.auth import read_credential_pool
+
+    cleared_ids = {item["id"] for item in cleared}
+    still_marked = [
+        entry for entry in read_credential_pool(provider)
+        if isinstance(entry, dict)
+        and entry.get("id") in cleared_ids
+        and entry.get("last_status") in (STATUS_EXHAUSTED, STATUS_DEAD)
+    ]
+    for entry in still_marked:
+        print(
+            f"  ! {entry.get('label') or entry.get('id')}: on-disk state is still "
+            f"{entry.get('last_status')} — a newer marking landed after this reset; "
+            f"check `hermes auth list {provider}` and re-run"
+        )
+    print(f"Reset status on {len(cleared) - len(still_marked)} {provider} credentials")
+    print(
+        "  Note: a running gateway keeps its own copy of the pool and re-reads "
+        "auth.json only when it next loads this provider (provider switch, "
+        "restore to primary, or a new session) — there is no reload signal. "
+        "The reset is timestamped, so a gateway re-save cannot reinstate the "
+        "cooldown; the gateway's current pool may still skip the credential "
+        "until it reloads."
+    )
 
 
 def auth_status_command(args) -> None:
