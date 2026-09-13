@@ -834,6 +834,7 @@ class CredentialPool:
         *,
         persist: bool = True,
         failure_reason: Optional[str] = None,
+        extra_fields: Optional[Dict[str, Any]] = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
@@ -856,6 +857,12 @@ class CredentialPool:
             updated_extra["failure_reason"] = failure_reason
         else:
             updated_extra.pop("failure_reason", None)
+        # Caller-supplied ``extra`` keys (tools/quota_bench.py stamps
+        # ``bench_basis`` on the benches it writes so its un-bench pass can
+        # tell them from reactive markings). Restricted to _EXTRA_KEYS.
+        for key, value in (extra_fields or {}).items():
+            if key in _EXTRA_KEYS and value is not None:
+                updated_extra[key] = value
         # A reactive mark must not erase a cliff we already know about. Most
         # provider errors carry no reset time (Kimi's weekly-limit 403 is the
         # worked example), and writing that None over a bench written by
@@ -2088,6 +2095,7 @@ class CredentialPool:
         api_key_hint: Optional[str] = None,
         credential_id: Optional[str] = None,
         failure_reason: Optional[str] = None,
+        extra_fields: Optional[Dict[str, Any]] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
             entry = None
@@ -2198,7 +2206,11 @@ class CredentialPool:
                 return None
             _label = entry.label or entry.id[:8]
             self._mark_exhausted(
-                entry, status_code, error_context, failure_reason=failure_reason
+                entry,
+                status_code,
+                error_context,
+                failure_reason=failure_reason,
+                extra_fields=extra_fields,
             )
             # A 402/429/401 is an API-key–level failure: the account is out of
             # balance, rate-limited, or its key is rejected.  The same key can
@@ -2224,6 +2236,7 @@ class CredentialPool:
                             error_context,
                             persist=False,
                             failure_reason=failure_reason,
+                            extra_fields=extra_fields,
                         )
                         siblings_marked = True
                 if siblings_marked:
