@@ -1948,21 +1948,23 @@ class LocalEnvironment(BaseEnvironment):
         Always defers to the base class for stripping the marker text from
         ``result["output"]`` so output formatting is identical.
         """
-        # Snapshot pre-existing cwd, defer to base for parsing + marker
-        # stripping, then validate / normalize whatever it assigned.
+        # Parse once, then normalize THIS command's observation. Another
+        # command may update the shared self.cwd before the base call returns.
         prev_cwd = self.cwd
         super()._extract_cwd_from_output(result)
-        if self.cwd != prev_cwd:
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+        if result.get("cwd_observed"):
+            observed_cwd = result["cwd"]
+            normalized = _msys_to_windows_path(observed_cwd) if _IS_WINDOWS else observed_cwd
             if normalized and os.path.isdir(normalized):
                 self.cwd = normalized
+                result["cwd"] = normalized
             else:
-                # Stale / non-existent path — keep previous cwd; _run_bash
-                # will resolve a safe fallback on the next call if needed.
-                # The rollback restores a value this command did not observe,
-                # so it is not attributable to this command's session either.
-                self.cwd = prev_cwd
+                # A stale observation is not attributable to this session.
+                # Do not roll back a newer command's shared compatibility cwd.
+                if self.cwd == observed_cwd:
+                    self.cwd = prev_cwd
                 result.pop("cwd_observed", None)
+                result.pop("cwd", None)
 
     def cleanup(self):
         """Clean up temp files."""

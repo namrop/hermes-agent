@@ -1,5 +1,86 @@
 # Architecture Decision Records
 
+## 2026-09-16: Cron working directories are per execution, not per process — backport
+
+Status: Accepted (supersedes "A redundant `workdir` is not a writer", 2026-09-09)
+
+Provenance: selectively adapted from these upstream commits, with contributor
+credit retained in the backport:
+
+- `b7c59bda54ae6ba6aa020c774a1c0d10a51ae148` — Andrew Bagrin,
+  *fix(cron): isolate per-execution working directories*
+- `62b0235d4524ddcf36894837045616ecd909a3a5` — Yong Chang Yi,
+  *fix(cron): pass workdir to agent pre-run scripts*
+
+Context:
+The fork's cron applied a job's `workdir` by writing the process-global
+`os.environ["TERMINAL_CWD"]` for the length of the agent run. Because that
+variable is shared by every concurrently running job, the write had to be
+serialised: workdir jobs were writers on `_ReadWriteLock`, workdir-less jobs
+were readers, and a waiter that did not get the lock within
+`HERMES_CRON_TIMEOUT + 60 s` (660 s by default) **failed closed** before
+reaching inference. Workdir jobs additionally queued on a single-thread
+`cron-seq` pool.
+
+That design makes legitimate overlap a failure. A workdir job that
+legitimately runs past 660 s takes out every unrelated job that fires
+underneath it — the three lost Chief-of-Staff packets recorded in the
+2026-09-09 entry below are one instance of the class. The redundant-workdir
+downgrade shipped that day narrowed the blast radius (a `workdir` equal to the
+scheduler's own cwd stopped being a writer) but could not help two jobs with
+genuinely *different* workdirs, which is the remaining and larger case.
+
+Decision:
+Bind the workdir to the fire's own identity instead of to the process.
+
+- Each agent execution gets `cron:<job id>:<execution id>` and passes it as
+  `run_conversation(task_id=…)`. `_run_one_job_body` forwards the ledger's
+  `execution_id` into `run_job`, so a run's working directory is traceable
+  back to its ledger row.
+- The workdir is written to the tool layer's per-task cwd record
+  (`tools.terminal_tool.record_session_cwd`), which is what `terminal`, the
+  file tools and `execute_code` already resolve their cwd from, and cleared in
+  `run_job`'s `finally`. No per-job `TERMINAL_CWD` mutation occurs.
+- `_SESSION_CWD` remains the prompt / context-file authority, unchanged:
+  `resolve_context_cwd()` reads it first, so `skip_context_files=False` plus
+  the workdir's `AGENTS.md` / `CLAUDE.md` loading behaves exactly as before.
+- With no process-global cwd override left, `_ReadWriteLock`, the lock
+  bound, the redundant-workdir predicate and the `cron-seq` pool are all
+  deleted. Every due job — and every resumed one — dispatches on the parallel
+  pool, still bounded by `cron.max_parallel_jobs`.
+- A command's observed cwd now rides its own result dict (`result["cwd"]`)
+  rather than being read back off the shared `env.cwd` attribute, which a
+  concurrent command may already have overwritten. Local normalization also
+  consumes that result field, never rereads the shared cwd; deterministic
+  interleaving tests cover valid, missing and stale markers. `env.cwd` is kept
+  as a fallback for third-party backends on the older contract.
+- The agent lane's pre-run script now receives the job's `workdir` as its
+  subprocess cwd (Yong Chang Yi's fix), matching what the `no_agent` lane
+  already did. `_resolve_job_workdir` is the single resolver all three
+  consumers share.
+
+Consequences:
+- The whole timeout class is gone: there is no lock to wait on, so a
+  long-running workdir job can no longer fail an unrelated job before
+  inference. No timer was raised and no workdir setting was removed to get
+  there.
+- Two jobs with different workdirs, and a workdir-less job beside them, now
+  run concurrently and each resolves only its own directory through
+  `terminal` / file / `execute_code`.
+- A delegated child inherits the parent's workdir through the existing
+  `record_session_cwd(child, get_session_cwd(parent))` seed, which previously
+  depended on the ambient env var.
+- Fork adaptation: project-skill root discovery and subdirectory hints now
+  resolve the session cwd; delegated workspace hints prefer the parent's task
+  cwd, then session cwd; destructive-command checkpoints use the same explicit
+  workdir / task-record precedence as command execution. Leaving these legacy
+  readers on the ambient environment would silently point them at a different
+  directory after the global override disappeared. Behavioral regressions cover
+  each consumer (five failing cases before the adaptation, all green after).
+- Fork-specific behaviour is untouched: `_resume_jobs` dispatch, execution /
+  fire claims and their cleanup, the bounded `SessionDB`, interruption
+  attribution, per-job `max_turns`, and the cron toolset messaging exception.
+
 ## 2026-09-09: Cron resume after a gateway restart — per-job policy, one rerun, the schedule's own window
 
 Status: Accepted
@@ -64,7 +145,10 @@ Consequences:
 
 ## 2026-09-09: A redundant `workdir` is not a writer — the TERMINAL_CWD lock downgrade
 
-Status: Accepted
+Status: Superseded by "Cron working directories are per execution, not per
+process" (2026-09-16). The lock, its bound and `_workdir_override_is_noop` no
+longer exist; the incident record below is retained as the reproduction that
+motivated the full fix.
 
 Context:
 Cron serialises the process-global `os.environ["TERMINAL_CWD"]` override with a

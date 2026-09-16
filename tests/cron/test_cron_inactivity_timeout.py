@@ -46,7 +46,7 @@ class FakeAgent:
         self._interrupted = True
         self._interrupt_msg = msg
 
-    def run_conversation(self, prompt):
+    def run_conversation(self, prompt, *, task_id=None):
         """Simulate a quick agent run that finishes immediately."""
         return {"final_response": "Done", "messages": []}
 
@@ -73,7 +73,7 @@ class SlowFakeAgent(FakeAgent):
                 summary["seconds_since_activity"] = 0.0
         return summary
 
-    def run_conversation(self, prompt):
+    def run_conversation(self, prompt, *, task_id=None):
         self._start_time = time.time()
         time.sleep(self._run_duration)
         return {"final_response": "Completed after work", "messages": []}
@@ -193,7 +193,7 @@ class TestInactivityTimeout:
         The polling loop will eventually complete when the task finishes.
         """
         class BareAgent:
-            def run_conversation(self, prompt):
+            def run_conversation(self, prompt, *, task_id=None):
                 return {"final_response": "no activity tracker", "messages": []}
 
         agent = BareAgent()

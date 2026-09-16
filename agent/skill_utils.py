@@ -664,18 +664,18 @@ def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
     Returns None when cwd is not inside a git checkout. ``.git`` may be a dir
     (normal clone) or a file (worktree/submodule) — both count.
 
-    When *start* is not given, the surface's working directory wins over the
-    process cwd: ``TERMINAL_CWD`` is the same per-surface workdir the terminal
-    tool and cron jobs use (a cron job sets it from its per-job ``workdir``
-    without chdir'ing the scheduler process). This is what lets
+    When *start* is not given, the session's working directory wins over the
+    process default. Cron pins its workdir in the session context rather than
+    changing ``TERMINAL_CWD`` for every job in the gateway. This is what lets
     non-interactive surfaces inherit a prior interactive trust decision by
     project identity — and a surface with no workdir in a trusted repo simply
     resolves no project and loads nothing (#48975).
     """
     try:
         if start is None:
-            env_cwd = os.environ.get("TERMINAL_CWD")
-            start = Path(env_cwd) if env_cwd else Path.cwd()
+            from agent.runtime_cwd import resolve_agent_cwd
+
+            start = resolve_agent_cwd()
         cur = Path(start).resolve()
     except OSError:
         return None

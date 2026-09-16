@@ -1057,8 +1057,15 @@ def _begin_tool_execution(
         try:
             command = function_args.get("command", "")
             if _is_destructive_command(command):
-                cwd = function_args.get("workdir") or os.getenv(
-                    "TERMINAL_CWD", os.getcwd()
+                from agent.runtime_cwd import resolve_agent_cwd
+                from tools.terminal_tool import _resolve_command_cwd
+
+                # Match the command's task-local cwd, including earlier cd
+                # commands; the gateway environment belongs to no one job.
+                cwd = _resolve_command_cwd(
+                    workdir=function_args.get("workdir"),
+                    default_cwd=str(resolve_agent_cwd()),
+                    session_key=effective_task_id,
                 )
                 agent._checkpoint_mgr.ensure_checkpoint(
                     cwd, f"before terminal: {command[:60]}"
