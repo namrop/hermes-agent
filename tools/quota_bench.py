@@ -27,6 +27,19 @@ Keeper requirements (2026-08-31):
   * fail open: if every chain provider is over threshold, ignore the signal
   * opencode-go participates despite being an ``estimated`` source
 
+Keeper amendment (2026-09-16): fail open now *releases the reserve* rather
+than merely declining to add to it. Benching at 90% holds back the last tenth
+of every weekly quota; that headroom is a reserve, and a reserve exists to be
+spent. So when every assessable chain provider is over threshold, this run
+lifts every bench it wrote on the chain instead of leaving the router with a
+chain of cooldowns it cannot route around. Before this, fail open only set
+``benched = []`` — a chain benched one provider at a time across successive
+runs still ended up fully benched, because the rule was never evaluated on a
+run that had a survivor. Released state is stable: the next run sees the same
+exhaustion, benches nothing, and finds nothing to lift. The reserve is
+re-established on its own, the moment one provider's window rolls back under
+threshold and fail open goes false again.
+
 Why this can run against a live gateway: ``write_credential_pool`` takes the
 auth.lock file lock, re-reads the on-disk pool under it, and merges status
 fields by ``last_status_at`` recency, so a concurrent writer cannot erase a
@@ -473,6 +486,7 @@ def evaluate_unbench(
     *,
     now: float,
     rebench: Optional[set] = None,
+    fail_open: bool = False,
 ) -> List[Dict[str, Any]]:
     """Decide, per benched entry, whether the bench still holds. Pure.
 
@@ -484,6 +498,17 @@ def evaluate_unbench(
     never to a stale bench and never to a blind un-bench — or when the
     provider is in *rebench* (it is being benched again this run, which
     overwrites the cliff; lifting first would only churn).
+
+    *fail_open* turns every remaining ``"keep"`` into a lift: the whole
+    assessable chain is spent, so the reserve those benches were holding back
+    is exactly what the router now needs. It is applied after the normal
+    decision so a lift that already had a specific reason keeps it; only the
+    keeps are overridden, and each one records what it overrode. This is the
+    one case that lifts a no-signal bench, and it is deliberate — with every
+    measurable provider over threshold, an unmeasurable one held down by a
+    cooldown we wrote is capacity withheld for no reason we can still justify.
+    Reactive 429/403 markings are still never touched; ``is_bench_entry``
+    gates the loop.
     """
     rebench = rebench or set()
     rows: List[Dict[str, Any]] = []
@@ -527,6 +552,14 @@ def evaluate_unbench(
                 )
             else:
                 row["reason"] = "still over threshold in the same window"
+            if fail_open and row["action"] == "keep":
+                # Whatever would have held this bench, the chain has nothing
+                # left to route to. Lift it and say what we overrode.
+                row["action"] = "unbench"
+                row["reason"] = (
+                    "fail open: every assessable chain provider is over "
+                    f"threshold — releasing the reserve (was: {row['reason']})"
+                )
             rows.append(row)
     return rows
 
@@ -667,6 +700,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         read_pool_status(args.hermes_home),
         now=now,
         rebench={r["pool_provider"] for r in result["benched"]},
+        fail_open=result["fail_open"],
     )
     to_unbench = [r for r in unbench_rows if r["action"] == "unbench"]
 
@@ -710,7 +744,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if result["fail_open"]:
         assessed = ", ".join(result["assessable"])
         print(f"FAIL OPEN: every assessable provider is over threshold ({assessed}) "
-              "— signal ignored, nothing benched.")
+              "— nothing benched, and the reserve is released: every bench this "
+              "script wrote on the chain is lifted so the router can spend the "
+              "headroom the 90% cliff was holding back.")
     elif not result["benched"]:
         print("No provider is over threshold. Nothing to bench.")
     else:

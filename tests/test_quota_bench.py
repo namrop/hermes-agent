@@ -257,6 +257,7 @@ def unbench(chain, observations, pool_status, **kw):
     rows = qb.evaluate_unbench(
         result["assessments"], pool_status, now=NOW,
         rebench={r["pool_provider"] for r in result["benched"]},
+        fail_open=result["fail_open"],
     )
     return result, rows
 
@@ -335,16 +336,11 @@ def test_no_fresh_signal_keeps_the_bench():
     assert "stale" in rows[0]["reason"]
 
 
-def test_still_over_in_the_same_window_is_kept():
-    cliff = NOW + 3600
-    _, rows = unbench(
-        ["zai", "openai-codex"],
-        {"z-ai": obs("z-ai", used=95, limit=100, resets_at=iso(cliff + 5)),
-         "openai": obs("openai", used=95, limit=100)},   # fail open -> no rebench
-        {"zai": [bench_entry("zai", cliff=cliff)]},
-    )
-    assert rows[0]["action"] == "keep"
-    assert "same window" in rows[0]["reason"]
+# test_still_over_in_the_same_window_is_kept was removed by the 2026-09-16
+# keeper amendment. Its scenario is unreachable as a keep: an over-threshold
+# provider is always in `benched` unless fail open, and under fail open the
+# reserve is now released. The reason string it guarded is asserted as the
+# "was:" clause of test_fail_open_lifts_a_bench_that_would_otherwise_be_kept.
 
 
 def test_reactive_marking_is_never_lifted():
@@ -507,3 +503,104 @@ def test_main_json_includes_unbench_rows(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["dry_run"] is True
     assert [r["action"] for r in payload["unbench"]] == ["unbench"]
+
+
+# --- Keeper amendment 2026-09-16: fail open releases the reserve -------------
+
+
+def test_fail_open_lifts_a_bench_that_would_otherwise_be_kept():
+    """The 09-16 shape: chain fully spent, bench still inside its own window."""
+    cliff = NOW + 3600
+    result, rows = unbench(
+        ["zai", "openai-codex"],
+        {"z-ai": obs("z-ai", used=95, limit=100, resets_at=iso(cliff + 5)),
+         "openai": obs("openai", used=95, limit=100)},
+        {"zai": [bench_entry("zai", cliff=cliff)]},
+    )
+    assert result["fail_open"] is True
+    assert rows[0]["action"] == "unbench"
+    assert "releasing the reserve" in rows[0]["reason"]
+    assert "was: still over threshold in the same window" in rows[0]["reason"]
+
+
+def test_fail_open_lifts_every_bench_on_the_chain():
+    cliff = NOW + 3600
+    result, rows = unbench(
+        ["opencode-go", "kimi-coding", "zai", "openai-codex"],
+        {"opencode-go": obs("opencode-go", used=100, limit=100),
+         "kimi-coding": obs("kimi-coding", used=92, limit=100),
+         "z-ai": obs("z-ai", used=95, limit=100),
+         "openai": obs("openai", used=100, limit=100)},
+        {"opencode-go": [bench_entry("opencode-go", cliff=cliff)],
+         "kimi-coding": [bench_entry("kimi-coding", cliff=cliff)],
+         "openai-codex": [bench_entry("openai-codex", cliff=cliff)]},
+        provider_thresholds={"opencode-go": 100.0},
+    )
+    assert result["fail_open"] is True
+    assert result["benched"] == []
+    assert {r["pool_provider"] for r in rows if r["action"] == "unbench"} == {
+        "opencode-go", "kimi-coding", "openai-codex"}
+
+
+def test_fail_open_lifts_a_no_signal_bench():
+    """The one case that lifts without a fresh reading — deliberate."""
+    result, rows = unbench(
+        ["zai", "openai-codex"],
+        {"z-ai": obs("z-ai", used=1, limit=100, age_seconds=99999),
+         "openai": obs("openai", used=95, limit=100)},
+        {"zai": [bench_entry("zai", cliff=NOW + 3600)]},
+        max_age_seconds=3600,
+    )
+    assert result["fail_open"] is True
+    assert rows[0]["action"] == "unbench"
+    assert "was: no fresh signal" in rows[0]["reason"]
+
+
+def test_fail_open_keeps_the_specific_reason_when_there_was_one():
+    """A lift that already had a reason is not relabelled by the override."""
+    old_cliff, new_cliff = NOW + 3600, NOW + 7 * 86400
+    result, rows = unbench(
+        ["zai", "openai-codex"],
+        {"z-ai": obs("z-ai", used=99, limit=100),
+         "openai": obs("openai", used=95, limit=100, resets_at=iso(new_cliff))},
+        {"openai-codex": [bench_entry("openai-codex", cliff=old_cliff)]},
+    )
+    assert result["fail_open"] is True
+    assert rows[0]["reason"].startswith("window rolled")
+
+
+def test_fail_open_never_lifts_a_reactive_marking():
+    result, rows = unbench(
+        ["zai", "openai-codex"],
+        {"z-ai": obs("z-ai", used=95, limit=100),
+         "openai": obs("openai", used=95, limit=100)},
+        {"zai": [reactive_entry("zai", cliff=NOW + 3600)]},
+    )
+    assert result["fail_open"] is True
+    assert rows == []
+
+
+def test_released_state_is_stable_on_the_next_run():
+    """Once released, the next fail-open run benches nothing and lifts nothing."""
+    result, rows = unbench(
+        ["zai", "openai-codex"],
+        {"z-ai": obs("z-ai", used=95, limit=100),
+         "openai": obs("openai", used=95, limit=100)},
+        {},   # nothing benched any more
+    )
+    assert result["fail_open"] is True
+    assert result["benched"] == []
+    assert rows == []
+
+
+def test_reserve_is_re_established_once_one_provider_comes_back():
+    """Survivor returns -> fail open goes false -> the spent ones bench again."""
+    result, rows = unbench(
+        ["zai", "openai-codex"],
+        {"z-ai": obs("z-ai", used=5, limit=100),
+         "openai": obs("openai", used=95, limit=100)},
+        {},
+    )
+    assert result["fail_open"] is False
+    assert [b["pool_provider"] for b in result["benched"]] == ["openai-codex"]
+    assert rows == []
