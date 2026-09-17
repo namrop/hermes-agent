@@ -1281,7 +1281,60 @@ providers:
     transport: anthropic_messages  # for Anthropic-compatible proxies
 ```
 
-Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key` or `key_cmd` (see below), `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key` or `key_cmd` (see below), `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `session_id_header`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+
+#### Opt-in conversation session header (`session_id_header`)
+
+Some proxies need a stable conversation identifier to resume their upstream tool
+loop. Set `session_id_header` to the header name that **that provider** expects;
+Hermes supplies the value on each main-agent model request. The default is off.
+This does not change any other provider's behavior.
+
+For Meridian's passthrough adapter, add the setting to its existing entry:
+
+```yaml
+custom_providers:
+  - name: meridian-yugen
+    base_url: http://127.0.0.1:3457
+    api_mode: anthropic_messages
+    auth: none
+    model: claude-opus-5
+    session_id_header: x-litellm-session-id
+    extra_headers:
+      x-meridian-agent: passthrough
+      x-meridian-profile: yugen
+```
+
+The keyed schema supports the same option:
+
+```yaml
+providers:
+  meridian-yugen:
+    api: http://127.0.0.1:3457
+    transport: anthropic_messages
+    auth: none
+    default_model: claude-opus-5
+    session_id_header: x-litellm-session-id
+    extra_headers:
+      x-meridian-agent: passthrough
+      x-meridian-profile: yugen
+```
+
+- Omit it, set `false`, or use an empty string to disable it. A boolean `true`
+  does not select a header name.
+- The generated value is an opaque hash of the compression-lineage session
+  scope. It stays stable across turns, tool rounds, retries, resume, and context
+  compression; new sessions, branches, delegated children, and independent
+  cron executions get separate values.
+- The opt-in matches both provider identity and endpoint. Switching or falling
+  back to a different provider/route does not carry the header along.
+- Existing transport headers are preserved; no identifier is added to prompts
+  or message bodies. Auxiliary calls (such as compression and title generation)
+  are not assigned the main conversation's upstream session.
+- Do **not** put a fixed session value in `extra_headers`: it would combine
+  unrelated conversations. The option names the header, not its value.
+- Selection is cached for the current agent/route. After changing the option,
+  start a fresh agent/session or restart the gateway to reload it reliably.
 
 #### Command-minted credentials (`key_cmd`)
 

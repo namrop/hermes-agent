@@ -1,5 +1,32 @@
 # Architecture Decision Records
 
+## 2026-09-17: Opt-in provider session affinity for stateful proxies
+
+Status: Accepted — fork implementation; live activation is a separate deployment.
+
+Origin: Luis requested the Meridian replay fix in the fork, scoped to that
+provider or controlled per provider in config (Discord message
+`1550065709600739369`).
+
+Decision:
+- `session_id_header` names an optional header on a `custom_providers` entry or
+  keyed `providers` entry. Default off; no vendor auto-detection or global tag.
+- Merge the generated header after the transport-specific request builder so
+  Anthropic beta headers and other transport fields survive. Match provider
+  identity **and** normalized endpoint, not just a shared proxy URL.
+- Hash the agent's compression-lineage scope: stable for continuation/resume,
+  distinct for fresh conversations, branches, delegated children, and separate
+  cron executions. Cache-shard scopes that merge multiple cron fires are not
+  stateful-session identities.
+- Do not tag auxiliary calls with the main session: their histories differ.
+- Do not change prompts, history, cache-control breakpoints, or context limits.
+
+The concrete consumer is Meridian passthrough's `x-litellm-session-id`.
+The real fork request-builder/Anthropic streaming smoke completed two tool
+rounds and a final response; Meridian reported `new`, `continuation`,
+`continuation`, rather than headerless tool-result replay. The short smoke
+proves continuation, not a measured subscription-quota savings percentage.
+
 ## 2026-09-16: Cron working directories are per execution, not per process — backport
 
 Status: Accepted (supersedes "A redundant `workdir` is not a writer", 2026-09-09)

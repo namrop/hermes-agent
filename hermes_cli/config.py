@@ -1373,6 +1373,7 @@ def _normalize_custom_provider_entry(
         "defaultModel": "default_model",
         "contextLength": "context_length",
         "rateLimitDelay": "rate_limit_delay",
+        "sessionIdHeader": "session_id_header",
     }
     # api_key_env is a documented snake_case alias for key_env (see
     # website/docs/guides/azure-foundry.md).  Normalize it up front so the
@@ -1392,6 +1393,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
+        "session_id_header",
         "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1554,6 +1556,16 @@ def _normalize_custom_provider_entry(
     if normalized_headers:
         normalized["extra_headers"] = normalized_headers
 
+    # Opt-in per-conversation session affinity (see
+    # ``agent/provider_session_affinity.py``). Absent, ``false`` or empty
+    # means this provider gets no new header at all — only a legal header
+    # NAME turns it on, and only for this provider's own route.
+    session_id_header = normalize_session_id_header(
+        entry.get("session_id_header"), provider_key=provider_key
+    )
+    if session_id_header:
+        normalized["session_id_header"] = session_id_header
+
     ssl_ca_cert = entry.get("ssl_ca_cert")
     if isinstance(ssl_ca_cert, str) and ssl_ca_cert.strip():
         normalized["ssl_ca_cert"] = ssl_ca_cert.strip()
@@ -1593,6 +1605,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "session_id_header",
         "ssl_ca_cert",
         "ssl_verify",
     ):
@@ -1748,6 +1761,115 @@ def normalize_extra_headers(extra_headers: Any) -> Dict[str, str]:
     if not isinstance(extra_headers, dict) or not extra_headers:
         return {}
     return {str(k): str(v) for k, v in extra_headers.items() if v is not None}
+
+
+# RFC 9110 field-name token characters. A value that is not a legal header
+# name would raise at request time inside httpx, turning a config typo into a
+# dead provider — so it is rejected during normalization instead.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def normalize_session_id_header(value: Any, *, provider_key: str = "") -> Optional[str]:
+    """Normalize a provider's ``session_id_header`` opt-in, or ``None``.
+
+    The feature is off unless the provider names exactly one header: absent,
+    ``false``, ``true``, empty/whitespace and non-string values all mean "send
+    no new header". A declared name is trimmed and lower-cased (HTTP field
+    names are case-insensitive; lower-case is what goes on the wire) and must
+    be a legal header token — an illegal one is dropped with a warning rather
+    than failing every request later.
+    """
+    if not isinstance(value, str):
+        # ``true``/``1`` are not header names. Nothing but a name enables it.
+        if value not in (None, False):
+            _warn_once_per_provider(
+                provider_key, f"session_id_header_type:{type(value).__name__}",
+                "providers.%s: session_id_header must be a header name string "
+                "(got %s) — session affinity stays off",
+                provider_key or "?", type(value).__name__,
+            )
+        return None
+    name = value.strip().lower()
+    if not name:
+        return None
+    if not _HEADER_NAME_RE.match(name):
+        _warn_once_per_provider(
+            provider_key, f"session_id_header_name:{name}",
+            "providers.%s: session_id_header '%s' is not a valid HTTP header "
+            "name — session affinity stays off",
+            provider_key or "?", value.strip(),
+        )
+        return None
+    return name
+
+
+def get_custom_provider_session_id_header(
+    provider: Optional[str],
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return the ``session_id_header`` opted into by *provider* on *base_url*.
+
+    Scoped deliberately tighter than :func:`get_custom_provider_extra_headers`,
+    which matches on the route alone. Session affinity is a property of ONE
+    configured provider: two entries can legitimately share a base_url (a
+    plain passthrough and a session-pinned profile on the same local proxy),
+    and the opt-in must not leak from one to the other, nor survive a
+    fallback/switch onto a different route.
+
+    *provider* is the runtime identity — ``custom:<key>``, a provider name, or
+    the bare ``custom`` used when no key was requested. A bare/empty identity
+    resolves by route only, and then only when every entry on that route
+    agrees; a route whose entries disagree fails closed.
+
+    Returns ``None`` whenever nothing opted in.
+    """
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            custom_providers = []
+    if not base_url or not isinstance(custom_providers, list):
+        return None
+
+    target_url = normalize_route_base_url(base_url)
+    if not target_url:
+        return None
+
+    identity = str(provider or "").strip().lower()
+    if identity == "custom":
+        identity = ""
+
+    on_route = [
+        entry
+        for entry in custom_providers
+        if isinstance(entry, dict)
+        and normalize_route_base_url(entry.get("base_url")) == target_url
+    ]
+    if not on_route:
+        return None
+
+    if identity:
+        from hermes_cli.providers import custom_provider_aliases
+
+        matched = [
+            entry
+            for entry in on_route
+            if identity
+            in custom_provider_aliases(
+                str(entry.get("name", "") or ""),
+                str(entry.get("provider_key", "") or ""),
+            )
+        ]
+        if not matched:
+            return None
+        return matched[0].get("session_id_header") or None
+
+    answers = {entry.get("session_id_header") or None for entry in on_route}
+    if len(answers) != 1:
+        return None
+    return answers.pop()
 
 
 def get_custom_provider_extra_headers(

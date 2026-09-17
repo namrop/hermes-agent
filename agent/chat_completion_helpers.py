@@ -1825,11 +1825,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode.
 
-    Wraps the per-api_mode builder so the OpenCode ``x-opencode-session``
-    affinity header rides on every OpenCode request regardless of transport
-    (chat_completions / codex_responses / anthropic_messages all route
-    OpenCode models). The relay rejects header-less requests with
-    ``400 MissingSessionID``. No-op for every other provider.
+    Wraps the per-api_mode builder so conversation-affinity headers ride on
+    every request regardless of transport (chat_completions / codex_responses
+    / anthropic_messages):
+
+    * OpenCode's ``x-opencode-session`` — always, for OpenCode targets. The
+      relay rejects header-less requests with ``400 MissingSessionID``.
+    * A provider's opted-in ``session_id_header`` (``providers.<name>.
+      session_id_header``) — off unless that provider named a header. See
+      ``agent/provider_session_affinity.py``.
 
     Merging here — *after* the per-mode builder — is load-bearing: the
     Anthropic transport assigns ``extra_headers`` outright for
@@ -1840,17 +1844,18 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         is_opencode_target,
         merge_opencode_session_headers,
     )
+    from agent.provider_session_affinity import merge_agent_session_affinity
 
     kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
     provider = getattr(agent, "provider", None)
     base_url = str(getattr(agent, "base_url", "") or "")
-    if not is_opencode_target(provider, base_url):
-        return kwargs
-    # Prefer the rotation-stable logical scope so the header survives a
-    # compression rotation, exactly like prompt_cache_key; the auxiliary
-    # path resolves the same scope from the runtime-main context.
-    scope = _prompt_cache_scope_for_agent(agent) or getattr(agent, "session_id", None)
-    return merge_opencode_session_headers(kwargs, provider, base_url, scope)
+    if is_opencode_target(provider, base_url):
+        # Prefer the rotation-stable logical scope so the header survives a
+        # compression rotation, exactly like prompt_cache_key; the auxiliary
+        # path resolves the same scope from the runtime-main context.
+        scope = _prompt_cache_scope_for_agent(agent) or getattr(agent, "session_id", None)
+        merge_opencode_session_headers(kwargs, provider, base_url, scope)
+    return merge_agent_session_affinity(kwargs, agent)
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
