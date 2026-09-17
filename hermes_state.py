@@ -5666,6 +5666,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session id rewritten — so a mid-compression append survives rotation
         instead of stranding in the closed parent.
 
+        The child inherits the parent's ``compaction_generation`` PLUS ONE, in
+        the same transaction (see :meth:`get_compaction_generation`): rotation
+        replaces the conversation's history exactly like in-place compaction
+        does, it just files the result under a new physical id.
+
         *watermark_ceiling* bounds the clone from above: the rotation path
         flushes its OWN un-persisted input transcript to the parent right
         before publishing (#47202), and those rows are already represented in
@@ -5691,7 +5696,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                          thread_id, display_name, origin_json, profile_name,
+                          compaction_generation
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
@@ -5709,8 +5715,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    system_prompt_hash,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   thread_id, display_name, origin_json, started_at,
+                   compaction_generation
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -5735,6 +5742,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     parent["display_name"],
                     parent["origin_json"],
                     time.time(),
+                    # The continuation is one committed rewrite further along
+                    # the SAME logical conversation, so the counter carries
+                    # over and advances rather than restarting at 0 (which
+                    # would make a rotated child indistinguishable from its
+                    # own pre-compaction root — see
+                    # :meth:`get_compaction_generation`).
+                    int(parent["compaction_generation"] or 0) + 1,
                 ),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
@@ -8747,7 +8761,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # declarative reconciliation are included automatically instead of
     # silently dropping out of list rows.
     _SESSION_COMPACT_EXCLUDED = frozenset(
-        {"system_prompt", "system_prompt_hash", "git_metadata_generation"}
+        {
+            "system_prompt",
+            "system_prompt_hash",
+            "git_metadata_generation",
+            "compaction_generation",
+        }
     )
     _session_compact_cols_sql: Optional[str] = None
 
@@ -10129,6 +10148,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         what the live load returns. ``model_config_patch`` is merged into the
         session's JSON config in the same transaction; a ``None`` value
         removes that key. Returns the new active count.
+
+        ``compaction_generation`` advances by exactly one in the SAME
+        transaction (see :meth:`get_compaction_generation`): this is a
+        REWRITE of the live transcript, not an append, and consumers keyed on
+        "the history a replaying proxy already holds" must be able to tell the
+        two apart. A commit that raises rolls the counter back with the rows.
         """
 
         def _do(conn):
@@ -10216,15 +10241,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
+            # compaction_generation rides along in both branches: the counter
+            # must advance with the rewrite or not at all.
             if model_config_patch is None:
                 conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "compaction_generation = COALESCE(compaction_generation, 0) + 1 "
+                    "WHERE id = ?",
                     (inserted, tool_calls_total, session_id),
                 )
             else:
                 conn.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "model_config = ? WHERE id = ?",
+                    "model_config = ?, "
+                    "compaction_generation = COALESCE(compaction_generation, 0) + 1 "
+                    "WHERE id = ?",
                     (inserted, tool_calls_total, patched_model_config, session_id),
                 )
             return inserted
@@ -11421,6 +11452,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         parent = self.get_session(parent_id)
         return bool(parent and parent.get("end_reason") == "compression")
+
+    def get_compaction_generation(self, session_id: str) -> int:
+        """How many COMMITTED context rewrites this transcript has been through.
+
+        0 for a session that has never been compacted (and for an unknown id,
+        an unreadable row, or a store that predates the column — the migration
+        default). Every :meth:`archive_and_compact` adds one to the session's
+        own count; :meth:`publish_compression_child` carries the count onto the
+        continuation and adds one there, so the number keeps climbing along a
+        rotated lineage instead of resetting at each new physical id.
+
+        Paired with the compression-lineage ROOT (``agent.prompt_cache_scope``)
+        this identifies "this conversation, as its history stands right now" —
+        which is what a proxy that resumes and replays an upstream transcript
+        keys on. The root alone is deliberately NOT enough: it is stable across
+        a rewrite by design, and reusing it after one makes the proxy resume a
+        transcript whose prefix Hermes has already thrown away.
+
+        One indexed primary-key read. Deliberately NOT memoized: an in-place
+        compaction committed by a sibling agent on the same session (gateway
+        hygiene, a proactive prune) or by another process must be visible on
+        the very next request, and a cache keyed on the session id cannot see
+        those writes. One row read per outbound API call is nothing next to
+        the request it rides on — unlike the recursive lineage walk that
+        ``prompt_cache_scope`` memoizes.
+        """
+        if not session_id:
+            return 0
+        try:
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT compaction_generation FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            logger.debug(
+                "compaction generation read failed for %s", session_id, exc_info=True
+            )
+            return 0
+        if row is None:
+            return 0
+        try:
+            return int(row[0] or 0)
+        except (TypeError, ValueError, IndexError):
+            return 0
 
     def get_compression_lineage(self, session_id: str) -> List[str]:
         """Return compression ancestors through tip in chronological order."""

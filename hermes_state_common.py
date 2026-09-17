@@ -307,6 +307,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
     compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    -- Count of COMMITTED context rewrites this session's transcript has been
+    -- through (in-place compaction on this id, plus every rotation ancestor —
+    -- a published child inherits its parent's count + 1). Advanced only inside
+    -- the transaction that publishes the compacted transcript, so it can never
+    -- disagree with the rows on disk. Consumers key conversation-affinity
+    -- identity on it (agent/compaction_generation.py); existing installs
+    -- migrate to 0, which preserves their current identity.
+    compaction_generation INTEGER NOT NULL DEFAULT 0,
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,

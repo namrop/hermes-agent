@@ -18,23 +18,42 @@ asks for it by name.
 
 **The value.** Derived from the agent's rotation-stable prompt-cache scope
 (``agent.prompt_cache_scope``) — the compression-lineage ROOT of the physical
-session id — then hashed:
+session id — AND that conversation's durable compaction generation
+(``agent.compaction_generation``), then hashed:
 
-    hermes-<first 32 hex of sha256(scope)>
+    hermes-<first 32 hex of sha256(scope)>              # generation 0
+    hermes-<first 32 hex of sha256(scope + generation)> # after N rewrites
 
 Consequences of that choice, each one load-bearing:
 
-* stable across the turns and tool rounds of a conversation, across retries,
-  across agent re-instantiation/resume, and across context-compression
-  session rotation (the lineage root does not move when a rotation mints a new
-  physical id);
+* stable across ordinary turns, tool rounds, retries and agent
+  re-instantiation/resume within one committed context generation; the lineage
+  root stays stable on compression rotation, but the generation advances;
+* it moves exactly once per COMMITTED context rewrite, and only then. The
+  deployed Meridian passthrough resumes the upstream transcript it already
+  holds for a value and forwards only the suffix-overlap delta — right for a
+  tool round, wrong after a compaction, because the compacted prefix never
+  reaches it and the upstream history keeps growing the turns Hermes just
+  summarized away (observed: 208k/168k local replaying as 986k/995k upstream).
+  A new value makes the proxy start a fresh upstream session from the complete
+  compacted history. A failed, refused, no-op, cancelled or lease-lost
+  compaction advances nothing, so a doomed retry loop cannot churn lanes;
+* generation 0 hashes the scope alone, exactly as before this was introduced:
+  deploying it does not invalidate live conversations that were never
+  compacted;
 * distinct for ``/new``, ``/branch`` forks, delegate subagents, independent
   cron fires and unrelated sessions, because each resolved scope is hashed
   directly rather than normalized as a prompt-cache key;
 * opaque — the provider never sees a Hermes session id, a platform chat id or
   a user id. The digest is unsalted by design: resume in a *new process* must
   land on the same upstream session, so a per-process salt would break the one
-  property the header exists for.
+  property the header exists for. The generation is durable for the same
+  reason (``sessions.compaction_generation``): a restart must not re-derive an
+  older value.
+
+The prompt-cache scope itself is left ALONE — it is the Codex/caching
+identity, it is supposed to survive a rewrite, and moving it would break
+prompt caching to fix a routing problem.
 
 NOT ``portal_tags.get_conversation_context()``, which the OpenCode affinity
 header prefers: that is the Portal-attribution walk, which follows
@@ -74,18 +93,32 @@ VALUE_PREFIX = "hermes-"
 _MEMO_ATTR = "_provider_session_affinity_memo"
 
 
-def session_affinity_value(scope: Optional[str]) -> str:
-    """Return the opaque affinity id for a logical conversation *scope*.
+def session_affinity_value(scope: Optional[str], generation: Any = 0) -> str:
+    """Return the opaque affinity id for a conversation *scope* at *generation*.
 
     Empty scope → empty string (the caller then sends no header). Hash the
     resolved scope directly so independent cron fires remain independent.
-    Compression rotation stays stable because the agent-level resolver supplies
-    the lineage root before calling this function.
+    Compression rotation keeps the same scope because the agent-level resolver
+    supplies the lineage root before calling this function; what distinguishes
+    the conversation before and after a committed context rewrite is
+    *generation*, mixed into the digest above 0.
+
+    Generation 0 hashes the bare scope, so the value predates and survives the
+    introduction of the generation. The separator is a unit separator, which
+    cannot occur in a session id, so no (scope, generation) pair can collide
+    with another pair's material.
     """
     normalized = str(scope or "")
     if not normalized:
         return ""
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    try:
+        counted = int(generation or 0)
+    except (TypeError, ValueError):
+        counted = 0
+    material = (
+        normalized if counted <= 0 else f"{normalized}\x1fcompaction:{counted}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return f"{VALUE_PREFIX}{digest[:32]}"
 
 
@@ -98,7 +131,18 @@ def session_affinity_value_for_agent(agent: Any) -> str:
         scope = resolve_prompt_cache_scope_safe(agent)
     except Exception:
         logger.debug("session-affinity scope resolution failed", exc_info=True)
-    return session_affinity_value(scope or getattr(agent, "session_id", None))
+    generation = 0
+    try:
+        from agent.compaction_generation import resolve_compaction_generation
+
+        generation = resolve_compaction_generation(agent)
+    except Exception:
+        # Degrade to the generation-zero value rather than dropping the header:
+        # a stale value still routes the conversation to one upstream session.
+        logger.debug("compaction generation resolution failed", exc_info=True)
+    return session_affinity_value(
+        scope or getattr(agent, "session_id", None), generation
+    )
 
 
 def resolve_session_id_header(

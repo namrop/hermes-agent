@@ -1,5 +1,42 @@
 # Architecture Decision Records
 
+## 2026-09-17: Stateful provider affinity rotates on committed compaction
+
+Status: Accepted — source correction; deployment explicitly held.
+
+Origin: Luis approved the Hermes-only correction and instructed
+"hold before deploying" (Discord message `1550247220924907631`). This corrects the
+compression-stability assumption in the earlier affinity decision below.
+
+The initial implementation fixed headerless tool-loop replay, but a real
+Shofar compaction exposed a different contract: Meridian 1.71.1's
+`lineage=compaction` resumes/forks the old upstream transcript and sends only
+new messages after suffix overlap. Hermes had committed a shorter local
+history; the provider still processed roughly 986k–999k input tokens.
+
+Decision:
+- Stateful upstream identity is conversation scope **plus committed context
+  generation**, not prompt-cache scope alone. Keep normal tool rounds and
+  retries stable, but advance after a real compaction commits.
+- Persist the generation atomically with compacted transcript publication,
+  for both in-place compaction and compression-child rotation. Failed,
+  cancelled, lease-lost, rejected, and no-op attempts must not advance it.
+- Read the durable generation when building the opted-in request so a fresh
+  agent or a cached agent after gateway hygiene uses the same committed state.
+  Retain the last observed generation for that exact store/session pair as a
+  monotonic floor: a transient read failure must not reconnect to generation
+  zero. Continue reading on every request so later commits remain visible.
+- Preserve existing generation-zero header values and ordinary prompt-cache
+  scope semantics. Do not change context limits, fallback routing, or auxiliary
+  session attribution.
+- Reuse the existing `session_id_header` option and header name. Meridian
+  requires no new header, patch, or configuration change.
+
+Acceptance must exercise a committed compaction through real session
+persistence and verify the next upstream context shrinks, followed by ordinary
+continuation. A short `new → continuation → continuation` smoke alone does not
+cover context replacement.
+
 ## 2026-09-17: Opt-in provider session affinity for stateful proxies
 
 Status: Accepted — fork implementation; live activation is a separate deployment.

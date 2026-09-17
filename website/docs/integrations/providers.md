@@ -1322,10 +1322,21 @@ providers:
 
 - Omit it, set `false`, or use an empty string to disable it. A boolean `true`
   does not select a header name.
-- The generated value is an opaque hash of the compression-lineage session
-  scope. It stays stable across turns, tool rounds, retries, resume, and context
-  compression; new sessions, branches, delegated children, and independent
-  cron executions get separate values.
+- The generated value identifies one upstream context generation. It stays
+  stable across turns, tool rounds, retries, and resume **until a compaction
+  commits**. A committed compaction—including in-place compaction—changes the
+  value so a stateful proxy starts a fresh upstream session from the compacted
+  history instead of retaining the old context. Failed or no-op compaction
+  attempts leave it unchanged.
+- The generation is persisted with the compacted session state, so restarting
+  Hermes does not reset it. New sessions, branches, delegated children, and
+  independent cron executions remain separate. Ordinary prompt-cache identities
+  are unchanged; this behavior applies only to the opted-in session header.
+- Existing stores migrate to generation zero without resetting active upstream
+  sessions. A session compacted before this feature was installed moves to a
+  fresh upstream context on its **next committed compaction**, not merely on
+  upgrade. Agents with persistence disabled keep a process-local generation;
+  they cannot restore that counter after a restart without a durable store.
 - The opt-in matches both provider identity and endpoint. Switching or falling
   back to a different provider/route does not carry the header along.
 - Existing transport headers are preserved; no identifier is added to prompts

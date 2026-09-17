@@ -3798,6 +3798,27 @@ def compress_context(
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
+        # Compaction generation (agent/compaction_generation.py): the identity
+        # a replaying proxy keys its upstream session on must move exactly once
+        # per committed rewrite. SessionDB advances it inside the transaction
+        # that published the compacted rows — atomic with the transcript, so
+        # nothing to do here for a durable agent. This call is for the agents
+        # whose store CANNOT record it (no session DB at all; a duck-typed
+        # session store that predates the column) and it no-ops for the rest.
+        # Gated on the same signals the boundary bookkeeping above uses, so an
+        # aborted, refused or rolled-back attempt never advances anything.
+        if _compression_made_progress and (
+            _session_commit_succeeded or split_status == "not_applicable"
+        ):
+            try:
+                from agent.compaction_generation import note_compaction_committed
+
+                note_compaction_committed(agent)
+            except Exception:
+                logger.debug(
+                    "could not record the compaction generation", exc_info=True
+                )
+
         # Round-2 #4: the activity heartbeat's terminal "context compression
         # completed" stamp landed on the PARENT row (force-persisted before
         # the rotation re-pointed agent.session_id at the child). Without a

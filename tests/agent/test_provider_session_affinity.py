@@ -18,8 +18,9 @@ The contract these tests pin:
 
 * absent / ``false`` / empty ⇒ no new header, for every provider;
 * the value is opaque (never a raw session/user id) and stable for the life of
-  one logical conversation — across tool rounds, retries, agent
-  re-instantiation/resume, and context-compression session rotation;
+  one logical conversation — across tool rounds, retries, and agent
+  re-instantiation/resume — up to the next COMMITTED context rewrite, which
+  mints the next value (see test_affinity_compaction_generation.py);
 * it differs across ``/new``, ``/branch`` forks, subagents, independent cron
   fires and unrelated sessions;
 * it is scoped to ONE provider identity on ONE normalized route: a sibling
@@ -339,16 +340,42 @@ class TestAgentScope:
         second = self._value(_stub_agent(session_id="sess-resume-7"))
         assert first == second == self._value(_stub_agent(session_id="sess-resume-7"))
 
-    def test_a_rotated_session_keeps_its_lineage_root_value(self):
-        """Compression rotation mints a new physical id, same conversation."""
-        root = _stub_agent(session_id="sess-root")
-        rotated = _stub_agent(
-            session_id="sess-root-rot2",
-            session_db=SimpleNamespace(
-                get_compression_lineage=lambda sid: ["sess-root", "sess-root-rot2"]
-            ),
-        )
-        assert self._value(rotated) == self._value(root)
+    def test_a_committed_rotation_keeps_the_cache_root_but_moves_the_value(
+        self, tmp_path
+    ):
+        """Rotation keeps ONE conversation but replaces its history.
+
+        Two different identities are in play and they must not be conflated:
+        the prompt-cache scope (the compression-lineage ROOT) stays put, so
+        rotation does not churn the cache bucket; the affinity value does NOT,
+        because a replaying proxy holds the PRE-compaction transcript under the
+        old value and would resume it by suffix overlap, never seeing the
+        compacted prefix. See tests/agent/test_affinity_compaction_generation.py
+        for the full contract.
+        """
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("sess-root", source="cli")
+            db.append_message("sess-root", "user", "long history")
+            root = _stub_agent(session_id="sess-root", session_db=db)
+            root_value = self._value(root)
+
+            db.publish_compression_child(
+                parent_session_id="sess-root",
+                child_session_id="sess-root-rot2",
+                source="cli",
+                messages=[{"role": "user", "content": "[COMPACTION] summary"}],
+                require_compression_lease=False,
+            )
+            rotated = _stub_agent(session_id="sess-root-rot2", session_db=db)
+
+            assert resolve_prompt_cache_scope(rotated) == "sess-root"
+            assert self._value(rotated) != root_value
+        finally:
+            db.close()
 
     def test_a_fork_child_does_not_inherit_the_parent_value(self):
         parent = _stub_agent(session_id="sess-root")
