@@ -1390,7 +1390,11 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt, *, task_id=None):
+        # ``**_kwargs``: the agent's run_conversation contract also carries
+        # the optional ``memory_query`` recall intent (2026-09-18 retrieval
+        # isolation); this fake models the real AIAgent signature, which the
+        # scheduler cannot signature-inspect through a MagicMock side_effect.
+        def _run_conversation(prompt, *, task_id=None, **_kwargs):
             from tools.env_passthrough import get_all_passthrough
 
             assert isinstance(task_id, str)

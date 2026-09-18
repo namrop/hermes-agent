@@ -30,10 +30,23 @@ import logging
 import re
 import inspect
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import (
+    RECALL_OUTCOME_CANCELLED,
+    RECALL_OUTCOME_ERROR,
+    RECALL_OUTCOME_NO_HITS,
+    RECALL_OUTCOME_RECALLED,
+    RECALL_OUTCOME_SKIPPED,
+    RECALL_OUTCOME_TIMED_OUT,
+    MemoryProvider,
+    RecallCancellation,
+    RecallInterrupted,
+    RecallStatus,
+)
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -45,6 +58,52 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# After the prefetch timeout, a cancellation-aware provider gets this long to
+# observe the cancelled token and return before the worker is reported as
+# still running. Legacy providers (no ``cancel`` keyword) are not waited on.
+_EXTERNAL_PREFETCH_CANCEL_GRACE_S = 1.0
+# Automatic recall consumes bounded task/query intent, never a whole evidence
+# packet. Ordinary questions are a few hundred characters; the 2026-09-17/18
+# incident queries were 3.2M and 22M characters (see docs/memory-recall-
+# isolation.md). Configurable via ``memory.prefetch_max_query_chars``.
+DEFAULT_PREFETCH_MAX_QUERY_CHARS = 4000
+
+
+def prepare_recall_query(text: str, *, max_chars: int = DEFAULT_PREFETCH_MAX_QUERY_CHARS) -> Tuple[str, bool]:
+    """Return ``(query, bounded)``: at most ``max_chars`` of ``text``.
+
+    Slices first so the cost is O(max_chars) regardless of input size — the
+    whole point is to bound BEFORE any split/tokenise/expand step. A cut that
+    lands mid-token backs up to the previous whitespace.
+    """
+    if not text:
+        return "", False
+    limit = max(1, int(max_chars))
+    if len(text) <= limit:
+        return text.strip(), False
+    head = text[:limit]
+    if not text[limit].isspace():
+        cut = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"))
+        if cut > 0:
+            head = head[:cut]
+    return head.strip(), True
+
+
+@dataclass(frozen=True)
+class PrefetchOutcome:
+    """Typed result of one provider's most recent automatic prefetch.
+
+    Recorded by ``MemoryManager`` (never contains query text) so the recall
+    indicator, diagnostics and logs can tell a skipped / timed-out / cancelled
+    retrieval apart from a successful "nothing relevant".
+    """
+
+    provider: str
+    outcome: str
+    detail: str = ""
+    elapsed_s: float = 0.0
+    query_chars: int = 0
+    bounded: bool = False
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -368,7 +427,13 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        *,
+        external_prefetch_timeout: Optional[float] = None,
+        prefetch_max_query_chars: Optional[int] = None,
+        external_prefetch_cancel_grace: Optional[float] = None,
+    ) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
@@ -379,8 +444,21 @@ class MemoryManager:
         )
         if self._external_prefetch_timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
+        self._external_prefetch_cancel_grace = (
+            _EXTERNAL_PREFETCH_CANCEL_GRACE_S
+            if external_prefetch_cancel_grace is None
+            else max(0.0, float(external_prefetch_cancel_grace))
+        )
+        self._prefetch_max_query_chars = (
+            DEFAULT_PREFETCH_MAX_QUERY_CHARS
+            if prefetch_max_query_chars is None
+            else max(1, int(prefetch_max_query_chars))
+        )
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
+        # Typed outcome of the most recent prefetch_all, per provider name.
+        self._prefetch_outcomes: Dict[str, PrefetchOutcome] = {}
+        self._prefetch_outcomes_lock = threading.Lock()
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -522,41 +600,161 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    def _record_outcome(self, provider_name: str, outcome: PrefetchOutcome) -> None:
+        with self._prefetch_outcomes_lock:
+            self._prefetch_outcomes[provider_name] = outcome
+
+    @property
+    def prefetch_outcomes(self) -> Dict[str, PrefetchOutcome]:
+        """Typed per-provider outcome of the most recent :meth:`prefetch_all`."""
+        with self._prefetch_outcomes_lock:
+            return dict(self._prefetch_outcomes)
+
+    def prefetch_diagnostics(self) -> Dict[str, Any]:
+        """Worker / outcome snapshot for logs and tests. Never includes query text."""
+        with self._external_prefetch_lock:
+            active = sum(1 for t in self._external_prefetch_threads.values() if t.is_alive())
+        return {
+            "active_workers": active,
+            "timeout_s": self._external_prefetch_timeout,
+            "max_query_chars": self._prefetch_max_query_chars,
+            "outcomes": {name: asdict(o) for name, o in self.prefetch_outcomes.items()},
+        }
+
+    def _resolve_recall_intent(
+        self, query: str, memory_query: Optional[str]
+    ) -> Tuple[Optional[str], bool, str]:
+        """Turn (message, explicit intent) into a bounded recall query.
+
+        Returns ``(query_or_None, bounded, skip_reason)``. ``None`` means
+        skip: either the caller explicitly supplied an empty intent, or the
+        message was bare skill scaffolding with nothing worth recalling.
+        """
+        if memory_query is not None:
+            intent = memory_query if isinstance(memory_query, str) else ""
+            if not intent.strip():
+                return None, False, "no recall intent"
+        else:
+            intent = self._strip_skill_scaffolding(query)
+            if not intent:
+                return None, False, "no user instruction"
+        bounded_query, bounded = prepare_recall_query(
+            intent, max_chars=self._prefetch_max_query_chars
+        )
+        if not bounded_query:
+            return None, bounded, "empty query"
+        return bounded_query, bounded, ""
+
+    def prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        memory_query: Optional[str] = None,
+    ) -> str:
         """Collect prefetch context from all providers.
 
-        Returns merged context text labeled by provider. Empty providers
-        are skipped. Failures in one provider don't block others.
+        ``query`` is the model-facing user message. ``memory_query`` is the
+        optional explicit recall intent (task / request identifiers) — when a
+        caller assembles a large evidence packet (cron script output,
+        archives) it should pass the concise intent here instead of letting
+        the packet become the recall query. ``memory_query=""`` explicitly
+        skips automatic recall (typed outcome ``skipped``).
+
+        The dispatched query is bounded to ``prefetch_max_query_chars``
+        BEFORE any provider sees it. Returns merged context text labeled by
+        provider. Empty providers are skipped. Failures in one provider don't
+        block others; each provider's typed outcome is recorded in
+        :attr:`prefetch_outcomes`.
         """
-        clean_query = self._strip_skill_scaffolding(query)
-        if not clean_query:
+        recall_query, bounded, skip_reason = self._resolve_recall_intent(query, memory_query)
+        if recall_query is None:
+            for provider in self._providers:
+                self._record_outcome(
+                    provider.name,
+                    PrefetchOutcome(provider.name, RECALL_OUTCOME_SKIPPED, skip_reason),
+                )
+            if skip_reason == "no recall intent":
+                logger.info("Memory prefetch skipped: caller supplied no recall intent")
             return ""
+        if bounded:
+            logger.info(
+                "Memory prefetch query bounded to %d chars (message was %d chars)",
+                len(recall_query), len(query) if isinstance(query, str) else 0,
+            )
         parts = []
         for provider in self._providers:
+            started = time.monotonic()
             try:
-                result = self._prefetch_provider(provider, clean_query, session_id=session_id)
+                result, outcome = self._prefetch_provider(
+                    provider, recall_query, session_id=session_id
+                )
                 if result and result.strip():
                     parts.append(result)
+            except RecallInterrupted as exc:
+                result, outcome = "", (exc.outcome, str(exc))
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
+                result, outcome = "", (RECALL_OUTCOME_ERROR, type(e).__name__)
+            self._record_outcome(
+                provider.name,
+                PrefetchOutcome(
+                    provider=provider.name,
+                    outcome=outcome[0],
+                    detail=outcome[1],
+                    elapsed_s=round(time.monotonic() - started, 3),
+                    query_chars=len(recall_query),
+                    bounded=bounded,
+                ),
+            )
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _provider_prefetch_accepts_cancel(provider: MemoryProvider) -> bool:
+        """Whether ``provider.prefetch`` declares a ``cancel`` keyword."""
+        try:
+            signature = inspect.signature(provider.prefetch)
+        except (TypeError, ValueError):
+            return False
+        params = signature.parameters
+        if "cancel" in params:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
-    ) -> str:
+    ) -> Tuple[str, Tuple[str, str]]:
+        """Run one provider's prefetch. Returns ``(text, (outcome, detail))``.
+
+        External providers run on a daemon worker with a wall-clock timeout.
+        On timeout the manager CANCELS the worker's token (if the provider
+        accepts one) and waits a short grace for it to return, instead of
+        abandoning a live thread that keeps its resources (the 2026-09-17
+        gateway-freeze mechanism). A worker that still does not stop is
+        reported as such; no second worker is started for that provider
+        until it returns, and no other provider's request is touched.
+        """
         if provider.name == "builtin":
-            return provider.prefetch(query, session_id=session_id)
+            text = provider.prefetch(query, session_id=session_id) or ""
+            return text, self._outcome_for_result(provider, text)
 
         result_box: Dict[str, str] = {}
-        error_box: Dict[str, Exception] = {}
+        error_box: Dict[str, BaseException] = {}
+        supports_cancel = self._provider_prefetch_accepts_cancel(provider)
+        token = RecallCancellation(timeout=self._external_prefetch_timeout)
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
-            except Exception as exc:  # pragma: no cover - re-raised by caller
+                if supports_cancel:
+                    result_box["value"] = (
+                        provider.prefetch(query, session_id=session_id, cancel=token) or ""
+                    )
+                else:
+                    result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+            except BaseException as exc:  # re-raised / typed by the caller
                 error_box["value"] = exc
 
         # Propagate the caller's contextvars (profile HERMES_HOME override)
@@ -573,31 +771,78 @@ class MemoryManager:
             existing = self._external_prefetch_threads.get(provider.name)
             if existing is not None:
                 if existing.is_alive():
-                    logger.debug(
-                        "Memory provider '%s' prefetch is still running; skipping this turn",
+                    logger.warning(
+                        "Memory provider '%s' prefetch from a previous turn is still "
+                        "running; skipping recall this turn",
                         provider.name,
                     )
-                    return ""
+                    return "", (RECALL_OUTCOME_SKIPPED, "previous prefetch still running")
                 self._external_prefetch_threads.pop(provider.name, None)
             self._external_prefetch_threads[provider.name] = thread
             thread.start()
 
         thread.join(self._external_prefetch_timeout)
         if thread.is_alive():
+            if supports_cancel:
+                token.cancel(f"prefetch timeout {self._external_prefetch_timeout:.1f}s")
+                thread.join(self._external_prefetch_cancel_grace)
+            if thread.is_alive():
+                detail = (
+                    "worker still running after cancellation"
+                    if supports_cancel
+                    else "worker still running; provider does not support cancellation"
+                )
+                logger.warning(
+                    "Memory provider '%s' prefetch timed out after %.1fs; %s — skipping it "
+                    "until the stuck call returns",
+                    provider.name, self._external_prefetch_timeout, detail,
+                )
+                return "", (RECALL_OUTCOME_TIMED_OUT, detail)
+            with self._external_prefetch_lock:
+                if self._external_prefetch_threads.get(provider.name) is thread:
+                    self._external_prefetch_threads.pop(provider.name, None)
             logger.warning(
-                "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
-                "the stuck call returns",
-                provider.name,
-                self._external_prefetch_timeout,
+                "Memory provider '%s' prefetch timed out after %.1fs; worker cancelled "
+                "and released",
+                provider.name, self._external_prefetch_timeout,
             )
-            return ""
+            return "", (RECALL_OUTCOME_TIMED_OUT, "cancelled after timeout")
 
         with self._external_prefetch_lock:
             if self._external_prefetch_threads.get(provider.name) is thread:
                 self._external_prefetch_threads.pop(provider.name, None)
         if error_box:
-            raise error_box["value"]
-        return result_box.get("value", "")
+            exc = error_box["value"]
+            if isinstance(exc, Exception):
+                raise exc
+            raise RuntimeError(f"prefetch worker died: {exc!r}")
+        text = result_box.get("value", "")
+        return text, self._outcome_for_result(provider, text)
+
+    @staticmethod
+    def _outcome_for_result(provider: MemoryProvider, text: str) -> Tuple[str, str]:
+        """Derive the typed outcome of a completed prefetch.
+
+        Prefers the provider's own :meth:`recall_status` (which may report a
+        typed skip / no-hit); falls back to "recalled" vs "no_hits" from the
+        returned text for providers without one.
+        """
+        try:
+            status = provider.recall_status()
+        except Exception:
+            status = None
+        if isinstance(status, RecallStatus) and status.outcome != RECALL_OUTCOME_RECALLED:
+            return status.outcome, status.detail
+        if text and text.strip():
+            return RECALL_OUTCOME_RECALLED, ""
+        return RECALL_OUTCOME_NO_HITS, ""
+
+    # Human-readable phrasing for non-recalled outcomes in the indicator.
+    _VISIBLE_OUTCOME_PHRASES = {
+        RECALL_OUTCOME_TIMED_OUT: "recall timed out",
+        RECALL_OUTCOME_CANCELLED: "recall cancelled",
+        RECALL_OUTCOME_SKIPPED: "recall skipped",
+    }
 
     def describe_recall(self) -> str:
         """Build a deterministic, model-independent recall indicator line.
@@ -606,9 +851,14 @@ class MemoryManager:
         provider's :meth:`MemoryProvider.recall_status` and renders a single
         status string (e.g. ``"🧠 Provider — recalled 3 memories"``) so the
         user SEES memory was used regardless of whether the model mentions it.
-        Returns ``""`` when no provider injected memory this turn — callers can
-        emit the result unconditionally.
+
+        Typed non-success outcomes are visible too: a skipped, timed-out or
+        cancelled retrieval renders as ``"🧠 Provider — recall timed out
+        (provider cause)"`` instead of silently reading as "no remembered facts".
+        A successful retrieval with no hits stays silent. Returns ``""`` when
+        there is nothing to say — callers can emit the result unconditionally.
         """
+        outcomes = self.prefetch_outcomes
         segments: List[str] = []
         for provider in self._providers:
             try:
@@ -618,8 +868,25 @@ class MemoryManager:
                     "Memory provider '%s' recall_status failed (non-fatal): %s",
                     provider.name, e,
                 )
+                status = None
+            glyph = status.glyph if status is not None else "🧠"
+            label = status.provider_label if status is not None else provider.name
+
+            # Manager-level outcome wins when it says the retrieval did not
+            # complete: a provider whose worker timed out never updated its
+            # own status, so its recall_status() may be stale.
+            manager_outcome = outcomes.get(provider.name)
+            if manager_outcome is not None and manager_outcome.outcome in self._VISIBLE_OUTCOME_PHRASES:
+                segments.append(self._render_outcome(glyph, label, manager_outcome.outcome, manager_outcome.detail))
                 continue
+
             if status is None:
+                continue
+            if status.outcome in self._VISIBLE_OUTCOME_PHRASES:
+                segments.append(self._render_outcome(glyph, label, status.outcome, status.detail))
+                continue
+            if status.outcome not in (RECALL_OUTCOME_RECALLED,):
+                # no_hits / error: nothing injected, nothing visible.
                 continue
             if status.count == 1:
                 detail = "recalled 1 memory"
@@ -628,8 +895,17 @@ class MemoryManager:
             else:
                 # count <= 0 → content injected but no discrete count (reflect).
                 detail = "recalled relevant memory"
-            segments.append(f"{status.glyph} {status.provider_label} — {detail}")
+            segments.append(f"{glyph} {label} — {detail}")
         return "  ".join(segments)
+
+    def _render_outcome(self, glyph: str, label: str, outcome: str, detail: str) -> str:
+        phrase = self._VISIBLE_OUTCOME_PHRASES.get(outcome, outcome)
+        if outcome == RECALL_OUTCOME_TIMED_OUT:
+            if detail:
+                phrase = f"{phrase} ({detail})"
+        elif detail:
+            phrase = f"{phrase} ({detail})"
+        return f"{glyph} {label} — {phrase}"
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
@@ -643,6 +919,13 @@ class MemoryManager:
             return
 
         clean_query = self._strip_skill_scaffolding(query)
+        if not clean_query:
+            return
+        # Same bound as the synchronous path: background prefetch must not
+        # receive an evidence packet either.
+        clean_query, _bounded = prepare_recall_query(
+            clean_query, max_chars=self._prefetch_max_query_chars
+        )
         if not clean_query:
             return
 

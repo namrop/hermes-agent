@@ -348,21 +348,32 @@ def test_recall_indicator_emitted_when_memory_injected():
     agent._emit_status.assert_any_call("👁️ Hindsight — recalled 2 memories")
 
 
-def test_recall_indicator_skipped_when_nothing_injected():
-    """No memory injected → describe_recall isn't consulted, nothing emitted."""
+def test_recall_indicator_silent_when_nothing_injected():
+    """No memory injected → the indicator is consulted but stays silent.
+
+    Contract change (2026-09-18, holographic retrieval isolation): the
+    prologue now asks ``describe_recall`` after EVERY attempted prefetch, not
+    only when text was injected, because a typed skip / timeout / cancellation
+    must be visible to the user instead of silently reading as "no remembered
+    facts". A successful retrieval with no hits still renders ``""`` and emits
+    nothing — that is the behavior this test pins.
+    """
     agent = _FakeAgent()
     agent._emit_status = MagicMock()
     mm = MagicMock()
     mm.prefetch_all.return_value = ""
+    mm.describe_recall.return_value = ""
     agent._memory_manager = mm
 
-    # Substantive query so prefetch_all actually runs; it returns nothing, so the
-    # indicator path must stay silent (as opposed to being skipped as trivial).
+    # Substantive query so prefetch_all actually runs; it returns nothing and
+    # the manager reports nothing visible, so no indicator is emitted (as
+    # opposed to being skipped as trivial).
     _build(agent, user_message="what did we decide about the deploy pipeline?")
 
-    mm.describe_recall.assert_not_called()
+    mm.describe_recall.assert_called_once()
     for call in agent._emit_status.call_args_list:
         assert "👁️" not in str(call)
+        assert "🧠" not in str(call)
 
 
 def test_ensure_db_session_runs_after_system_prompt_restore():

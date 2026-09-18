@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import inspect
 import json
 import logging
 import os
@@ -3923,6 +3924,104 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _compose_job_user_prompt(job: dict, extra_prompt: Optional[str] = None) -> str:
+    """The job's own instruction: stored prompt plus this fire's run context.
+
+    This is the stored task instruction plus per-run context, as opposed to
+    runtime-collected DATA (script stdout, upstream job output, skill bodies)
+    that ``_build_job_prompt`` prepends. Its role does not imply human authorship.
+    """
+    user_prompt = str(job.get("prompt") or "")
+    if extra_prompt:
+        user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+    return user_prompt
+
+
+def _job_memory_query(job: dict, extra_prompt: Optional[str] = None) -> str:
+    """Recall intent for the external memory prefetch of a cron fire.
+
+    Separates what memory should be asked about from the evidence handed to
+    the model. The 2026-09-17/18 Nightly Lantern incidents fed the whole
+    assembled packet (3.2M / 22M chars of script output) to holographic
+    prefetch; the recall intent was only ever the job's instruction.
+
+    Resolution:
+      * ``job["memory_query"]`` (str) — explicit intent; ``""`` means "this
+        packet is self-contained, skip automatic recall".
+      * otherwise the job's stored prompt plus per-run context.
+    """
+    explicit = job.get("memory_query")
+    if isinstance(explicit, str):
+        return explicit.strip()
+    return _compose_job_user_prompt(job, extra_prompt)
+
+
+def _run_conversation_accepts_memory_query(run_conversation: Any) -> bool:
+    """Whether an agent's ``run_conversation`` takes the ``memory_query`` keyword.
+
+    ``AIAgent`` always does. Signature-inspect (the same rule the plugin
+    contract uses for optional kwargs) so narrow test doubles and third-party
+    agent shims with the legacy ``(prompt, task_id=...)`` shape keep working.
+    """
+    try:
+        params = inspect.signature(run_conversation).parameters
+    except (TypeError, ValueError):
+        return True
+    if "memory_query" in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+class CronRequestOversized(RuntimeError):
+    """The assembled cron request cannot fit the model's context window."""
+
+
+def _check_cron_request_size(prompt: str, context_length: Any) -> Optional[dict]:
+    """Return an oversize verdict for ``prompt`` against ``context_length``.
+
+    ``None`` when the prompt fits (or the window is unknown / not a real
+    positive int — test doubles and unresolved runtimes must never block a
+    run). Uses the same rough estimator the preflight compressor uses; a
+    prompt whose estimate alone reaches the window cannot be made to fit by
+    compression, memory injection, or a fallback provider with the same
+    window, so the caller fails the fire explicitly instead of dispatching.
+    """
+    if isinstance(context_length, bool) or not isinstance(context_length, int) or context_length <= 0:
+        return None
+    if not isinstance(prompt, str):
+        return None
+    from agent.model_metadata import estimate_tokens_rough
+
+    estimated = estimate_tokens_rough(prompt)
+    if estimated < context_length:
+        return None
+    return {
+        "estimated_tokens": estimated,
+        "context_length": context_length,
+        "prompt_chars": len(prompt),
+    }
+
+
+def _retain_oversized_cron_prompt(job_id: str, session_id: str, prompt: str) -> Optional[Path]:
+    """Keep the assembled oversized request as an artifact for diagnosis.
+
+    Written under ``cron/oversized/<job_id>/`` — deliberately NOT the job's
+    output directory, whose newest ``*.md`` is what ``context_from`` ingests
+    as "previous output".
+    """
+    try:
+        from cron.jobs import get_cron_output_dir
+
+        target_dir = get_cron_output_dir().parent / "oversized" / str(job_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{session_id or 'request'}.txt"
+        path.write_text(prompt, encoding="utf-8", errors="replace")
+        return path
+    except Exception:
+        logger.warning("Job '%s': could not retain oversized prompt artifact", job_id, exc_info=True)
+        return None
+
+
 def _build_job_prompt(
     job: dict,
     prerun_script: Optional[tuple] = None,
@@ -3942,9 +4041,7 @@ def _build_job_prompt(
             stored prompt under a ``## Run Context`` header for this single
             fire only — never persisted to the job definition.
     """
-    user_prompt = str(job.get("prompt") or "")
-    if extra_prompt:
-        user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+    user_prompt = _compose_job_user_prompt(job, extra_prompt)
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -5096,6 +5193,9 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+    # Recall intent for external memory prefetch: the job's own instruction,
+    # never the assembled evidence packet (script output / upstream output).
+    _memory_query = _job_memory_query(job, extra_prompt)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
@@ -5726,7 +5826,58 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
+        # Request boundary: an assembled packet that cannot fit the model's
+        # window fails HERE, before memory prefetch and before any model /
+        # fallback call. Dispatching it anyway is futile (every provider in
+        # the chain rejects it) and, on 2026-09-17/18, the prefetch it
+        # triggered froze the gateway. The packet is retained for diagnosis
+        # and the fire reports an explicit, compact failure — never the
+        # multi-megabyte prompt echoed back into the delivery doc.
+        _oversize = _check_cron_request_size(
+            prompt,
+            getattr(getattr(agent, "context_compressor", None), "context_length", None),
+        )
+        if _oversize is not None:
+            _artifact = _retain_oversized_cron_prompt(job_id, _cron_session_id, prompt)
+            error_msg = (
+                f"CronRequestOversized: assembled request is ~{_oversize['estimated_tokens']:,} "
+                f"tokens ({_oversize['prompt_chars']:,} chars) but the model context window is "
+                f"{_oversize['context_length']:,} tokens; agent not run, no model or fallback "
+                f"call attempted"
+            )
+            logger.error("Job '%s' (ID: %s): %s", job_name, job_id, error_msg)
+            _write_usage_audit({
+                "ts": _utcnow_iso_ms(),
+                "job_id": job_id,
+                "fire_id": uuid.uuid4().hex,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "response_silent": False,
+                "deliver_target": job.get("deliver"),
+                "model": model or None,
+                "duration_ms": 0,
+                "error": error_msg,
+            })
+            output = (
+                f"# Cron Job: {job_name} (FAILED)\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Schedule:** {job.get('schedule_display', 'N/A')}\n"
+                f"**Status:** REQUEST OVERSIZED\n\n"
+                "The assembled request (job prompt plus injected script / upstream output) "
+                "exceeds the model's context window, so the agent was NOT run and no memory "
+                "prefetch, model call or fallback was attempted.\n\n"
+                f"- estimated tokens: {_oversize['estimated_tokens']:,}\n"
+                f"- context window: {_oversize['context_length']:,} tokens\n"
+                f"- prompt size: {_oversize['prompt_chars']:,} chars\n"
+                f"- retained request: {_artifact if _artifact else 'not retained (write failed)'}\n\n"
+                "Move bulk source material to a file-backed batch pipeline and pass the "
+                "model a compact manifest/reference instead of inlining the corpus.\n"
+            )
+            return False, output, "", error_msg
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -5790,11 +5941,14 @@ def run_job(
         # task_id is what binds every tool call in this turn to THIS fire's cwd
         # record (see _cron_task_id above); without it the agent would mint a
         # fresh uuid per turn and the workdir record would address nobody.
+        _run_kwargs: dict = {"task_id": _cron_task_id}
+        if _run_conversation_accepts_memory_query(agent.run_conversation):
+            _run_kwargs["memory_query"] = _memory_query
         _cron_future = _cron_pool.submit(
             _cron_context.run,
             agent.run_conversation,
             prompt,
-            task_id=_cron_task_id,
+            **_run_kwargs,
         )
         _inactivity_timeout = False
         try:

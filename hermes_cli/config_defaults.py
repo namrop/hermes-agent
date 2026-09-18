@@ -1902,6 +1902,15 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Automatic-recall execution budgets (docs/memory-recall-isolation.md).
+        # prefetch_timeout_seconds: how long a turn waits for the external
+        #   provider's prefetch before cancelling it (cancellation-aware
+        #   providers release their work; legacy ones are skipped until they
+        #   return). prefetch_max_query_chars: the recall query handed to the
+        #   provider is at most this many characters of the task/request
+        #   intent — an evidence packet is never the recall query.
+        "prefetch_timeout_seconds": 8,
+        "prefetch_max_query_chars": 4000,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
