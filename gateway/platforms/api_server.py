@@ -2169,6 +2169,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/api/sessions/{session_id}/model/reset", self._handle_session_model_reset),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3464,6 +3465,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "session_model_reset": {"method": "POST", "path": "/api/sessions/{session_id}/model/reset"},
             },
         })
 
@@ -4743,6 +4745,101 @@ class APIServerAdapter(BasePlatformAdapter):
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
+
+    async def _handle_session_model_reset(self, request: "web.Request") -> "web.Response":
+        """Clear a current gateway conversation's explicit model selection.
+
+        Unlike browser model locks, this is owned by the live gateway: do not
+        edit its persisted routing index from a second SessionStore instance.
+        Historical session IDs must not reset a newer conversation on that key.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        profile = _api_request_profile.get()
+        if profile and profile != "default":
+            # Named profile stores are isolated from the default gateway store.
+            return web.json_response(
+                _openai_error("Model reset requires the owning gateway API", code="model_reset_profile_unsupported"),
+                status=409,
+            )
+        if not self._api_key:
+            return web.json_response(
+                _openai_error("Model reset requires API key authentication", code="model_reset_auth_required"),
+                status=403,
+            )
+        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        if err is not None:
+            return err
+        if session is None:
+            return web.json_response(
+                _openai_error("Session not found", code="session_not_found"),
+                status=404,
+            )
+        session_key = (session.get("session_key") or "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error("Session is not gateway-routed", code="session_not_gateway_routed"),
+                status=409,
+            )
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if runner is None:
+            try:
+                from gateway.run import _gateway_runner_ref
+                runner = _gateway_runner_ref()
+            except Exception:
+                runner = None
+        reset = getattr(runner, "_reset_session_model_override", None)
+        if runner is None or not callable(reset):
+            return web.json_response(
+                _openai_error("Gateway model reset is unavailable", code="model_reset_unavailable"),
+                status=503,
+            )
+        from gateway.session import (
+            SessionModelOverrideChangedError,
+            SessionRouteChangedError,
+        )
+
+        try:
+            current_id = await asyncio.to_thread(
+                runner._lookup_session_id_under_store_lock,
+                runner.session_store,
+                session_key,
+            )
+            if current_id != session.get("id"):
+                return web.json_response(
+                    _openai_error("Session no longer owns this gateway route", code="session_route_changed"),
+                    status=409,
+                )
+            if runner._is_session_running(session_key):
+                return web.json_response(
+                    _openai_error("Wait for this conversation's active turn to finish", code="session_busy"),
+                    status=409,
+                )
+            await reset(session_key, expected_session_id=session.get("id"))
+        except SessionRouteChangedError:
+            return web.json_response(
+                _openai_error("Session no longer owns this gateway route", code="session_route_changed"),
+                status=409,
+            )
+        except SessionModelOverrideChangedError:
+            return web.json_response(
+                _openai_error("A newer model selection superseded this reset", code="model_reset_superseded"),
+                status=409,
+            )
+        except Exception:
+            logger.exception("[api_server] model reset failed for session %s", session.get("id"))
+            return web.json_response(
+                _openai_error("Could not clear the saved model selection", code="model_reset_failed"),
+                status=500,
+            )
+        # The API adapter has its own last-known runtime cache as well.
+        self._last_resolved_model.pop(session_key, None)
+        return web.json_response({
+            "object": "hermes.session.model_reset",
+            "session_id": session.get("id"),
+            "status": "reset",
+        })
 
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""

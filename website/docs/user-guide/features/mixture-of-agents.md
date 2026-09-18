@@ -23,7 +23,7 @@ You can select a preset through the normal model picker surfaces:
 
 MoA presets are selectable on **every Hermes surface**, because MoA is a normal provider in the model system:
 
-- **CLI / gateway / TUI `/model`** — `/model <preset> --provider moa`, or `/model --provider moa` for the default preset. A bare `/model <preset>` also works when the name exactly matches a configured preset.
+- **CLI / gateway / TUI `/model`** — `/model <preset> --provider moa`, or `/model --provider moa` for the configured default preset. Bare `/model moa` also selects that configured default preset. A bare `/model <preset>` works when the name exactly matches an enabled preset. In gateway chats only, bare `/model default` is reserved for clearing that conversation's explicit model override, so select a preset literally named `default` with `/model default --provider moa`.
 - **`hermes model`** and the **Dashboard model picker** — a `Mixture of Agents` provider row appears with your preset names as its models.
 - **Desktop GUI app** — the model dropdown shows an `MoA presets` section; selecting one (`MoA: <preset>`) switches the active model to that preset. The Desktop settings panel also creates and edits presets.
 

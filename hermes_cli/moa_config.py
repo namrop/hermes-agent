@@ -443,6 +443,53 @@ def resolve_moa_preset(config: Any, name: str | None = None) -> dict[str, Any]:
     return deepcopy(preset)
 
 
+def resolve_configured_default_moa_preset_name(config: Any) -> str:
+    """Return the enabled configured default preset without silent repair.
+
+    ``normalize_moa_config`` is deliberately forgiving for normal read paths:
+    malformed hand-edited config falls back to a usable preset.  A command that
+    explicitly means "the configured default MoA preset" needs the opposite
+    contract.  It must surface a stale ``default_preset`` name or a disabled
+    default rather than silently selecting a different fan-out policy.
+
+    Explicit named preset selection remains permissive through
+    :func:`resolve_moa_preset`; this strict helper is only for bare ``/model
+    moa`` and provider-only ``/model --provider moa``.
+    """
+    raw = config if isinstance(config, dict) else {}
+    cfg = normalize_moa_config(raw)
+    requested = str(raw.get("default_preset") or "").strip()
+    default_name = cfg["default_preset"]
+
+    # If a user named a default in the modern named-preset shape, do not let
+    # tolerant normalization replace it with the first available preset.
+    if requested and requested != default_name:
+        available = ", ".join(cfg["presets"]) or "(none)"
+        from agent.errors import MoAPresetNotFoundError
+
+        raise MoAPresetNotFoundError(
+            f"Configured default MoA preset '{requested}' was not found. "
+            f"Available presets: {available}. Run `hermes moa list`."
+        )
+
+    preset = cfg["presets"].get(default_name)
+    if preset is None:
+        # Defensive guard for future changes to the tolerant normalizer.
+        available = ", ".join(cfg["presets"]) or "(none)"
+        from agent.errors import MoAPresetNotFoundError
+
+        raise MoAPresetNotFoundError(
+            f"Configured default MoA preset '{default_name}' was not found. "
+            f"Available presets: {available}. Run `hermes moa list`."
+        )
+    if not preset.get("enabled", True):
+        raise ValueError(
+            f"Configured default MoA preset '{default_name}' is disabled. "
+            "Enable it or select a named preset explicitly with --provider moa."
+        )
+    return default_name
+
+
 def exact_moa_preset_name(config: Any, text: str) -> str | None:
     """Return the preset name iff ``text`` exactly matches an *enabled* preset.
 

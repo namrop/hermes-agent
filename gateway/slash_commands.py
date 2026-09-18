@@ -1759,6 +1759,7 @@ class GatewaySlashCommandsMixin:
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+          /model default                       — clear this conversation's explicit model selection
         """
         from gateway.run import _hermes_home, _load_gateway_config
         from hermes_cli.model_switch import (
@@ -1786,6 +1787,9 @@ class GatewaySlashCommandsMixin:
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        is_default_reset = (
+            model_input.strip().lower() == "default" and not explicit_provider
+        )
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
@@ -1840,6 +1844,27 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        if is_default_reset:
+            # The reset is intentionally conversation-only.  Never reinterpret
+            # a scope flag as permission to mutate the global default or to
+            # clear only a transient one-turn selection.
+            if is_global_flag or one_turn:
+                return (
+                    "❌ /model default is a conversation-scoped reset and cannot "
+                    "be combined with --global or --once."
+                )
+            reset = getattr(self, "_reset_session_model_override", None)
+            if not callable(reset):
+                return "❌ Session model reset is unavailable."
+            try:
+                await reset(session_key)
+            except RuntimeError as exc:
+                return f"❌ {exc}"
+            return (
+                "✅ Cleared this conversation's explicit model selection. "
+                "Its next turn will use the configured channel or global default."
+            )
+
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None

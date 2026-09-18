@@ -2645,6 +2645,8 @@ from gateway.config import (
 from gateway.session import (
     AsyncSessionStore,
     SessionEntry,
+    SessionModelOverrideChangedError,
+    SessionRouteChangedError,
     SessionStore,
     SessionSource,
     SessionContext,
@@ -27033,6 +27035,115 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 override.get("provider")
             )
         return model, runtime_kwargs
+
+    async def _reset_session_model_override(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: Optional[str] = None,
+    ) -> None:
+        """Clear one conversation's explicit model route without resetting it.
+
+        The exact-key helper is shared by gateway control surfaces.  It never
+        rotates a session, touches transcript/persona/global configuration, or
+        clears another conversation.  The durable route is cleared and read
+        back before volatile state/cache is changed; failures raise so callers
+        cannot report a successful reset that will revive after restart.
+
+        An API caller may supply ``expected_session_id`` to compare-and-set the
+        route it addressed.  Both the durable clear and final volatile cleanup
+        verify that ownership under the SessionStore lock.
+        """
+        if not session_key:
+            raise RuntimeError("Cannot clear a model override without a session key.")
+        if self._is_session_running(session_key):
+            raise RuntimeError(
+                "This conversation is busy; wait for its current turn before clearing its model override."
+            )
+
+        state_before_reset = self._peek_session_state(session_key)
+        initial_volatile_override = (
+            dict(state_before_reset.conversation.model_override)
+            if state_before_reset is not None
+            and isinstance(state_before_reset.conversation.model_override, dict)
+            else None
+        )
+        try:
+            persisted = await self.async_session_store.get_durable_model_override(
+                session_key
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read durable /model override before reset for %s: %s",
+                session_key,
+                exc,
+            )
+            raise RuntimeError(
+                "Could not verify this conversation's durable model override before reset; its current selection was left unchanged."
+            ) from exc
+
+        if persisted is not None:
+            try:
+                await self.async_session_store.set_model_override(
+                    session_key,
+                    None,
+                    expected_session_id=expected_session_id,
+                    expected_model_override=persisted,
+                )
+                remaining = await self.async_session_store.get_durable_model_override(
+                    session_key
+                )
+            except (SessionRouteChangedError, SessionModelOverrideChangedError):
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Could not durably verify /model override reset for %s: %s",
+                    session_key,
+                    exc,
+                )
+                raise RuntimeError(
+                    "Could not verify this conversation's model override after attempting the reset; do not assume its prior selection remains."
+                ) from exc
+            if remaining is not None:
+                logger.error(
+                    "Persisted /model override remained after reset for %s",
+                    session_key,
+                )
+                raise RuntimeError(
+                    "Could not verify this conversation's model override after attempting the reset; do not assume its prior selection remains."
+                )
+
+        def _clear_volatile_state() -> None:
+            state = self._peek_session_state(session_key)
+            current_override = (
+                state.conversation.model_override if state is not None else None
+            )
+            if current_override != initial_volatile_override:
+                raise SessionModelOverrideChangedError(
+                    "A newer explicit model selection superseded this reset."
+                )
+            if state is not None:
+                state.conversation.model_override = None
+                state.conversation.one_turn_restore = None
+                # This is an empty-config recovery cache; retaining a manual route
+                # makes the reset appear ineffective on the next resolution.
+                state.conversation.last_resolved_model = ""
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if pending_notes is not None:
+                pending_notes.pop(session_key, None)
+
+            # Next turn builds a fresh agent and resolves channel -> global policy.
+            self._evict_cached_agent(session_key)
+
+        # The persisted state is absent (or was already absent for a one-turn
+        # selection).  Execute this final ownership check and all volatile
+        # cleanup under the same store lock so a successor route/selection cannot
+        # be erased after one of the awaits above.
+        self.session_store.run_model_override_reset_cleanup_if_current(
+            session_key,
+            expected_session_id,
+            _clear_volatile_state,
+        )
 
     def _snapshot_session_model_override(self, session_key: str) -> dict:
         """Capture a gateway session override before a one-turn switch."""

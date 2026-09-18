@@ -1,5 +1,22 @@
 # Architecture Decision Records
 
+## 2026-09-18: Gateway `/model default` clears only the conversation override; bare `moa` selects the configured MoA default
+
+Status: Accepted — source implementation; fleet pin/activation is separate.
+
+Origin: Luis explicitly requested this behavior in Discord message `1550367968112807947` ("`/model moa` should go to the moa preset I am making now, and `/model default` should do the reset ... scoped to the channel") and continued the implementation commission in `1550390477394673737`.
+
+Decision:
+
+- In gateway chats, **bare** `/model default` removes only the explicit `/model` route for the exact channel/thread session key. It does not rotate the session, change transcript/history, persona, channel configuration, global configuration, or any other conversation.
+- The reset clears the persisted route first and reads the canonical state.db route plus the enabled `sessions.json` mirror back before clearing the in-memory route, pending one-turn restore, stale route display cache, model note, and cached agent. A store/write/read-back failure raises a concrete failure; callers must not report success. A busy exact target is refused.
+- After reset, the next turn returns to the established normal precedence: channel default, then global default/fallback. `/model default --provider <name>` remains a deliberate selection of the model/preset named `default`; reset rejects `--global` and `--once` rather than widening scope.
+- Bare `/model moa` and `/model --provider moa` resolve the *currently configured* MoA `default_preset`, not a hard-coded preset. A configured missing or disabled default is reported explicitly rather than silently falling back. Provider-qualified named presets (including `default`) remain deliberately selectable.
+- The exact-key `GatewayRunner._reset_session_model_override(session_key)` helper is the single reset seam for slash and authenticated operator API surfaces. It is deliberately not a broad conversation clear.
+- `POST /api/sessions/{session_id}/model/reset` exposes that same operation to the authenticated operator, allowing the commissioned six resets without external edits to a live routing index. It requires the current gateway-owned session ID and an idle target, preserves other running conversations, and rejects stale IDs and non-owning profile prefixes. Browser model locks remain a separate surface. This API shape is the implementation mechanism, not an additional keeper-authored routing rule.
+
+Verification covers JSON and SQLite routing persistence plus fresh rehydration, thread isolation, session/persona preservation, one-turn cancellation, write failure/read-back behavior, idempotence, channel-default restoration, busy refusal, configured MoA default changes, and missing/disabled/default-named preset cases.
+
 ## 2026-09-17: Stateful provider affinity rotates on committed compaction
 
 Status: Accepted — source correction; deployment explicitly held.

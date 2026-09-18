@@ -242,8 +242,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
-               args_hint="[model] [--provider name] [--global|--session] [--refresh]",
+    CommandDef("model", "Switch model; gateway /model default clears this conversation's override", "Configuration",
+               args_hint="[model|default] [--provider name] [--global|--session|--once] [--refresh]",
                busy_policy="reject", busy_handler="model"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),

@@ -1538,11 +1538,19 @@ def switch_model(
         if target_provider == "moa" and not new_model:
             try:
                 from hermes_cli.config import load_config
-                from hermes_cli.moa_config import normalize_moa_config
+                from hermes_cli.moa_config import resolve_configured_default_moa_preset_name
 
-                new_model = normalize_moa_config(load_config().get("moa") or {})["default_preset"]
-            except Exception:
-                new_model = "default"
+                new_model = resolve_configured_default_moa_preset_name(
+                    load_config().get("moa") or {}
+                )
+            except ValueError as exc:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=pdef.name,
+                    is_global=is_global,
+                    error_message=str(exc),
+                )
 
         # Guard against silent aggregator hops. A vendor name like bare
         # "openai" is an alias that resolves to an aggregator ("openrouter").
@@ -1635,10 +1643,18 @@ def switch_model(
     else:
         try:
             from hermes_cli.config import load_config
-            from hermes_cli.moa_config import exact_moa_preset_name, normalize_moa_config
+            from hermes_cli.moa_config import (
+                exact_moa_preset_name,
+                normalize_moa_config,
+                resolve_configured_default_moa_preset_name,
+            )
 
-            _moa_cfg = normalize_moa_config(load_config().get("moa") or {})
-            _moa_match = exact_moa_preset_name(_moa_cfg, raw_input)
+            _moa_raw = load_config().get("moa") or {}
+            _moa_cfg = normalize_moa_config(_moa_raw)
+            if raw_input.strip().lower() == "moa":
+                _moa_match = resolve_configured_default_moa_preset_name(_moa_raw)
+            else:
+                _moa_match = exact_moa_preset_name(_moa_cfg, raw_input)
             if _moa_match:
                 target_provider = "moa"
                 new_model = _moa_match
@@ -1652,6 +1668,12 @@ def switch_model(
                 success=False,
                 is_global=is_global,
                 error_message=_ambiguous_alias_message(err),
+            )
+        except ValueError as err:
+            return ModelSwitchResult(
+                success=False,
+                is_global=is_global,
+                error_message=str(err),
             )
         except Exception:
             try:

@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -1277,6 +1277,14 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+class SessionRouteChangedError(RuntimeError):
+    """A session key no longer owns the expected conversation ID."""
+
+
+class SessionModelOverrideChangedError(RuntimeError):
+    """A newer explicit model selection superseded an in-flight reset."""
+
+
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
@@ -1299,6 +1307,9 @@ class AsyncSessionStore:
 # from a deliberate ``store._db = None`` (which disables the DB and selects
 # the JSONL fallback).  A plain ``None`` cannot express both.
 _DB_UNPINNED = object()
+# Distinct from ``None``: a reset may compare-and-set a durable clear, while
+# ordinary model writes intentionally omit any prior-value expectation.
+_MODEL_OVERRIDE_EXPECTATION_UNSET = object()
 
 
 class SessionStore:
@@ -3144,7 +3155,12 @@ class SessionStore:
             return True
 
     def set_model_override(
-        self, session_key: str, override: Optional[Dict[str, Any]]
+        self,
+        session_key: str,
+        override: Optional[Dict[str, Any]],
+        *,
+        expected_session_id: Optional[str] = None,
+        expected_model_override: Any = _MODEL_OVERRIDE_EXPECTATION_UNSET,
     ) -> None:
         """Persist (or clear) the session-scoped /model override.
 
@@ -3153,17 +3169,158 @@ class SessionStore:
         are re-resolved at rehydration time via the normal runtime provider
         resolution.  Pass ``None`` (or a dict with no persistable values)
         to clear the persisted override, e.g. on /new.
+
+        ``expected_session_id`` is an optional compare-and-set guard for a
+        caller that already resolved a client-visible conversation ID.
+        ``expected_model_override`` optionally guards the durable selection
+        previously read by that caller; the private sentinel keeps ordinary
+        model writes from changing behavior.  When supplied, both comparisons
+        and the durable mutation share this store lock, so a stale request
+        cannot clear a successor route or a newer same-session selection.
         """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
                 return
+            if (
+                expected_session_id is not None
+                and entry.session_id != expected_session_id
+            ):
+                raise SessionRouteChangedError(
+                    "The gateway route no longer belongs to the requested session."
+                )
+            if expected_model_override is not _MODEL_OVERRIDE_EXPECTATION_UNSET:
+                expected_cleaned = sanitize_model_override(expected_model_override)
+                if entry.model_override != expected_cleaned:
+                    raise SessionModelOverrideChangedError(
+                        "A newer explicit model selection superseded this reset."
+                    )
             cleaned = sanitize_model_override(override)
             if entry.model_override == cleaned:
                 return
             entry.model_override = cleaned
             self._save()
+
+    def run_model_override_reset_cleanup_if_current(
+        self,
+        session_key: str,
+        expected_session_id: Optional[str],
+        cleanup: Callable[[], None],
+    ) -> None:
+        """Run synchronous reset cleanup only while this route still owns it.
+
+        The durable reset has already been read back before this small critical
+        section.  Keep the final route/override receipt and volatile cleanup
+        under the same SessionStore lock: a successor route or a newly saved
+        explicit selection either wins before this lock (and raises) or starts
+        after the reset cleanup has finished.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                if expected_session_id is not None:
+                    raise SessionRouteChangedError(
+                        "The gateway route no longer belongs to the requested session."
+                    )
+                cleanup()
+                return
+            if (
+                expected_session_id is not None
+                and entry.session_id != expected_session_id
+            ):
+                raise SessionRouteChangedError(
+                    "The gateway route no longer belongs to the requested session."
+                )
+            if entry.model_override is not None:
+                raise SessionModelOverrideChangedError(
+                    "A newer explicit model selection superseded this reset."
+                )
+            cleanup()
+
+    def get_durable_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
+        """Read one model override from durable routing stores, not memory.
+
+        ``get_model_override`` intentionally returns the live ``SessionEntry``
+        and is correct for normal routing.  A control-plane reset needs a
+        stricter receipt: when state.db is available it is canonical, and the
+        optional sessions.json mirror must agree with it.  This catches the
+        legacy full-save behavior where a failed DB replacement is logged and
+        a successful JSON mirror write otherwise makes the in-memory entry look
+        cleared even though a restart would rehydrate the old DB route.
+
+        Returns the sanitized durable override or ``None`` for a durable clear.
+        Raises ``RuntimeError`` for a missing/corrupt/disagreeing durable record
+        so callers can fail closed rather than claim success.
+        """
+        if not session_key:
+            raise RuntimeError("Cannot read a durable model override without a session key.")
+
+        def _decode(entry_json: Any, store_name: str) -> Optional[Dict[str, str]]:
+            if isinstance(entry_json, str):
+                try:
+                    entry_json = json.loads(entry_json)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"{store_name} has invalid routing data for {session_key}."
+                    ) from exc
+            if not isinstance(entry_json, dict):
+                raise RuntimeError(
+                    f"{store_name} has no routing entry for {session_key}."
+                )
+            return sanitize_model_override(entry_json.get("model_override"))
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            # No known routing entry means there is no durable override to
+            # clear. This keeps a first, already-default conversation
+            # idempotent without manufacturing a session or changing history.
+            if session_key not in self._entries:
+                return None
+
+            db = self._db
+            write_json = bool(getattr(self, "_write_sessions_json", True))
+            db_override: Optional[Dict[str, str]] = None
+            if db is not None:
+                loader = getattr(db, "load_gateway_routing_entries", None)
+                if not callable(loader):
+                    raise RuntimeError("state.db cannot read gateway routing entries.")
+                try:
+                    db_rows = loader(scope=self._routing_scope())
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not read the canonical state.db route for {session_key}."
+                    ) from exc
+                if not isinstance(db_rows, dict) or session_key not in db_rows:
+                    raise RuntimeError(
+                        f"state.db has no routing entry for {session_key}."
+                    )
+                db_override = _decode(db_rows[session_key], "state.db")
+
+            # JSON is the only durable store when SQLite is absent, and is a
+            # required consistency receipt whenever its mirror is enabled.
+            json_override: Optional[Dict[str, str]] = None
+            if db is None or write_json:
+                sessions_file = self.sessions_dir / "sessions.json"
+                try:
+                    with open(sessions_file, "r", encoding="utf-8") as f:
+                        mirror_rows = json.load(f)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not read the sessions.json mirror for {session_key}."
+                    ) from exc
+                if not isinstance(mirror_rows, dict) or session_key not in mirror_rows:
+                    raise RuntimeError(
+                        f"sessions.json has no routing entry for {session_key}."
+                    )
+                json_override = _decode(mirror_rows[session_key], "sessions.json")
+
+            if db is not None and write_json and db_override != json_override:
+                raise RuntimeError(
+                    f"state.db and sessions.json disagree about the model route for {session_key}."
+                )
+            return db_override if db is not None else json_override
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""
