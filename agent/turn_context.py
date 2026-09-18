@@ -448,12 +448,20 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    memory_query: Optional[str] = None,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
     The callables/helpers the original prologue referenced from the
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
+
+    ``memory_query`` is the optional explicit recall intent for external
+    memory prefetch. Callers that assemble a large model-facing packet (cron
+    script output, archives) pass the concise task/request here so the
+    packet never becomes the recall query; ``""`` explicitly skips automatic
+    recall. ``None`` (default) derives the intent from the user message as
+    before.
     """
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
@@ -1336,19 +1344,32 @@ def build_turn_context(
     #
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
+    # An explicit ``memory_query`` bypasses that gate: the caller already
+    # separated recall intent from the (possibly huge) model-facing message,
+    # and an empty intent is a typed skip the manager records visibly.
     ext_prefetch_cache = ""
+    _prefetch_attempted = False
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            if not is_trivial_prompt(_query):
+            if memory_query is not None:
+                _prefetch_attempted = True
+                ext_prefetch_cache = (
+                    agent._memory_manager.prefetch_all(_query, memory_query=memory_query) or ""
+                )
+            elif not is_trivial_prompt(_query):
+                _prefetch_attempted = True
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
         # Deterministic, model-independent recall indicator: when memory was
         # actually injected this turn, tell the user — don't rely on the model
-        # to surface it. Rendered by Hermes (via _emit_status), so it always
-        # shows and can't be silently dropped by the model.
-        if ext_prefetch_cache:
+        # to surface it. Consulted after EVERY attempted prefetch so a typed
+        # skip / timeout / cancellation is visible too, instead of silently
+        # reading as "no remembered facts"; a successful no-hit renders "".
+        # Rendered by Hermes (via _emit_status), so it always shows and can't
+        # be silently dropped by the model.
+        if _prefetch_attempted:
             try:
                 _recall_indicator = agent._memory_manager.describe_recall()
                 if _recall_indicator:

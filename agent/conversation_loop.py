@@ -1771,9 +1771,15 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    memory_query: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
+
+    ``memory_query``: optional explicit recall intent for external memory
+    prefetch, separate from the model-facing ``user_message`` (cron passes
+    the job's own prompt here rather than the assembled script packet).
+    ``""`` skips automatic recall; ``None`` derives it from the message.
 
     Args:
         user_message (str): The user's message/question
@@ -1857,6 +1863,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        memory_query=memory_query,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message

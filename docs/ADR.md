@@ -17,6 +17,46 @@ Decision:
 
 Verification covers JSON and SQLite routing persistence plus fresh rehydration, thread isolation, session/persona preservation, one-turn cancellation, write failure/read-back behavior, idempotence, channel-default restoration, busy refusal, configured MoA default changes, and missing/disabled/default-named preset cases.
 
+## 2026-09-18: Automatic recall is bounded intent on owned, cancellable readers
+
+Status: Accepted — fork implementation; deployment held for independent review.
+
+Origin: Luis commissioned the Hermes retrieval-isolation repair separately from
+the Lantern provenance/batch repair (Discord message `1550370596104306731`),
+after the 2026-09-17 gateway freeze recurred on 2026-09-18 (Atrium scar:
+oversized holographic prefetch / shared SQLite).
+
+Decision:
+- Automatic memory recall consumes **bounded task/query intent**, never an
+  evidence packet. The turn contract gains an explicit optional
+  `memory_query`; cron passes the job's own prompt (plus run context) and the
+  assembled script output stays model-facing only. The manager bounds the
+  intent (`memory.prefetch_max_query_chars`) before any provider tokenises it,
+  and the holographic FTS builder deduplicates and caps terms independently so
+  explicit search is protected too. Model/user messages are never truncated.
+- SQLite work is **owned per operation**. The holographic store keeps its
+  shared, refcounted writer, but every read path (prefetch, explicit tools,
+  system-prompt count, list/search) opens its own reader with a progress
+  handler and `interrupt()` hook, closed in the worker's `finally`. Lock waits
+  are bounded separately from statement deadlines.
+- A prefetch timeout **cancels** rather than abandons: the manager hands
+  cancellation-aware providers a token and observes completion; legacy
+  providers keep the old signature and skip-until-return behaviour. One
+  request's cancellation never touches a sibling reader or the writer. No new
+  process service; process isolation was not needed because the only
+  uncooperative path (SQLite) is interruptible.
+- Retrieval outcomes are **typed and visible**: skip / timeout / cancel render
+  through the existing recall indicator; a successful no-hit stays silent.
+- The cron request boundary rejects an assembled request that cannot fit the
+  model window before memory prefetch or any model/fallback call, retaining
+  the request as an artifact outside the job output directory.
+
+Contract change: the turn prologue consults `describe_recall()` after every
+attempted prefetch (previously only when text was injected). These are
+per-operation execution budgets; they do not reduce Lantern reading coverage
+(see the 2026-08-28 reader-starvation ruling). Details:
+`docs/memory-recall-isolation.md`.
+
 ## 2026-09-17: Stateful provider affinity rotates on committed compaction
 
 Status: Accepted — source correction; deployment explicitly held.

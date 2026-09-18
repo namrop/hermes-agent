@@ -3,16 +3,28 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import contextlib
+import logging
 import os
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
+from typing import Any, Iterator, Optional
+
+from agent.memory_provider import (
+    RecallCancellation,
+    RecallDeadlineExceeded,
+    RecallInterrupted,
+)
 
 try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -96,10 +108,84 @@ def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
 
 
+class _ReaderState:
+    """Deadline / cancellation view for one owned reader connection."""
+
+    __slots__ = ("cancel", "deadline", "interrupted")
+
+    def __init__(self, cancel: Optional[RecallCancellation], deadline: Optional[float]) -> None:
+        self.cancel = cancel
+        self.deadline = deadline
+        self.interrupted = False
+
+    def should_stop(self) -> bool:
+        if self.cancel is not None and self.cancel.should_stop():
+            return True
+        return self.deadline is not None and time.monotonic() >= self.deadline
+
+    def interruption(self) -> Optional[RecallInterrupted]:
+        if self.cancel is not None:
+            typed = self.cancel.interruption()
+            if typed is not None:
+                return typed
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            return RecallDeadlineExceeded("retrieval deadline exceeded")
+        if self.interrupted:
+            return RecallDeadlineExceeded("retrieval interrupted")
+        return None
+
+
+class _ReaderConnection:
+    """Retry bounded SQLite busy waits while polling one reader's token.
+
+    SQLite does not call a progress handler, nor reliably honour
+    ``Connection.interrupt()``, while its busy handler is sleeping on a file
+    lock. Keep each native busy wait short, then retry at Python level until
+    the operation's lock budget or cancellation/deadline is exhausted.
+    """
+
+    BUSY_WAIT_SLICE_S = 0.025
+
+    def __init__(self, store, connection, state: _ReaderState, lock_wait: float) -> None:
+        self._store = store
+        self._connection = connection
+        self._state = state
+        self._wait_deadline = time.monotonic() + lock_wait
+
+    def _remaining_wait(self) -> float:
+        remaining = self._wait_deadline - time.monotonic()
+        if self._state.deadline is not None:
+            remaining = min(remaining, self._state.deadline - time.monotonic())
+        return max(0.0, remaining)
+
+    def execute(self, sql, parameters=()):
+        while True:
+            typed = self._state.interruption()
+            if typed is not None:
+                raise typed
+            try:
+                return self._connection.execute(sql, parameters)
+            except sqlite3.OperationalError as exc:
+                if not self._store.is_contention_error(exc):
+                    raise
+                typed = self._state.interruption()
+                if typed is not None:
+                    raise typed from exc
+                remaining = self._remaining_wait()
+                if remaining <= 0:
+                    raise RecallDeadlineExceeded(
+                        f"database busy: reader lock wait of {self._store.reader_lock_wait_seconds:.1f}s exceeded ({exc})"
+                    ) from exc
+                time.sleep(min(0.005, remaining))
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 class MemoryStore:
     """SQLite-backed fact store with entity resolution and trust scoring."""
 
-    # --- Process-wide shared connection registry -------------------------
+    # --- Process-wide shared WRITER connection registry --------------------
     # SQLite permits only one writer at a time. Each MemoryStore instance used
     # to open its own connection guarded by its own RLock, so the several
     # providers that coexist in one process (the main agent plus every
@@ -107,18 +193,45 @@ class MemoryStore:
     # writes that were not rolled back on error, one connection could leave an
     # open write transaction that pinned the write lock and made every other
     # connection's write fail with "database is locked" for the full busy
-    # timeout. All instances for the same database now share ONE connection and
-    # ONE re-entrant lock, so access is fully serialized and cross-connection
-    # contention is impossible. The shared connection is refcounted, so closing
-    # one instance never tears the connection out from under a live sibling.
+    # timeout. All instances for the same database share ONE writer connection
+    # and ONE re-entrant lock, so writes are fully serialized. The shared
+    # connection is refcounted, so closing one instance never tears the
+    # connection out from under a live sibling.
+    #
+    # Reads do NOT go through that connection. The 2026-09-17 gateway freeze
+    # (Atrium scar: oversized holographic prefetch / shared SQLite) showed that
+    # a long FTS statement left running on the shared
+    # ``check_same_thread=False`` connection locks the whole interpreter as
+    # soon as a second thread enters the same connection. Every read path now
+    # opens its own short-lived reader via :meth:`reader`, owns it for the
+    # duration of one operation, and closes it in ``finally``. A reader
+    # carries a deadline / cancellation token enforced with an SQLite progress
+    # handler plus ``Connection.interrupt()``, so a cancelled retrieval releases
+    # its connection without touching sibling readers or the writer.
     _shared: dict = {}
     _shared_guard = threading.Lock()
+
+    # How many SQLite VM opcodes run between cancellation/deadline checks on
+    # an owned reader. Small enough to react within milliseconds on a
+    # pathological statement, large enough to be free on ordinary ones.
+    READER_PROGRESS_OPCODES = 1000
+    # Busy-timeout (file-lock wait) for reader connections. Independent of the
+    # statement deadline: a reader queued behind a writer's commit in
+    # journal_mode=DELETE waits at most this long before failing with
+    # "database is locked" instead of blocking indefinitely.
+    DEFAULT_READER_LOCK_WAIT_S = 2.0
+    # Bounded wait for best-effort bookkeeping writes (retrieval_count bumps)
+    # on the serialized writer lock.
+    DEFAULT_WRITER_LOCK_WAIT_S = 5.0
 
     def __init__(
         self,
         db_path: "str | Path | None" = None,
         default_trust: float = 0.5,
         hrr_dim: int = 1024,
+        *,
+        reader_lock_wait_seconds: Optional[float] = None,
+        writer_lock_wait_seconds: Optional[float] = None,
     ) -> None:
         if db_path is None:
             from hermes_constants import get_hermes_home
@@ -128,6 +241,16 @@ class MemoryStore:
         self.default_trust = _clamp_trust(default_trust)
         self.hrr_dim = hrr_dim
         self._hrr_available = hrr._HAS_NUMPY
+        self.reader_lock_wait_seconds = (
+            self.DEFAULT_READER_LOCK_WAIT_S
+            if reader_lock_wait_seconds is None
+            else max(0.0, float(reader_lock_wait_seconds))
+        )
+        self.writer_lock_wait_seconds = (
+            self.DEFAULT_WRITER_LOCK_WAIT_S
+            if writer_lock_wait_seconds is None
+            else max(0.0, float(writer_lock_wait_seconds))
+        )
 
         # Acquire (or open) the process-wide shared connection for this DB.
         # resolve() (not just expanduser) so symlinked/relative paths to the
@@ -151,7 +274,18 @@ class MemoryStore:
                     isolation_level=None,
                 )
                 conn.row_factory = sqlite3.Row
-                entry = {"conn": conn, "lock": threading.RLock(), "refs": 0, "ready": False}
+                entry = {
+                    "conn": conn,
+                    "lock": threading.RLock(),
+                    "refs": 0,
+                    "ready": False,
+                    # Reader diagnostics (owned per-operation connections are
+                    # never registry entries themselves; only counted here).
+                    "readers_active": 0,
+                    "readers_opened": 0,
+                    "readers_closed": 0,
+                    "reader_interrupts": 0,
+                }
                 MemoryStore._shared[self._key] = entry
             entry["refs"] += 1
             self._entry = entry
@@ -181,6 +315,280 @@ class MemoryStore:
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
         self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Owned reader connections
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_interrupt_error(exc: BaseException) -> bool:
+        """True when ``exc`` is SQLite reporting an interrupted statement."""
+        return isinstance(exc, sqlite3.OperationalError) and "interrupt" in str(exc).lower()
+
+    @staticmethod
+    def is_busy_error(exc: BaseException) -> bool:
+        """True when ``exc`` is SQLite giving up on the file lock (busy timeout)."""
+        if not isinstance(exc, sqlite3.OperationalError):
+            return False
+        text = str(exc).lower()
+        return "database is locked" in text or "database is busy" in text
+
+    @classmethod
+    def is_contention_error(cls, exc: BaseException) -> bool:
+        """Busy-timeout errors plus an FTS5 constructor failing under contention.
+
+        FTS5's xConnect runs internal statements when a reader first attaches
+        the virtual table; if those hit the file lock (or an interrupt) the
+        error reads ``vtable constructor failed: facts_fts``.
+        """
+        if cls.is_busy_error(exc):
+            return True
+        return isinstance(exc, sqlite3.OperationalError) and "vtable constructor failed" in str(exc).lower()
+
+    def _reader_progress_tick(self, state: _ReaderState) -> bool:
+        """Progress-handler hook for owned readers. Return True to abort.
+
+        Runs every ``READER_PROGRESS_OPCODES`` VM opcodes on the reader's own
+        thread. Kept as a method (not a closure) so diagnostics and tests can
+        observe or slow the real cancellation path.
+        """
+        return state.should_stop()
+
+    @contextlib.contextmanager
+    def reader(
+        self,
+        *,
+        cancel: Optional[RecallCancellation] = None,
+        deadline: Optional[float] = None,
+        timeout: Optional[float] = None,
+        lock_wait: Optional[float] = None,
+    ) -> Iterator[Any]:
+        """Open a private read-only connection for ONE operation.
+
+        The connection is created on the calling thread, owned by it, and
+        closed in ``finally`` when the block exits — never shared, never
+        reused. ``cancel`` (a :class:`RecallCancellation`), ``deadline``
+        (monotonic) or ``timeout`` (seconds from now) install an SQLite
+        progress handler that aborts the running statement; ``cancel`` also
+        registers ``Connection.interrupt()`` so a cancel from another thread
+        takes effect immediately. An aborted statement surfaces as the typed
+        :class:`RecallCancelled` / :class:`RecallDeadlineExceeded`.
+
+        ``lock_wait`` bounds the busy wait on the database file lock
+        independently of the statement deadline.
+        """
+        entry = self._entry
+        if entry is None:
+            raise sqlite3.ProgrammingError("MemoryStore is closed")
+        if timeout is not None:
+            own = time.monotonic() + float(timeout)
+            deadline = own if deadline is None else min(deadline, own)
+        if cancel is not None and cancel.deadline is not None:
+            deadline = cancel.deadline if deadline is None else min(deadline, cancel.deadline)
+        wait = self.reader_lock_wait_seconds if lock_wait is None else max(0.0, float(lock_wait))
+        state = _ReaderState(cancel, deadline)
+        # A native busy handler does not run our SQLite progress callback.
+        # Keep each native wait short; _ReaderConnection retries those slices
+        # while polling the request token and the complete lock budget.
+        busy_slice = min(wait, _ReaderConnection.BUSY_WAIT_SLICE_S)
+        conn = sqlite3.connect(
+            self._key,
+            check_same_thread=False,
+            timeout=busy_slice,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        conn_guard = threading.Lock()
+        closed = False
+
+        def _interrupt() -> None:
+            # Called from the cancelling thread; never touch a closed handle.
+            state.interrupted = True
+            with conn_guard:
+                if not closed:
+                    try:
+                        conn.interrupt()
+                    except Exception:
+                        pass
+
+        with MemoryStore._shared_guard:
+            entry["readers_active"] += 1
+            entry["readers_opened"] += 1
+        try:
+            if cancel is not None or deadline is not None:
+                conn.set_progress_handler(
+                    lambda: 1 if self._reader_progress_tick(state) else 0,
+                    max(1, int(self.READER_PROGRESS_OPCODES)),
+                )
+            if cancel is not None:
+                cancel.add_interrupt(_interrupt)
+            reader_conn = _ReaderConnection(self, conn, state, wait)
+            reader_conn.execute("PRAGMA query_only = 1")
+            try:
+                yield reader_conn
+            except sqlite3.OperationalError as exc:
+                # Token state first, message second: an interrupt that lands
+                # while a virtual table (FTS5) constructor is running its own
+                # internal statements surfaces as "vtable constructor failed",
+                # not "interrupted". Any SQLite error on a reader whose token
+                # is stopped is a consequence of that stop.
+                typed = state.interruption()
+                if typed is not None:
+                    with MemoryStore._shared_guard:
+                        entry["reader_interrupts"] += 1
+                    raise typed from exc
+                if self.is_contention_error(exc):
+                    # The bounded file-lock wait ran out (a writer's commit
+                    # held the lock for longer than ``lock_wait``), or the FTS
+                    # virtual table could not be attached under contention.
+                    # Surface it as a typed, visible outcome — never "no hits".
+                    raise RecallDeadlineExceeded(
+                        f"database busy: reader lock wait of {wait:.1f}s exceeded ({exc})"
+                    ) from exc
+                raise
+        finally:
+            if cancel is not None:
+                cancel.remove_interrupt(_interrupt)
+            with conn_guard:
+                closed = True
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            with MemoryStore._shared_guard:
+                entry["readers_active"] -= 1
+                entry["readers_closed"] += 1
+
+    def diagnostics(self) -> dict:
+        """Connection-ownership counters for logs and tests.
+
+        Never includes query text.
+        """
+        entry = self._entry
+        if entry is None:
+            return {
+                "db": str(self.db_path),
+                "open": False,
+                "writer_refs": 0,
+                "active_readers": 0,
+                "readers_opened": 0,
+                "readers_closed": 0,
+                "reader_interrupts": 0,
+            }
+        with MemoryStore._shared_guard:
+            return {
+                "db": str(self.db_path),
+                "open": True,
+                "writer_refs": entry["refs"],
+                "active_readers": entry["readers_active"],
+                "readers_opened": entry["readers_opened"],
+                "readers_closed": entry["readers_closed"],
+                "reader_interrupts": entry["reader_interrupts"],
+            }
+
+    def count_facts(
+        self,
+        *,
+        cancel: Optional[RecallCancellation] = None,
+        timeout: Optional[float] = 2.0,
+    ) -> int:
+        """Total fact count on an owned reader (system-prompt block)."""
+        with self.reader(cancel=cancel, timeout=timeout) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM facts").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def bump_retrieval_counts(
+        self,
+        fact_ids: "list[int]",
+        *,
+        cancel: Optional[RecallCancellation] = None,
+        deadline: Optional[float] = None,
+        lock_wait: Optional[float] = None,
+    ) -> bool:
+        """Increment ``retrieval_count`` for surfaced facts (best-effort).
+
+        Accounting shares the retrieval's absolute cancellation/deadline. It
+        may skip under ordinary writer lock pressure, but a cancelled request
+        never waits on either the in-process writer lock or SQLite's busy
+        handler beyond its remaining budget.
+        """
+        ids = [int(i) for i in fact_ids if i is not None]
+        if not ids:
+            return True
+        wait = self.writer_lock_wait_seconds if lock_wait is None else max(0.0, float(lock_wait))
+        started = time.monotonic()
+        lock_deadline = started + wait
+        if cancel is not None and cancel.deadline is not None:
+            deadline = cancel.deadline if deadline is None else min(deadline, cancel.deadline)
+
+        def _check_interruption() -> None:
+            if cancel is not None:
+                cancel.raise_if_stopped()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RecallDeadlineExceeded("retrieval deadline exceeded during retrieval_count accounting")
+
+        def _remaining() -> float:
+            remaining = lock_deadline - time.monotonic()
+            if deadline is not None:
+                remaining = min(remaining, deadline - time.monotonic())
+            return max(0.0, remaining)
+
+        acquired = False
+        while not acquired:
+            _check_interruption()
+            remaining = _remaining()
+            if remaining <= 0:
+                acquired = self._lock.acquire(blocking=False)
+                if acquired:
+                    break
+                _check_interruption()
+                logger.warning(
+                    "holographic: retrieval_count update skipped — writer lock busy for %.1fs",
+                    wait,
+                )
+                return False
+            acquired = self._lock.acquire(timeout=min(_ReaderConnection.BUSY_WAIT_SLICE_S, remaining))
+
+        try:
+            while True:
+                _check_interruption()
+                remaining = _remaining()
+                if remaining <= 0:
+                    _check_interruption()
+                    logger.warning(
+                        "holographic: retrieval_count update skipped — database busy for %.1fs",
+                        wait,
+                    )
+                    return False
+                # Do not interrupt this shared connection: another ordinary
+                # writer may use it next. Short busy slices let this request
+                # observe only its own token between failed SQLite attempts.
+                busy_ms = max(1, int(min(_ReaderConnection.BUSY_WAIT_SLICE_S, remaining) * 1000))
+                self._conn.execute(f"PRAGMA busy_timeout = {busy_ms}")
+                try:
+                    placeholders = ", ".join("?" * len(ids))
+                    self._conn.execute(
+                        f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                        f"WHERE fact_id IN ({placeholders})",
+                        ids,
+                    )
+                    self._conn.commit()
+                    return True
+                except sqlite3.OperationalError as exc:
+                    if not self.is_busy_error(exc):
+                        raise
+                    _check_interruption()
+                    if _remaining() <= 0:
+                        _check_interruption()
+                        logger.warning(
+                            "holographic: retrieval_count update skipped — database busy for %.1fs",
+                            wait,
+                        )
+                        return False
+                    time.sleep(min(0.005, _remaining()))
+        finally:
+            self._conn.execute("PRAGMA busy_timeout = 10000")
+            self._lock.release()
 
     # ------------------------------------------------------------------
     # Public API
@@ -237,57 +645,66 @@ class MemoryStore:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        *,
+        cancel: Optional[RecallCancellation] = None,
+        timeout: Optional[float] = None,
     ) -> list[dict]:
         """Full-text search over facts using FTS5.
 
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
         descending. Also increments retrieval_count for matched facts.
+
+        Reads on an owned reader (bounded by ``timeout`` / ``cancel``); the
+        query is bounded by the retriever's sanitizer before FTS expansion.
         """
-        with self._lock:
-            query = query.strip()
-            if not query:
-                return []
+        query = query.strip()
+        if not query:
+            return []
 
-            # FTS5 AND-joins tokens by default, which zeroes out recall on
-            # natural-language queries. Reuse the retriever's sanitizer
-            # (stopword drop + OR-join content tokens). Imported lazily to
-            # avoid a store->retrieval import cycle.
-            from plugins.memory.holographic.retrieval import FactRetriever
+        # FTS5 AND-joins tokens by default, which zeroes out recall on
+        # natural-language queries. Reuse the retriever's sanitizer
+        # (stopword drop + bounded, deduplicated OR-join of content tokens).
+        # Imported lazily to avoid a store->retrieval import cycle.
+        from plugins.memory.holographic.retrieval import FactRetriever
 
-            match_query = FactRetriever._sanitize_fts_query(query)
-            params: list = [match_query, min_trust]
-            category_clause = ""
-            if category is not None:
-                category_clause = "AND f.category = ?"
-                params.append(category)
-            params.append(limit)
+        match_query = FactRetriever._sanitize_fts_query(query)
+        params: list = [match_query, min_trust]
+        category_clause = ""
+        if category is not None:
+            category_clause = "AND f.category = ?"
+            params.append(category)
+        params.append(limit)
 
-            sql = f"""
-                SELECT f.fact_id, f.content, f.category, f.tags,
-                       f.trust_score, f.retrieval_count, f.helpful_count,
-                       f.created_at, f.updated_at
-                FROM facts f
-                JOIN facts_fts fts ON fts.rowid = f.fact_id
-                WHERE facts_fts MATCH ?
-                  AND f.trust_score >= ?
-                  {category_clause}
-                ORDER BY fts.rank, f.trust_score DESC
-                LIMIT ?
-            """
+        sql = f"""
+            SELECT f.fact_id, f.content, f.category, f.tags,
+                   f.trust_score, f.retrieval_count, f.helpful_count,
+                   f.created_at, f.updated_at
+            FROM facts f
+            JOIN facts_fts fts ON fts.rowid = f.fact_id
+            WHERE facts_fts MATCH ?
+              AND f.trust_score >= ?
+              {category_clause}
+            ORDER BY fts.rank, f.trust_score DESC
+            LIMIT ?
+        """
 
-            rows = self._conn.execute(sql, params).fetchall()
+        token = (
+            RecallCancellation(parent=cancel, timeout=timeout)
+            if timeout is not None
+            else cancel
+        )
+        try:
+            with self.reader(cancel=token) as conn:
+                rows = conn.execute(sql, params).fetchall()
             results = [self._row_to_dict(r) for r in rows]
 
             if results:
-                ids = [r["fact_id"] for r in results]
-                placeholders = ",".join("?" * len(ids))
-                self._conn.execute(
-                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id IN ({placeholders})",
-                    ids,
-                )
-                self._conn.commit()
+                self.bump_retrieval_counts([r["fact_id"] for r in results], cancel=token)
 
             return results
+        finally:
+            if token is not None and token is not cancel:
+                token.detach()
 
     def update_fact(
         self,
@@ -375,30 +792,34 @@ class MemoryStore:
         category: str | None = None,
         min_trust: float = 0.0,
         limit: int = 50,
+        *,
+        cancel: Optional[RecallCancellation] = None,
+        timeout: Optional[float] = None,
     ) -> list[dict]:
         """Browse facts ordered by trust_score descending.
 
-        Optionally filter by category and minimum trust score.
+        Optionally filter by category and minimum trust score. Reads on an
+        owned reader connection.
         """
-        with self._lock:
-            params: list = [min_trust]
-            category_clause = ""
-            if category is not None:
-                category_clause = "AND category = ?"
-                params.append(category)
-            params.append(limit)
+        params: list = [min_trust]
+        category_clause = ""
+        if category is not None:
+            category_clause = "AND category = ?"
+            params.append(category)
+        params.append(limit)
 
-            sql = f"""
-                SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
-                FROM facts
-                WHERE trust_score >= ?
-                  {category_clause}
-                ORDER BY trust_score DESC
-                LIMIT ?
-            """
-            rows = self._conn.execute(sql, params).fetchall()
-            return [self._row_to_dict(r) for r in rows]
+        sql = f"""
+            SELECT fact_id, content, category, tags, trust_score,
+                   retrieval_count, helpful_count, created_at, updated_at
+            FROM facts
+            WHERE trust_score >= ?
+              {category_clause}
+            ORDER BY trust_score DESC
+            LIMIT ?
+        """
+        with self.reader(cancel=cancel, timeout=timeout) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_dict(r) for r in rows]
 
     def record_feedback(self, fact_id: int, helpful: bool) -> dict:
         """Record user feedback and adjust trust asymmetrically.

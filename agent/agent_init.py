@@ -1861,7 +1861,18 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+
+                def _mem_budget(key, caster, default):
+                    try:
+                        value = caster(mem_config.get(key))
+                    except (TypeError, ValueError):
+                        return default
+                    return value if value > 0 else default
+
+                agent._memory_manager = _MemoryManager(
+                    external_prefetch_timeout=_mem_budget("prefetch_timeout_seconds", float, None),
+                    prefetch_max_query_chars=_mem_budget("prefetch_max_query_chars", int, None),
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

@@ -13,6 +13,12 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       default_trust: 0.5
       min_trust_threshold: 0.3
       temporal_decay_half_life: 0
+      # Retrieval execution budgets (see docs/memory-recall-isolation.md)
+      retrieval_timeout_seconds: 6     # per automatic-recall SQL deadline
+      tool_timeout_seconds: 20         # per explicit fact_store read action
+      max_query_chars: 4000            # query prefix used for retrieval
+      max_query_terms: 64              # distinct FTS OR terms per query
+      lock_wait_seconds: 2             # reader busy-wait on the DB file lock
 """
 
 from __future__ import annotations
@@ -20,9 +26,16 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import (
+    RECALL_OUTCOME_ERROR,
+    RECALL_OUTCOME_NO_HITS,
+    MemoryProvider,
+    RecallCancellation,
+    RecallInterrupted,
+    RecallStatus,
+)
 from tools.registry import tool_error
 from utils import is_truthy_value
 from .store import MemoryStore
@@ -30,6 +43,22 @@ from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+
+_PROVIDER_LABEL = "Holographic"
+
+
+def _float_or(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_or(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +147,15 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        # Execution budgets. These bound how much retrieval WORK one request
+        # may do; they are not reader caps on stored data.
+        self._retrieval_timeout = _float_or(self._config.get("retrieval_timeout_seconds"), 6.0)
+        self._tool_timeout = _float_or(self._config.get("tool_timeout_seconds"), 20.0)
+        self._max_query_chars = _int_or(self._config.get("max_query_chars"), FactRetriever._MAX_QUERY_CHARS)
+        self._max_query_terms = _int_or(self._config.get("max_query_terms"), FactRetriever._MAX_QUERY_TERMS)
+        self._lock_wait = _float_or(self._config.get("lock_wait_seconds"), MemoryStore.DEFAULT_READER_LOCK_WAIT_S)
+        # Typed result of the LAST prefetch, for the recall indicator.
+        self._last_recall: Optional[RecallStatus] = None
 
     @property
     def name(self) -> str:
@@ -169,12 +207,20 @@ class HolographicMemoryProvider(MemoryProvider):
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
-        self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
+        self._store = MemoryStore(
+            db_path=db_path,
+            default_trust=default_trust,
+            hrr_dim=hrr_dim,
+            reader_lock_wait_seconds=self._lock_wait,
+        )
         self._retriever = FactRetriever(
             store=self._store,
             temporal_decay_half_life=temporal_decay,
             hrr_weight=hrr_weight,
             hrr_dim=hrr_dim,
+            max_query_chars=self._max_query_chars,
+            max_query_terms=self._max_query_terms,
+            deadline_seconds=self._retrieval_timeout,
         )
         self._session_id = session_id
 
@@ -182,9 +228,9 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._store:
             return ""
         try:
-            total = self._store._conn.execute(
-                "SELECT COUNT(*) FROM facts"
-            ).fetchone()[0]
+            # Owned reader with a short deadline: the prompt count must never
+            # queue behind (or enter) a retrieval running on another thread.
+            total = self._store.count_facts(timeout=2.0)
         except Exception:
             total = 0
         if total == 0:
@@ -201,27 +247,76 @@ class HolographicMemoryProvider(MemoryProvider):
             f"Use fact_feedback to rate facts after using them (trains trust scores)."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        cancel: Optional[RecallCancellation] = None,
+    ) -> str:
+        """Automatic recall for the upcoming turn.
+
+        ``cancel`` is the manager's cancellation token (deadline = the
+        prefetch timeout). The retriever composes it with its own SQL
+        deadline (``retrieval_timeout_seconds``) and runs every read on an
+        owned reader connection. Typed interruptions propagate so the
+        manager records "timed out" / "cancelled" instead of "no hits".
+        """
+        self._last_recall = None
         if not self._retriever or not query:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
-            if not results:
-                return ""
-            lines = []
-            for r in results:
-                trust = r.get("trust_score", r.get("trust", 0))
-                lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
-            # Point-of-use reminder: the only natural moment to rate a fact is
-            # when it is injected. The system-prompt block alone never surfaced
-            # the instruction where the behavior fires, so the trust trainer
-            # stayed dormant (live db: zero ratings ever). One line, at the
-            # injection site, closes that gap.
-            lines.append("Rate facts you actually used: fact_feedback(action=helpful|unhelpful, fact_id)")
-            return "## Holographic Memory\n" + "\n".join(lines)
+            results = self._retriever.search(
+                query, min_trust=self._min_trust, limit=5, cancel=cancel
+            )
+        except RecallInterrupted as exc:
+            self._last_recall = RecallStatus(
+                _PROVIDER_LABEL, 0, outcome=exc.outcome, detail=str(exc)
+            )
+            raise
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
+            self._last_recall = RecallStatus(
+                _PROVIDER_LABEL, 0, outcome=RECALL_OUTCOME_ERROR, detail=type(e).__name__
+            )
             return ""
+        if not results:
+            self._last_recall = RecallStatus(_PROVIDER_LABEL, 0, outcome=RECALL_OUTCOME_NO_HITS)
+            return ""
+        self._last_recall = RecallStatus(_PROVIDER_LABEL, len(results))
+        lines = []
+        for r in results:
+            trust = r.get("trust_score", r.get("trust", 0))
+            lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
+        # Point-of-use reminder: the only natural moment to rate a fact is
+        # when it is injected. The system-prompt block alone never surfaced
+        # the instruction where the behavior fires, so the trust trainer
+        # stayed dormant (live db: zero ratings ever). One line, at the
+        # injection site, closes that gap.
+        lines.append("Rate facts you actually used: fact_feedback(action=helpful|unhelpful, fact_id)")
+        return "## Holographic Memory\n" + "\n".join(lines)
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        """Typed outcome of the LAST prefetch (recalled / no_hits / timed_out …)."""
+        return self._last_recall
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Connection-ownership counters plus the last recall outcome."""
+        out: Dict[str, Any] = {
+            "provider": self.name,
+            "retrieval_timeout_seconds": self._retrieval_timeout,
+            "max_query_chars": self._max_query_chars,
+            "max_query_terms": self._max_query_terms,
+        }
+        if self._store is not None:
+            out["store"] = self._store.diagnostics()
+        if self._last_recall is not None:
+            out["last_recall"] = {
+                "outcome": self._last_recall.outcome,
+                "count": self._last_recall.count,
+                "detail": self._last_recall.detail,
+            }
+        return out
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         # Holographic memory stores explicit facts via tools, not auto-sync.
@@ -274,6 +369,10 @@ class HolographicMemoryProvider(MemoryProvider):
 
     # -- Tool handlers -------------------------------------------------------
 
+    def _tool_token(self) -> RecallCancellation:
+        """Deadline token for one explicit tool read (probe/search/…)."""
+        return RecallCancellation(timeout=self._tool_timeout if self._tool_timeout > 0 else None)
+
     def _handle_fact_store(self, args: dict) -> str:
         try:
             action = args["action"]
@@ -294,6 +393,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
+                    cancel=self._tool_token(),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -302,6 +402,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["entity"],
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    cancel=self._tool_token(),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -310,6 +411,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["entity"],
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    cancel=self._tool_token(),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -321,6 +423,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     entities,
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    cancel=self._tool_token(),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -328,6 +431,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 results = retriever.contradict(
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    cancel=self._tool_token(),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -350,6 +454,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", 0.0)),
                     limit=int(args.get("limit", 10)),
+                    cancel=self._tool_token(),
                 )
                 return json.dumps({"facts": facts, "count": len(facts)})
 
@@ -358,6 +463,11 @@ class HolographicMemoryProvider(MemoryProvider):
 
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
+        except RecallInterrupted as exc:
+            return tool_error(
+                f"fact_store {args.get('action', '?')} timed out ({exc}); narrow the query "
+                "or raise plugins.hermes-memory-store.tool_timeout_seconds"
+            )
         except Exception as exc:
             return tool_error(str(exc))
 

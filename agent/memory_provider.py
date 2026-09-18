@@ -35,15 +35,29 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 # Default glyph for the deterministic memory indicators. Providers override
 # per-status with their own brand mark (e.g. Hindsight uses "👁️").
 INDICATOR_GLYPH = "🧠"
+
+# Typed recall outcomes. ``recalled`` and ``no_hits`` are successful
+# retrievals (content injected / nothing relevant); the others describe why
+# automatic recall did NOT run to completion, so the UI can say "skipped" or
+# "timed out" instead of silently presenting a failure as "no remembered
+# facts" (the 2026-09-17 gateway-freeze scar).
+RECALL_OUTCOME_RECALLED = "recalled"
+RECALL_OUTCOME_NO_HITS = "no_hits"
+RECALL_OUTCOME_SKIPPED = "skipped"
+RECALL_OUTCOME_TIMED_OUT = "timed_out"
+RECALL_OUTCOME_CANCELLED = "cancelled"
+RECALL_OUTCOME_ERROR = "error"
 
 
 @dataclass(frozen=True)
@@ -57,11 +71,176 @@ class RecallStatus:
     count (e.g. a synthesized reflect answer), which the indicator renders
     generically rather than as "0 memories". ``glyph`` is the brand mark the
     indicator leads with.
+
+    ``outcome`` types the result (see ``RECALL_OUTCOME_*``). The default,
+    ``recalled``, keeps every existing positional/keyword construction
+    unchanged. Providers that can distinguish "nothing matched" from "the
+    retrieval was skipped / timed out / cancelled" set it accordingly and put
+    a short human-readable cause in ``detail`` (never the query text).
     """
 
     provider_label: str
     count: int
     glyph: str = INDICATOR_GLYPH
+    outcome: str = RECALL_OUTCOME_RECALLED
+    detail: str = ""
+
+
+class RecallInterrupted(Exception):
+    """Base for typed retrieval interruptions raised out of ``prefetch``.
+
+    ``MemoryManager`` records the ``outcome`` as the provider's typed prefetch
+    result instead of treating it as an opaque provider failure.
+    """
+
+    outcome = RECALL_OUTCOME_CANCELLED
+
+
+class RecallCancelled(RecallInterrupted):
+    """The caller cancelled the retrieval (e.g. manager timeout)."""
+
+    outcome = RECALL_OUTCOME_CANCELLED
+
+
+class RecallDeadlineExceeded(RecallInterrupted):
+    """The retrieval's own deadline expired before it finished."""
+
+    outcome = RECALL_OUTCOME_TIMED_OUT
+
+
+class RecallCancellation:
+    """Cooperative cancellation token + monotonic deadline for one retrieval.
+
+    Providers that accept a ``cancel`` keyword on :meth:`MemoryProvider.prefetch`
+    receive one of these from ``MemoryManager``. They should poll
+    :meth:`should_stop` / :meth:`raise_if_stopped` at safe points and, for
+    blocking work that can be interrupted from another thread (an SQLite
+    statement, a socket), register the interrupter with
+    :meth:`add_interrupt` so :meth:`cancel` can abort it immediately.
+
+    Tokens compose: ``RecallCancellation(parent=token, timeout=6.0)`` is a
+    child that stops when the parent is cancelled/expired OR its own tighter
+    deadline passes; interrupters registered on the child fire for either.
+    The manager never cancels a sibling request — every prefetch call gets
+    its own token.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Optional[float] = None,
+        parent: Optional["RecallCancellation"] = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._reason = ""
+        self._interrupts: List[Callable[[], None]] = []
+        self._parent = parent
+        own_deadline = deadline
+        if timeout is not None:
+            own_deadline = time.monotonic() + float(timeout)
+        if parent is not None and parent.deadline is not None:
+            own_deadline = (
+                parent.deadline if own_deadline is None else min(own_deadline, parent.deadline)
+            )
+        self._deadline = own_deadline
+        if parent is not None:
+            parent.add_interrupt(self._on_parent_cancel)
+
+    # -- state -----------------------------------------------------------
+
+    @property
+    def deadline(self) -> Optional[float]:
+        """Monotonic deadline (``time.monotonic()`` scale) or ``None``."""
+        return self._deadline
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set() or (
+            self._parent is not None and self._parent.cancelled
+        )
+
+    @property
+    def reason(self) -> str:
+        if self._reason:
+            return self._reason
+        if self._parent is not None:
+            return self._parent.reason
+        return ""
+
+    def remaining(self) -> Optional[float]:
+        if self._deadline is None:
+            return None
+        return max(0.0, self._deadline - time.monotonic())
+
+    def expired(self) -> bool:
+        return self._deadline is not None and time.monotonic() >= self._deadline
+
+    def should_stop(self) -> bool:
+        return self.cancelled or self.expired()
+
+    def raise_if_stopped(self) -> None:
+        """Raise the typed interruption matching the token state, if any."""
+        if self.cancelled:
+            raise RecallCancelled(self.reason or "retrieval cancelled")
+        if self.expired():
+            raise RecallDeadlineExceeded("retrieval deadline exceeded")
+
+    def interruption(self) -> Optional[RecallInterrupted]:
+        """The typed interruption for the current state, or ``None``."""
+        try:
+            self.raise_if_stopped()
+        except RecallInterrupted as exc:
+            return exc
+        return None
+
+    # -- cancellation ----------------------------------------------------
+
+    def cancel(self, reason: str = "") -> None:
+        """Flag the token and fire every registered interrupter once."""
+        with self._lock:
+            if self._cancelled.is_set():
+                return
+            self._reason = reason or "retrieval cancelled"
+            self._cancelled.set()
+            interrupts = list(self._interrupts)
+        for fn in interrupts:
+            try:
+                fn()
+            except Exception:
+                logger.debug("recall interrupt callback failed", exc_info=True)
+
+    def _on_parent_cancel(self) -> None:
+        self.cancel(self._parent.reason if self._parent is not None else "")
+
+    def add_interrupt(self, fn: Callable[[], None]) -> None:
+        """Register ``fn`` to be called when the token is cancelled.
+
+        If the token is already cancelled the callback fires immediately, so
+        a late registration can never miss the signal.
+        """
+        with self._lock:
+            already = self._cancelled.is_set()
+            if not already:
+                self._interrupts.append(fn)
+        if already:
+            try:
+                fn()
+            except Exception:
+                logger.debug("recall interrupt callback failed", exc_info=True)
+
+    def remove_interrupt(self, fn: Callable[[], None]) -> None:
+        with self._lock:
+            try:
+                self._interrupts.remove(fn)
+            except ValueError:
+                pass
+
+    def detach(self) -> None:
+        """Unhook a child token from its parent once its work is finished."""
+        if self._parent is not None:
+            self._parent.remove_interrupt(self._on_parent_cancel)
 
 
 # Prompts that carry no semantic signal — trivial acknowledgements, greetings,
@@ -174,6 +353,19 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
+        ``query`` is already bounded by ``MemoryManager`` (see
+        ``memory.prefetch_max_query_chars``); providers must still apply
+        their own finite limits before any expensive expansion.
+
+        Optional cancellation: a provider may declare an extra keyword-only
+        ``cancel: Optional[RecallCancellation] = None`` parameter. The
+        manager detects it by signature and passes a token carrying the
+        prefetch deadline; on timeout the manager cancels the token instead
+        of abandoning the worker. Cooperating providers should stop promptly
+        and raise :class:`RecallCancelled` / :class:`RecallDeadlineExceeded`
+        (typed outcomes) rather than returning ``""`` as if nothing matched.
+        Providers without the keyword keep the legacy call shape.
         """
         return ""
 
