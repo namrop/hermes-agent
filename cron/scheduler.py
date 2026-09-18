@@ -4418,96 +4418,16 @@ DRIFT_SKIP_SILENT_MARKER = "[drift_skip:silent]"
 def _is_transient_provider_resolve_error(exc: BaseException) -> bool:
     """True when primary provider resolution failed for a transient network reason.
 
-    Agent crons resolve OAuth credentials (token refresh / discovery) before the
-    agent loop starts. A short DNS outage (Cloudflare WARP / macOS resolver blip)
-    surfaces as httpx/httpcore ConnectError or raw OSError errno 8 ("nodename nor
-    servname provided") and must be eligible for ``fallback_providers`` the same
-    way AuthError already is — otherwise a healthy XAI_API_KEY / Anthropic rung
-    never gets tried and the whole job dies before the first model call.
+    Thin alias kept for the scheduler's own call sites and existing regression
+    tests. The implementation moved to ``hermes_cli.fallback_config`` so agent
+    init (fresh gateway turns) and cron share ONE definition of "resolve
+    failure worth walking the chain for". Before that split was closed, cron
+    walked the chain correctly while fresh gateway turns died outright — see
+    the 2026-09-18 benched-credential-pool incident.
     """
-    # Walk the cause chain; scheduler wraps raw transport errors.
-    seen: set[int] = set()
-    cur: Optional[BaseException] = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        name = type(cur).__name__
-        module = type(cur).__module__ or ""
-        msg = str(cur).lower()
-        # Explicit transport classes from httpx/httpcore/aiohttp.
-        if name in {
-            "ConnectError",
-            "ConnectTimeout",
-            "ReadTimeout",
-            "WriteTimeout",
-            "PoolTimeout",
-            "NetworkError",
-            "TimeoutException",
-            "ClientConnectorError",
-            "ClientConnectorDNSError",
-            "ServerTimeoutError",
-            "ClientOSError",
-        }:
-            return True
-        if "httpx" in module or "httpcore" in module or "aiohttp" in module:
-            if any(
-                needle in msg
-                for needle in (
-                    "nodename nor servname",
-                    "name or service not known",
-                    "temporary failure in name resolution",
-                    "failed to resolve",
-                    "connection refused",
-                    "network is unreachable",
-                    "timed out",
-                    "timeout",
-                )
-            ):
-                return True
-        if isinstance(cur, OSError):
-            # Platform-safe classification (the raw-literal set {8, 7, 11, ...}
-            # from the first revision mixed macOS getaddrinfo constants with
-            # errno values and does not hold on Linux — see PR review).
-            # socket.gaierror carries getaddrinfo codes (EAI_*), plain OSError
-            # carries errno; compare each against its own constant namespace.
-            import errno as _errno
-            import socket as _socket
+    from hermes_cli.fallback_config import is_transient_provider_resolve_error
 
-            if isinstance(cur, _socket.gaierror):
-                _eai_transient = {
-                    getattr(_socket, _n)
-                    for _n in ("EAI_NONAME", "EAI_AGAIN", "EAI_FAIL", "EAI_NODATA")
-                    if hasattr(_socket, _n)
-                }
-                if cur.errno in _eai_transient:
-                    return True
-            else:
-                err_no = getattr(cur, "errno", None)
-                if err_no in {
-                    _errno.ECONNREFUSED,
-                    _errno.ECONNRESET,
-                    _errno.EHOSTUNREACH,
-                    _errno.ENETUNREACH,
-                    _errno.ENETDOWN,
-                    _errno.ETIMEDOUT,
-                    _errno.EAGAIN,
-                }:
-                    return True
-            if any(
-                needle in msg
-                for needle in (
-                    "nodename nor servname",
-                    "name or service not known",
-                    "temporary failure in name resolution",
-                    "network is unreachable",
-                )
-            ):
-                return True
-        # Bare RuntimeError/Exception that already carries the DNS text
-        # (format_runtime_provider_error sometimes surfaces the raw message).
-        if "nodename nor servname" in msg or "name or service not known" in msg:
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
+    return is_transient_provider_resolve_error(exc)
 
 
 def _cron_preflight_enabled(cfg: dict) -> bool:

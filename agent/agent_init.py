@@ -1336,8 +1336,40 @@ def init_agent(
         else:
             # No explicit creds — use the centralized provider router
             from agent.auxiliary_client import resolve_provider_client
-            _routed_client, _ = resolve_provider_client(
-                agent.provider or "auto", model=agent.model, raw_codex=True)
+
+            # Resolution can FAIL rather than return None. The case that
+            # matters in production: every entry in the provider's credential
+            # pool is benched/exhausted (e.g. the hourly pre-emptive
+            # weekly-quota bench), so selection raises AuthError. That happens
+            # before any client exists, so the conversation-loop fallback
+            # machinery — which only engages once a client is streaming —
+            # cannot see it, and the turn dies with a bare "Provider
+            # authentication failed" and zero API calls even when healthy rungs
+            # are sitting in ``fallback_providers``. Treat an eligible raised
+            # error exactly like the None return below and walk the chain.
+            _resolve_exc = None
+            _resolve_exc_reason = None
+            try:
+                _routed_client, _ = resolve_provider_client(
+                    agent.provider or "auto", model=agent.model, raw_codex=True)
+            except Exception as _resolve_error:
+                from hermes_cli.fallback_config import (
+                    classify_provider_resolve_error,
+                )
+
+                _resolve_exc_reason = classify_provider_resolve_error(_resolve_error)
+                if _resolve_exc_reason is None:
+                    # Neither auth nor transient transport: a genuine failure.
+                    # Surface it instead of silently rerouting the user onto a
+                    # different provider.
+                    raise
+                _resolve_exc = _resolve_error
+                _routed_client = None
+                logger.warning(
+                    "Primary provider resolve failed (%s: %s), trying fallback",
+                    _resolve_exc_reason,
+                    _resolve_error,
+                )
             if _routed_client is not None:
                 client_kwargs = {
                     "api_key": _routed_client.api_key,
@@ -1361,7 +1393,14 @@ def init_agent(
                 # but no credentials were found, fail fast with a clear
                 # message instead of silently routing through OpenRouter.
                 _explicit = (agent.provider or "").strip().lower()
-                if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+                # A raised, fallback-eligible resolve error always earns a walk,
+                # independent of the provider-name gate below: that gate exists
+                # to stop a credential-less provider from silently routing
+                # through OpenRouter, which is a different concern from a
+                # configured provider whose pool is momentarily benched.
+                if _resolve_exc is not None or (
+                    _explicit and _explicit not in {"auto", "openrouter", "custom"}
+                ):
                     # Look up the actual env var name from the provider
                     # config — some providers use non-standard names
                     # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
@@ -1384,6 +1423,20 @@ def init_agent(
                         _fb_entries = [fallback_model]
                     _fb_resolved = False
                     for _fb in _fb_entries:
+                        # Re-attempting the backend that just failed is pointless
+                        # and costs a second resolution round-trip. The
+                        # downstream (streaming) fallback path already skips
+                        # same-backend rungs — "chain entry X resolves to the
+                        # same backend as the current one" — so match that here.
+                        if _resolve_exc is not None and _explicit and str(
+                            _fb.get("provider") or ""
+                        ).strip().lower() == _explicit:
+                            logger.debug(
+                                "Init-time fallback skip: chain entry %s is the "
+                                "primary that just failed to resolve",
+                                _fb.get("provider"),
+                            )
+                            continue
                         try:
                             from hermes_cli.fallback_config import resolve_entry_api_key
                             _fb_explicit_key = resolve_entry_api_key(_fb)
@@ -1399,9 +1452,33 @@ def init_agent(
                             )
                             continue
                         if _fb_client is not None:
+                            _prev_provider = agent.provider
+                            _prev_model = agent.model
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
+                            # Never let a substitution be silent: the user asked
+                            # for one model and is getting another. Reuse the
+                            # same hop ledger the streaming fallback path uses so
+                            # both surfaces render one consistent notice.
+                            try:
+                                agent._record_fallback_hop(
+                                    _prev_model,
+                                    _prev_provider,
+                                    agent.model,
+                                    agent.provider,
+                                )
+                            except Exception:  # pragma: no cover - notice is best-effort
+                                logger.debug(
+                                    "Init-time fallback hop notice failed", exc_info=True
+                                )
+                            logger.warning(
+                                "Init-time fallback activated: %s via %s → %s via %s",
+                                _prev_model,
+                                _prev_provider,
+                                agent.model,
+                                agent.provider,
+                            )
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
@@ -1418,6 +1495,13 @@ def init_agent(
                             _fb_resolved = True
                             break
                     if not _fb_resolved:
+                        if _resolve_exc is not None:
+                            # Every rung failed too. Surface the ORIGINAL
+                            # resolution failure rather than a misleading
+                            # "no API key was found" — the key exists, the
+                            # pool entry was benched/exhausted or the network
+                            # was down.
+                            raise _resolve_exc
                         raise RuntimeError(
                             f"Provider '{_explicit}' is set in config.yaml but no API key "
                             f"was found. Set the {_env_hint} environment "
