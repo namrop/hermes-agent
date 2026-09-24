@@ -123,6 +123,63 @@ _background_review_pass_state: "_ctxvars.ContextVar[_BackgroundReviewPassState]"
     )
 )
 
+# Post-turn review scope (keeper ruling 2026-09-24, task 633; Discord #gateway
+# message 1552775230093529211). The post-turn review fork keeps exactly one
+# direct skill write: patching (or, failing that, editing) a skill that was
+# loaded in the reviewed conversation and turned out wrong. Every other pattern
+# goes to the Atrium beam photon ledger through the beam_photon tool.
+#
+# The value is the frozenset of skill names loaded in the reviewed
+# conversation, installed on the review thread before run_conversation (tool
+# workers copy that context). None means no post-turn review scope, which is
+# the case for foreground sessions and for the curator fork (which shares
+# is_background_review() but keeps its own consolidation writes).
+_post_turn_review_loaded_skills: "_ctxvars.ContextVar[Optional[frozenset]]" = (
+    _ctxvars.ContextVar("post_turn_review_loaded_skills", default=None)
+)
+POST_TURN_REVIEW_DIRECT_ACTIONS = frozenset({"patch", "edit"})
+
+
+def begin_post_turn_review_scope(loaded_skills) -> None:
+    """Restrict this review pass's direct skill writes to *loaded_skills*."""
+    names = set()
+    for raw in loaded_skills or ():
+        name = str(raw or "").strip()
+        if name:
+            names.add(name)
+            names.add(name.rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+    _post_turn_review_loaded_skills.set(frozenset(names))
+
+
+def _post_turn_review_guard(action: str, name: str) -> Optional[Dict[str, Any]]:
+    loaded = _post_turn_review_loaded_skills.get()
+    if loaded is None:
+        return None
+    try:
+        from tools.skill_provenance import is_background_review
+        if not is_background_review():
+            return None
+    except Exception:
+        return None
+    if action in POST_TURN_REVIEW_DIRECT_ACTIONS and name in loaded:
+        return None
+    if action in POST_TURN_REVIEW_DIRECT_ACTIONS:
+        why = (
+            f"'{name}' was not loaded in the reviewed conversation, so the "
+            "post-turn review may not change it"
+        )
+    else:
+        why = f"the post-turn review does not {action} skills"
+    return {
+        "success": False,
+        "error": (
+            f"Refused: {why}. Its only direct skill write is patching a skill "
+            "loaded in this conversation that turned out wrong. Record other "
+            "patterns with beam_photon (search_memory, then record)."
+        ),
+    }
+
+
 # Circuit breaker: after this many identical read-before-write refusals for
 # one skill in one pass, the skill is skipped for the remainder of the pass.
 # Cheap insurance against mechanical retry loops — with read-mark propagation
@@ -1678,6 +1735,10 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    scope_refusal = _post_turn_review_guard(action, name)
+    if scope_refusal is not None:
+        return json.dumps(scope_refusal, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)

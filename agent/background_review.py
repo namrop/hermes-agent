@@ -398,6 +398,54 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # the user-message that the forked review agent receives.  AIAgent exposes
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
+# Keeper ruling 2026-09-24 (task 633; Discord #gateway 1552775230093529211):
+# the post-turn review stops growing skill files. One direct skill write stays
+# (fixing a skill loaded in the conversation that turned out wrong); every
+# other pattern goes to the owning Atrium beam's photon ledger through the
+# beam_photon tool, corroborated against memory photons at review time. The
+# refusal side is enforced in tools/skill_manager_tool.py
+# (_post_turn_review_guard), so this text describes rules the code keeps.
+_SKILL_ROUTING_RULES = (
+    "Signals worth acting on:\n"
+    "  • The user corrected your style, tone, format, legibility, "
+    "verbosity, workflow, or sequence of steps ('stop doing X', 'don't "
+    "format like this', 'you always do Y and I hate it', 'remember "
+    "this'). These are FIRST-CLASS signals, not just memory signals.\n"
+    "  • A non-trivial technique, fix, workaround, or debugging path "
+    "emerged and was shown to work.\n"
+    "  • A skill loaded in this conversation turned out wrong, missing a "
+    "step, or outdated.\n\n"
+    "Where each one goes:\n"
+    "  1. DIRECT SKILL FIX, your only direct skill write. When a skill "
+    "loaded in this conversation (via /skill-name or skill_view) turned "
+    "out wrong, missing a step, or outdated, and the conversation shows "
+    "the correction, skill_view it and fix it with skill_manage "
+    "action=patch (action=edit only when a patch cannot express the "
+    "fix). Change only what was wrong. Creating skills, adding support "
+    "files, deleting, and writing to skills not loaded in this "
+    "conversation are refused.\n"
+    "  2. EVERYTHING ELSE GOES TO THE BEAM PHOTON LEDGER. Record the "
+    "pattern with the beam_photon tool instead of writing it into a "
+    "skill. Beam photons are Atrium ledger rows, not memory photons.\n"
+    "     a. beam_photon action=search_memory with a query drawn from the "
+    "pattern, to find memory photons (fact_store) that corroborate it.\n"
+    "     b. beam_photon action=route with skill=<the skill that governs "
+    "this class of work> and query=<a few words naming the domain>, when "
+    "you do not already know the owning beam.\n"
+    "     c. beam_photon action=record with title, text (the pattern, "
+    "stated so a later reader can apply it), skill, beam (the owning "
+    "beam, only if you know it), memory_queries (the searches you ran), "
+    "and memory_fact_ids (only memory photons that actually support the "
+    "pattern; none is a valid answer). Use origin_type=luis_origin when "
+    "the user stated the rule.\n"
+    "     One record per distinct pattern. Do not record what the "
+    "governing skill already says.\n"
+    "  A user correction follows the same split: patch the loaded skill "
+    "it corrected, or record a beam photon tied to the skill that "
+    "governs that task.\n\n"
+)
+
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Focus on:\n"
@@ -410,76 +458,11 @@ _MEMORY_REVIEW_PROMPT = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be "
-    "ACTIVE — most sessions produce at least one skill update, even if "
-    "small. A pass that does nothing is a missed learning opportunity, "
-    "not a neutral outcome.\n\n"
-    "Target shape of the library: CLASS-LEVEL skills, each with a rich "
-    "SKILL.md and a `references/` directory for session-specific detail. "
-    "Not a long flat list of narrow one-session-one-skill entries. This "
-    "shapes HOW you update, not WHETHER you update.\n\n"
-    "Signals to look for (any one of these warrants action):\n"
-    "  • User corrected your style, tone, format, legibility, or "
-    "verbosity. Frustration signals like 'stop doing X', 'this is too "
-    "verbose', 'don't format like this', 'why are you explaining', "
-    "'just give me the answer', 'you always do Y and I hate it', or an "
-    "explicit 'remember this' are FIRST-CLASS skill signals, not just "
-    "memory signals. Update the relevant skill(s) to embed the "
-    "preference so the next session starts already knowing.\n"
-    "  • User corrected your workflow, approach, or sequence of steps. "
-    "Encode the correction as a pitfall or explicit step in the skill "
-    "that governs that class of task.\n"
-    "  • Non-trivial technique, fix, workaround, debugging path, or "
-    "tool-usage pattern emerged that a future session would benefit "
-    "from. Capture it.\n"
-    "  • A skill that got loaded or consulted this session turned out "
-    "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-    "Preference order — prefer the earliest action that fits, but do "
-    "pick one when a signal above fired:\n"
-    "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
-    "conversation for skills the user loaded via /skill-name or you "
-    "read via skill_view. If any of them covers the territory of the "
-    "new learning, PATCH that one first. It is the skill that was in "
-    "play, so it's the right one to extend — but only if it is "
-    "curator-managed. Bundled, hub, pinned, and user-owned skills are "
-    "off-limits to you no matter how relevant (see Protected skills "
-    "below); for those, fall through to the next option.\n"
-    "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). "
-    "If no loaded skill fits but an existing class-level skill does, "
-    "patch it. Add a subsection, a pitfall, or broaden a trigger.\n"
-    "  3. ADD A SUPPORT FILE under an existing umbrella. Skills can be "
-    "packaged with three kinds of support files — use the right "
-    "directory per kind:\n"
-    "     • `references/<topic>.md` — session-specific detail (error "
-    "transcripts, reproduction recipes, provider quirks) AND "
-    "condensed knowledge banks: quoted research, API docs, external "
-    "authoritative excerpts, or domain notes you found while working "
-    "on the problem. Write it concise and for the value of the task, "
-    "not as a full mirror of upstream docs.\n"
-    "     • `templates/<name>.<ext>` — starter files meant to be "
-    "copied and modified (boilerplate configs, scaffolding, a "
-    "known-good example the agent can `reproduce with modifications`).\n"
-    "     • `scripts/<name>.<ext>` — statically re-runnable actions "
-    "the skill can invoke directly (verification scripts, fixture "
-    "generators, deterministic probes, anything the agent should run "
-    "rather than hand-type each time).\n"
-    "     Add support files via skill_manage action=write_file with "
-    "file_path starting 'references/', 'templates/', or 'scripts/'. "
-    "The umbrella's SKILL.md should gain a one-line pointer to any "
-    "new support file so future agents know it exists.\n"
-    "  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL when no existing "
-    "skill covers the class. The name MUST be at the class level. "
-    "The name MUST NOT be a specific PR number, error string, feature "
-    "codename, library-alone name, or 'fix-X / debug-Y / audit-Z-today' "
-    "session artifact. If the proposed name only makes sense for "
-    "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
-    "User-preference embedding (important): when the user expressed a "
-    "style/format/workflow preference, the update belongs in the "
-    "SKILL.md body, not just in memory. Memory captures 'who the user "
-    "is and what the current situation and state of your operations "
-    "are'; skills capture 'how to do this class of task for this "
-    "user'. When they complain about how you handled a task, the "
-    "skill that governs that task needs to carry the lesson.\n\n"
+    "Review the conversation above for anything worth keeping about "
+    "how to do this class of task for this user. 'Nothing to save.' is "
+    "a normal result: most passes end there unless a signal below "
+    "actually fired.\n\n"
+    + _SKILL_ROUTING_RULES +
     "If you notice two existing skills that overlap, note it in your "
     "reply — the background curator handles consolidation at scale.\n\n"
     "Protected skills (DO NOT edit these):\n"
@@ -497,8 +480,8 @@ _SKILL_REVIEW_PROMPT = (
     "being in play does not make one yours to edit. If such a skill is "
     "wrong or outdated, say so in your reply and recommend "
     "'hermes curator adopt <name>' — do not try to patch it.\n"
-    "If the only skills that need updating are protected, say\n"
-    "'Nothing to save.' and stop.\n\n"
+    "If the skill that needs a fix is protected, record the fix as a "
+    "beam photon tied to that skill instead.\n\n"
     "Do NOT capture (these become persistent self-imposed constraints "
     "that bite you later when the environment changes):\n"
     "  • Environment-dependent failures: missing binaries, fresh-install "
@@ -525,13 +508,10 @@ _SKILL_REVIEW_PROMPT = (
     "(not something you are merely guessing might work), capture ONLY that "
     "alternative — never the dead ends, and never dressed up as best practice.\n\n"
     "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) under an existing setup or "
-    "troubleshooting skill — never 'this tool does not work' as a "
+    "command, config step, env var to set) as a beam photon tied to the "
+    "setup or troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "'Nothing to save.' is a real option but should NOT be the "
-    "default. If the session ran smoothly with no corrections and "
-    "produced no new technique, just say 'Nothing to save.' and stop. "
-    "Otherwise, act."
+    "If no signal fired, say 'Nothing to save.' and stop."
 )
 
 _COMBINED_REVIEW_PROMPT = (
@@ -540,51 +520,10 @@ _COMBINED_REVIEW_PROMPT = (
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
     "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most "
-    "sessions produce at least one skill update. A pass that does "
-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
-    "Target shape of the skill library: CLASS-LEVEL skills with a rich "
-    "SKILL.md and a `references/` directory for session-specific detail. "
-    "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-    "Signals that warrant a skill update (any one is enough):\n"
-    "  • User corrected your style, tone, format, legibility, "
-    "verbosity, or approach. Frustration is a FIRST-CLASS skill "
-    "signal, not just a memory signal. 'stop doing X', 'don't format "
-    "like this', 'I hate when you Y' — embed the lesson in the skill "
-    "that governs that task so the next session starts fixed.\n"
-    "  • Non-trivial technique, fix, workaround, or debugging path "
-    "emerged.\n"
-    "  • A skill that was loaded or consulted turned out wrong, "
-    "missing, or outdated — patch it now.\n\n"
-    "Preference order for skills — pick the earliest that fits:\n"
-    "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
-    "loaded via /skill-name or skill_view in the conversation. If one "
-    "of them covers the learning, PATCH it first. It was in play; "
-    "it's the right place — provided it is curator-managed. Protected "
-    "and user-owned skills are off-limits however relevant; fall "
-    "through when one of those is the best fit.\n"
-    "  2. UPDATE AN EXISTING UMBRELLA (skills_list + skill_view to "
-    "find the right one). Patch it.\n"
-    "  3. ADD A SUPPORT FILE under an existing umbrella via "
-    "skill_manage action=write_file. Three kinds: "
-    "`references/<topic>.md` for session-specific detail OR condensed "
-    "knowledge banks (quoted research, API docs excerpts, domain "
-    "notes) written concise and task-focused; `templates/<name>.<ext>` "
-    "for starter files meant to be copied and modified; "
-    "`scripts/<name>.<ext>` for statically re-runnable actions "
-    "(verification, fixture generators, probes). Add a one-line "
-    "pointer in SKILL.md so future agents find them.\n"
-    "  4. CREATE A NEW CLASS-LEVEL UMBRELLA when nothing exists. "
-    "Name at the class level — NOT a PR number, error string, "
-    "codename, library-alone name, or 'fix-X / debug-Y' session "
-    "artifact. If the name only fits today's task, fall back to (1), "
-    "(2), or (3).\n\n"
-    "User-preference embedding: when the user complains about how "
-    "you handled a task, update the skill that governs that task — "
-    "memory alone isn't enough. Memory says 'who the user is and "
-    "what the current situation and state of your operations are'; "
-    "skills say 'how to do this class of task for this user'. Both "
-    "should carry user-preference lessons when relevant.\n\n"
+    "**Skills**: how to do this class of task for this user. 'Nothing "
+    "to save.' is a normal result for this half; act only when a "
+    "signal below actually fired.\n\n"
+    + _SKILL_ROUTING_RULES +
     "If you notice overlapping existing skills, mention it — the "
     "background curator handles consolidation.\n\n"
     "Protected skills (DO NOT edit these):\n"
@@ -599,8 +538,8 @@ _COMBINED_REVIEW_PROMPT = (
     "request). Your writes to these WILL be refused, including to skills "
     "loaded or consulted this session. If one is wrong, say so in your "
     "reply and recommend 'hermes curator adopt <name>' instead.\n"
-    "If the only skills that need updating are protected, say\n"
-    "'Nothing to save.' and stop.\n\n"
+    "If the skill that needs a fix is protected, record the fix as a "
+    "beam photon tied to that skill instead.\n\n"
     "Do NOT capture as skills (these become persistent self-imposed "
     "constraints that bite you later when the environment changes):\n"
     "  • Environment-dependent failures: missing binaries, fresh-install "
@@ -627,14 +566,51 @@ _COMBINED_REVIEW_PROMPT = (
     "(not something you are merely guessing might work), capture ONLY that "
     "alternative — never the dead ends, and never dressed up as best practice.\n\n"
     "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) under an existing setup or "
-    "troubleshooting skill — never 'this tool does not work' as a "
+    "command, config step, env var to set) as a beam photon tied to the "
+    "setup or troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "Act on whichever of the two dimensions has real signal. If "
-    "genuinely nothing stands out on either, say 'Nothing to save.' "
-    "and stop — but don't reach for that conclusion as a default."
+    "Act on whichever half has real signal. If neither does, say "
+    "'Nothing to save.' and stop."
 )
 
+
+
+def skills_loaded_in_conversation(messages: Optional[List[Dict]]) -> set:
+    """Names of skills loaded in *messages*: skill_view calls and /skill invocations."""
+    names: set = set()
+    try:
+        from agent.skill_commands import _SKILL_NAME_RE
+    except Exception:  # pragma: no cover - import guard
+        _SKILL_NAME_RE = None
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                if fn.get("name") != "skill_view":
+                    continue
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(args, dict) and args.get("name"):
+                    names.add(str(args["name"]))
+        elif role == "user" and _SKILL_NAME_RE is not None:
+            content = msg.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    part.get("text", "") for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                )
+            if isinstance(content, str):
+                for match in _SKILL_NAME_RE.finditer(content):
+                    if match.group(1):
+                        names.add(match.group(1))
+    return names
 
 
 def summarize_background_review_actions(
@@ -676,7 +652,7 @@ def summarize_background_review_actions(
     # result JSON only says "Entry added"; the call arguments contain action,
     # target, and content previews.  Restricting to notify_tools also prevents
     # helper tools from surfacing as memory work just because they succeeded.
-    notify_tools = {"memory", "skill_manage"}
+    notify_tools = {"memory", "skill_manage", "beam_photon"}
     all_tool_call_ids: set = set()
     call_details: dict = {}
     for msg in review_messages or []:
@@ -743,6 +719,13 @@ def summarize_background_review_actions(
             detail = {}
         target = data.get("target", "") or detail.get("target", "")
         is_skill = detail.get("tool") == "skill_manage"
+
+        if detail.get("tool") == "beam_photon":
+            # Only a recorded photon is a write worth surfacing; memory
+            # searches and routing lookups are reads.
+            if detail.get("action") == "record" and message:
+                actions.append(f"🔆 {message}")
+            continue
 
         message_lower = message.lower()
         if not verbose:
@@ -1338,6 +1321,16 @@ def _run_review_in_thread(
                 _reset_background_review_read_marks()
             except Exception:
                 pass
+            try:
+                # Keeper ruling 2026-09-24 (task 633): direct skill writes in
+                # this pass are limited to skills loaded in the conversation.
+                from tools.skill_manager_tool import begin_post_turn_review_scope
+
+                begin_post_turn_review_scope(
+                    skills_loaded_in_conversation(messages_snapshot)
+                )
+            except Exception:
+                logger.warning("post-turn review scope not installed", exc_info=True)
 
             try:
                 request_admitted = (
