@@ -238,3 +238,64 @@ class TestMcpPrefixThreshold:
         cfg = budget_for_context_window(16_384)  # scaled default < 50K
         assert cfg.default_result_size < 50_000
         assert cfg.resolve_threshold("mcp_tool") == cfg.default_result_size
+
+
+# ---------------------------------------------------------------------------
+# tool_budget.tool_overrides — per-tool thresholds from config.yaml
+# ---------------------------------------------------------------------------
+
+
+class TestConfiguredToolOverrides:
+    """``tool_budget.tool_overrides`` lifts one tool without touching others."""
+
+    _CFG = "tool_budget:\n  tool_overrides:\n    skill_view: 128000\n"
+
+    def test_override_applies_without_context_length(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(self._CFG)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.resolve_threshold("skill_view") == 128_000
+        assert cfg.resolve_threshold("some_random_tool") == DEFAULT_RESULT_SIZE_CHARS
+
+    def test_override_kept_on_large_window(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(self._CFG)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(1_000_000)
+        assert cfg.resolve_threshold("skill_view") == 128_000
+        assert cfg.default_result_size == DEFAULT_RESULT_SIZE_CHARS
+
+    def test_override_capped_by_window_fraction(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(self._CFG)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(200_000)  # 15% of 800K chars = 120K
+        assert cfg.resolve_threshold("skill_view") == 120_000
+
+    def test_override_never_below_scaled_default_on_tiny_window(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(self._CFG)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(8_192)
+        assert cfg.resolve_threshold("skill_view") == cfg.default_result_size
+
+    def test_pinned_tools_cannot_be_overridden(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    read_file: 5000\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.resolve_threshold("read_file") == float("inf")
+
+    def test_malformed_entries_ignored(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    skill_view: lots\n    web_extract: -5\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.tool_overrides == {}
+        assert cfg.resolve_threshold("skill_view") == DEFAULT_RESULT_SIZE_CHARS
+
+    def test_non_mapping_overrides_ignored(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides: [skill_view]\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert budget_for_context_window(None) is DEFAULT_BUDGET

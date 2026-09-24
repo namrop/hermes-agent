@@ -63,6 +63,42 @@ def _configured_mcp_result_size() -> int:
     return DEFAULT_MCP_RESULT_SIZE_CHARS
 
 
+def _configured_tool_overrides() -> Dict[str, int]:
+    """Read ``tool_budget.tool_overrides`` ({tool_name: chars}) from config.
+
+    Lets one tool's persistence threshold sit above (or below) the generic
+    default without a code change -- e.g. ``skill_view``, whose results for a
+    SKILL.md near the 100K write cap land a little over the 100K generic
+    threshold once JSON-escaped and joined with the linked-files list, and
+    so arrive as a 1,500-char preview instead of the skill.
+
+    Same guarded read path as :func:`_configured_mcp_result_size`. Entries
+    that are not positive integers are dropped, and pinned tools cannot be
+    overridden (``read_file`` must stay inf).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly()
+        block = data.get("tool_budget") if isinstance(data, dict) else None
+        raw = block.get("tool_overrides") if isinstance(block, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        overrides: Dict[str, int] = {}
+        for name, value in raw.items():
+            if not isinstance(name, str) or not name or name in PINNED_THRESHOLDS:
+                continue
+            try:
+                chars = int(value)
+            except (TypeError, ValueError):
+                continue
+            if chars > 0:
+                overrides[name] = chars
+        return overrides
+    except Exception:
+        return {}
+
+
 @dataclass(frozen=True)
 class BudgetConfig:
     """Immutable budget constants for the 3-layer tool result persistence system.
@@ -151,24 +187,32 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     always survives.
     """
     mcp_result_size = _configured_mcp_result_size()
+    tool_overrides = _configured_tool_overrides()
 
     if not context_length or context_length <= 0:
-        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS:
+        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS and not tool_overrides:
             return DEFAULT_BUDGET
-        return BudgetConfig(mcp_result_size=mcp_result_size)
+        return BudgetConfig(mcp_result_size=mcp_result_size, tool_overrides=tool_overrides)
 
     window_chars = context_length * _CHARS_PER_TOKEN
-    per_result = int(window_chars * _PER_RESULT_WINDOW_FRACTION)
+    per_result_window = int(window_chars * _PER_RESULT_WINDOW_FRACTION)
     per_turn = int(window_chars * _PER_TURN_WINDOW_FRACTION)
 
     # Clamp: never exceed the historical defaults (so large models are
     # unchanged), never drop below the floor (so tiny models stay usable).
-    per_result = max(_MIN_RESULT_SIZE_CHARS, min(per_result, DEFAULT_RESULT_SIZE_CHARS))
+    per_result = max(_MIN_RESULT_SIZE_CHARS, min(per_result_window, DEFAULT_RESULT_SIZE_CHARS))
     per_turn = max(_MIN_TURN_BUDGET_CHARS, min(per_turn, DEFAULT_TURN_BUDGET_CHARS))
+
+    # A configured per-tool override may lift one tool above the generic
+    # default, but never past the model-window fraction -- the same
+    # small-model protection the scaled default gives every other tool (#23767).
+    override_cap = max(per_result, per_result_window)
+    tool_overrides = {name: min(chars, override_cap) for name, chars in tool_overrides.items()}
 
     return BudgetConfig(
         default_result_size=per_result,
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
         mcp_result_size=mcp_result_size,
+        tool_overrides=tool_overrides,
     )
