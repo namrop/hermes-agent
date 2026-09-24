@@ -1446,6 +1446,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    selection_source: str = "typed",
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1480,6 +1481,10 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
+        selection_source: ``"typed"`` (default), ``"picker"`` for an
+            interactive-picker choice, or ``"config"`` for a config-driven
+            reset. Only typed selections are subject to the OpenRouter
+            subscription guard (:mod:`hermes_cli.subscription_routing`).
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -1849,6 +1854,41 @@ def switch_model(
                 target_provider, new_model = detected
 
     # =================================================================
+    # OpenRouter subscription guard (keeper ruling 2026-09-24)
+    # =================================================================
+    # A typed name or nickname must not land on OpenRouter's pay-per-token
+    # copy of a model one of the configured subscriptions serves. Picker
+    # selections pass through: that is the deliberate emergency route.
+    subscription_route_note = ""
+    if str(target_provider).strip().lower() == "openrouter":
+        from hermes_cli.subscription_routing import decide_openrouter_selection
+
+        _or_decision = decide_openrouter_selection(
+            new_model,
+            typed_input=raw_input,
+            current_provider=current_provider,
+            explicit_provider=explicit_provider,
+            selection_source=selection_source,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
+        )
+        if _or_decision.action == "refuse":
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                is_global=is_global,
+                error_message=_or_decision.message,
+            )
+        if _or_decision.action == "reroute":
+            logger.info(
+                "OpenRouter subscription guard: %r -> %s/%s",
+                raw_input, _or_decision.provider, _or_decision.model,
+            )
+            target_provider = _or_decision.provider
+            new_model = _or_decision.model
+            subscription_route_note = _or_decision.message
+
+    # =================================================================
     # COMMON PATH: Resolve credentials, normalize, get metadata
     # =================================================================
 
@@ -2199,6 +2239,8 @@ def switch_model(
 
     # --- Collect warnings ---
     warnings: list[str] = []
+    if subscription_route_note:
+        warnings.append(subscription_route_note)
     if validation.get("message"):
         warnings.append(validation["message"])
     hermes_warn = _check_hermes_model_warning(new_model)

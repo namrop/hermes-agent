@@ -1936,6 +1936,9 @@ class GatewaySlashCommandsMixin:
                             explicit_provider=provider_slug,
                             user_providers=user_provs,
                             custom_providers=custom_provs,
+                            # Picker choices are the one route to an
+                            # OpenRouter copy of a subscription model.
+                            selection_source="picker",
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)

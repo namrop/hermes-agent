@@ -9879,6 +9879,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     current_api_key=self.api_key or "",
                     is_global=False,
                     explicit_provider=_config_provider or "",
+                    selection_source="config",
                 )
                 if _reset_result.success:
                     if self.agent:
@@ -11193,6 +11194,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     explicit_provider=provider_data.get("slug"),
                     user_providers=state.get("user_provs"),
                     custom_providers=state.get("custom_provs"),
+                    selection_source="picker",
                 )
                 # Capture before close — picker state is cleared on close.
                 _picker_custom_provs = state.get("custom_provs")

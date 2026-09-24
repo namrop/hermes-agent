@@ -2017,6 +2017,17 @@ DEFAULT_CONFIG = {
         "self_paced_ceiling_seconds": 900,
     },
 
+    # Typed-selection routing guard (hermes_cli/subscription_routing.py).
+    # List the providers you reach through a subscription/plan rather than
+    # per-token billing, in tie-break order. When a typed /model name or a
+    # nickname would land on OpenRouter but one of these serves the same
+    # model, Hermes routes to the subscription copy (and refuses a typed
+    # `--provider openrouter`); OpenRouter's copy stays selectable from the
+    # interactive /model picker. Empty list = guard off.
+    "model_routing": {
+        "subscription_providers": [],
+    },
+
     # Mixture of Agents — named presets used by /moa. A preset is an execution
     # mode around the main model, not a provider/model itself: references +
     # aggregator synthesize private guidance before each main-model iteration.
