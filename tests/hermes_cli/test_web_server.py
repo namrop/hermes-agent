@@ -2281,6 +2281,29 @@ class TestConfigRoundTrip:
 
 
 
+    def test_model_routing_schema_groups_with_model_controls(self):
+        response = self.client.get("/api/config/schema")
+        assert response.status_code == 200
+        fields = response.json()["fields"]
+        assert fields["model_routing.subscription_providers"]["category"] == "general"
+        assert fields["model"]["category"] == "general"
+
+    @pytest.mark.parametrize("providers", [[], ["openai-codex", "custom:fixture-subscription"]])
+    def test_model_routing_round_trip_preserves_key_and_value(self, providers):
+        from hermes_cli.config import read_raw_config, save_config
+
+        save_config({"model_routing": {"subscription_providers": ["old-fixture"]}})
+        response = self.client.get("/api/config")
+        assert response.status_code == 200
+        config = response.json()
+        assert config["model_routing"]["subscription_providers"] == ["old-fixture"]
+        config["model_routing"]["subscription_providers"] = providers
+        response = self.client.put("/api/config", json={"config": config})
+        assert response.status_code == 200
+        assert read_raw_config()["model_routing"]["subscription_providers"] == providers
+        assert self.client.get("/api/config").json()["model_routing"]["subscription_providers"] == providers
+        assert "subscription_providers" not in read_raw_config().get("general", {})
+
     def test_round_trip_preserves_schema_invisible_nested_keys(self):
         """Nested keys that aren't in CONFIG_SCHEMA must also survive a
         round-trip. Deep-merge is required — a shallow merge would drop
