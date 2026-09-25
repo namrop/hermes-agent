@@ -2541,6 +2541,57 @@ def _pool_quota_benched_until(pool) -> "float | None":
         return None
 
 
+def fallback_entry_busy(fb: dict) -> Optional[str]:
+    """Return a reason when a queue-gated fallback's backend is too busy.
+
+    A fallback entry may carry ``queue_gate: {status_url, max_in_flight}``.
+    ``status_url`` is an oMLX-style ``/api/status`` returning
+    ``active_requests`` and ``waiting_requests``; the entry counts as busy
+    when their sum is at least ``max_in_flight`` (default 2). A probe that
+    fails or times out also counts as busy: on 2026-09-25 the acubens status
+    endpoint itself timed out while the sidecar was saturated.
+
+    Busy never removes an entry. ``try_activate_fallback`` defers it behind
+    the rest of the chain and comes back to it (break-glass) when everything
+    after it fails, so a local last resort stays reachable. An entry with no
+    gate, or a gate with no ``status_url``, is never busy.
+
+    Origin: 2026-09-25, six long agent turns fell back onto Qwen3.8-27B on
+    acubens at once and stalled local inference for ~80 minutes (scar
+    01a0da22-c8be-7ae9-bc72-28110e4d78ec). Keeper direction the same day:
+    a little local fallback is fine, but under load it should overflow to
+    another provider — "if the local fallbacks were aware of the queue that
+    would be good".
+    """
+    gate = fb.get("queue_gate") if isinstance(fb, dict) else None
+    if not isinstance(gate, dict):
+        return None
+    url = str(gate.get("status_url") or "").strip()
+    if not url:
+        return None
+    try:
+        limit = max(1, int(gate.get("max_in_flight", 2)))
+    except (TypeError, ValueError):
+        limit = 2
+    try:
+        timeout = float(gate.get("timeout_s", 2.0))
+    except (TypeError, ValueError):
+        timeout = 2.0
+    try:
+        import httpx
+
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        active = int(data.get("active_requests") or 0)
+        waiting = int(data.get("waiting_requests") or 0)
+    except Exception as exc:
+        return f"status probe failed ({type(exc).__name__})"
+    if active + waiting >= limit:
+        return f"{active} running + {waiting} waiting >= max_in_flight {limit}"
+    return None
+
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -2576,7 +2627,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
-    if agent._fallback_index >= len(agent._fallback_chain):
+    # Queue-gated entries skipped as busy during this walk. A fresh walk
+    # (index 0) starts with none.
+    if agent._fallback_index == 0:
+        agent._busy_deferred_fallbacks = []
+    deferred = getattr(agent, "_busy_deferred_fallbacks", None)
+    if deferred is None:
+        deferred = []
+        agent._busy_deferred_fallbacks = deferred
+    breakglass = False
+    if agent._fallback_index >= len(agent._fallback_chain) and deferred:
+        # Everything after the busy local entry failed or was skipped. A busy
+        # local model is better than no model: use it anyway.
+        fb = deferred.pop(0)
+        breakglass = True
+        logger.warning(
+            "Fallback break-glass: every later entry failed; using queue-gated "
+            "%s/%s despite load",
+            fb.get("provider"), fb.get("model"),
+        )
+    elif agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
         # their own 60s cooldown above), arm a short cooldown so the next
@@ -2593,8 +2663,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
         return False
-    fb = agent._fallback_chain[agent._fallback_index]
-    agent._fallback_index += 1
+    else:
+        fb = agent._fallback_chain[agent._fallback_index]
+        agent._fallback_index += 1
     fb_key = _fallback_entry_key(fb)
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
     if unavailable is None:
@@ -2659,6 +2730,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_benched_until)),
         )
         return agent._try_activate_fallback(reason)
+
+    # Queue gate: a busy local backend is deferred behind the rest of the
+    # chain, never dropped (see fallback_entry_busy).
+    if not breakglass and fb.get("queue_gate"):
+        busy_reason = fallback_entry_busy(fb)
+        if busy_reason:
+            deferred.append(fb)
+            logger.warning(
+                "Fallback skip: %s/%s is busy (%s); trying the rest of the "
+                "chain first",
+                fb_provider, fb_model, busy_reason,
+            )
+            return agent._try_activate_fallback(reason)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2793,6 +2877,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        # Which chain entry is serving, so the next turn can leave a
+        # queue-gated entry that has become busy (leave_busy_fallback).
+        agent._active_fallback_entry = fb
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream

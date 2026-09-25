@@ -1552,6 +1552,59 @@ def _skip_benched_primary(agent) -> bool:
     return False
 
 
+def leave_busy_fallback(agent) -> bool:
+    """At turn start, move off a queue-gated fallback that has become busy.
+
+    While the primary stays in cooldown, restore_primary_runtime keeps the
+    session on whatever fallback it activated, turn after turn. A session
+    that landed on the local model while it was idle would otherwise keep
+    feeding it even after the queue fills — which is how six long turns sat
+    on acubens for over an hour on 2026-09-25. When the serving entry carries
+    a ``queue_gate`` and is busy now, walk the rest of the chain from just
+    after it. If nothing later activates, stay put (the client is untouched)
+    and restore the walk state. Fails open on anything unexpected: staying
+    on the current fallback is today's behaviour.
+    """
+    try:
+        from agent.chat_completion_helpers import (
+            _fallback_entry_key,
+            fallback_entry_busy,
+        )
+
+        fb = getattr(agent, "_active_fallback_entry", None)
+        if not isinstance(fb, dict) or not fb.get("queue_gate"):
+            return False
+        busy_reason = fallback_entry_busy(fb)
+        if not busy_reason:
+            return False
+        chain = getattr(agent, "_fallback_chain", None) or []
+        key = _fallback_entry_key(fb)
+        pos = next(
+            (i for i, entry in enumerate(chain) if _fallback_entry_key(entry) == key),
+            None,
+        )
+        if pos is None:
+            return False
+        saved_index = agent._fallback_index
+        saved_cooldown = getattr(agent, "_rate_limited_until", 0)
+        agent._fallback_index = pos + 1
+        agent._busy_deferred_fallbacks = []
+        if agent._try_activate_fallback():
+            logger.warning(
+                "Left busy fallback %s/%s (%s) for %s/%s",
+                fb.get("provider"), fb.get("model"), busy_reason,
+                agent.provider, agent.model,
+            )
+            return True
+        agent._fallback_index = saved_index
+        agent._rate_limited_until = saved_cooldown
+        agent._active_fallback_entry = fb
+        return False
+    except Exception:
+        logger.debug("leave-busy-fallback check failed", exc_info=True)
+        return False
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
@@ -1576,6 +1629,7 @@ def restore_primary_runtime(agent) -> bool:
         return False
 
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+        leave_busy_fallback(agent)
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     # ── Reset-aware gate ──
@@ -1628,6 +1682,7 @@ def restore_primary_runtime(agent) -> bool:
                     agent.provider,
                     agent.model,
                 )
+            leave_busy_fallback(agent)
             return False
     except Exception:
         logger.debug(
