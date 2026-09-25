@@ -27139,7 +27139,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # selection).  Execute this final ownership check and all volatile
         # cleanup under the same store lock so a successor route/selection cannot
         # be erased after one of the awaits above.
-        self.session_store.run_model_override_reset_cleanup_if_current(
+        await self.async_session_store.run_model_override_reset_cleanup_if_current(
             session_key,
             expected_session_id,
             _clear_volatile_state,

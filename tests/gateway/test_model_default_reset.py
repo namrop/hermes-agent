@@ -215,6 +215,9 @@ async def test_model_default_clears_sqlite_and_json_mirror_for_a_fresh_runner(
     runner, store = _runner(tmp_path, monkeypatch, use_sqlite=True)
     assert store._db is not None
     _entry, key = _seed_override(runner, store, _source("thread-a"))
+    store.append_to_transcript(_entry.session_id, {"role": "user", "content": "Keep this history."})
+    history = store.load_transcript(_entry.session_id)
+    assert history
     monkeypatch.setattr(
         "hermes_cli.model_switch.switch_model",
         lambda **_kw: (_ for _ in ()).throw(AssertionError("default must not select a model")),
@@ -224,6 +227,7 @@ async def test_model_default_clears_sqlite_and_json_mirror_for_a_fresh_runner(
 
     assert reply is not None and "configured channel or global default" in reply.lower()
     assert Path(store._db.db_path).exists()
+    assert store.load_transcript(_entry.session_id) == history
     fresh_store = SessionStore(sessions_dir=store.sessions_dir, config=runner.config)
     assert fresh_store._db is not None
     assert fresh_store.get_model_override(key) is None
@@ -326,6 +330,88 @@ async def test_model_default_leaves_memory_untouched_when_durable_clear_fails(tm
     assert runner._session_model_overrides[key]["model"] == "manual/model"
     assert key in runner._pending_one_turn_model_restores
     assert key in runner._agent_cache
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('newer_selection', [False, True])
+async def test_reset_finalization_wait_keeps_heartbeat_and_newer_volatile_selection(
+    tmp_path, monkeypatch, newer_selection
+):
+    import asyncio
+    import threading
+    from gateway.session import SessionModelOverrideChangedError
+
+    runner, store = _runner(tmp_path, monkeypatch)
+    entry, key = _seed_override(runner, store, _source('thread-a'))
+    _other_entry, other_key = _seed_override(runner, store, _source('thread-b'))
+    facade = runner.async_session_store
+    original_read = facade.get_durable_model_override
+    ready = asyncio.Event()
+    reads = 0
+    released = threading.Event()
+    safety_release = None
+    loop_thread = threading.get_ident()
+    evictions = []
+    original_evict = runner._evict_cached_agent
+
+    def evict(target):
+        evictions.append(threading.get_ident())
+        original_evict(target)
+
+    monkeypatch.setattr(runner, '_evict_cached_agent', evict)
+
+    def release():
+        if not released.is_set():
+            released.set()
+            store._lock.release()
+
+    async def read(target):
+        nonlocal reads, safety_release
+        result = await original_read(target)
+        reads += 1
+        if reads == 2:
+            store._lock.acquire()
+            # A blocking regression must fail rather than hang the whole suite.
+            safety_release = threading.Timer(5, release)
+            safety_release.start()
+            ready.set()
+        return result
+
+    monkeypatch.setattr(facade, 'get_durable_model_override', read)
+    task = asyncio.create_task(runner._reset_session_model_override(key, expected_session_id=entry.session_id))
+    try:
+        await asyncio.wait_for(ready.wait(), 2)
+        ticks = 0
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+            ticks += 1
+        assert ticks == 5 and not released.is_set() and not task.done()
+        if newer_selection:
+            runner._session_state(key).conversation.model_override = {'model': 'new-one-turn'}
+        release()
+        if newer_selection:
+            with pytest.raises(SessionModelOverrideChangedError):
+                await task
+            assert runner._session_model_overrides[key] == {'model': 'new-one-turn'}
+            assert key in runner._agent_cache
+            assert evictions == []
+        else:
+            await task
+            assert key not in runner._session_model_overrides
+            assert key not in runner._agent_cache
+            assert evictions == [loop_thread]
+        assert runner._session_model_overrides[other_key] == OVERRIDE
+        assert runner._session_state(key).conversation.personality_override == 'writer'
+        assert store.get_model_override(key) is None
+    finally:
+        if safety_release is not None:
+            safety_release.cancel()
+            release()
+            safety_release.join()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
 
 @pytest.mark.asyncio

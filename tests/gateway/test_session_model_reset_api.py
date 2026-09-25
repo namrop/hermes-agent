@@ -368,6 +368,9 @@ async def test_model_reset_refuses_route_rebound_after_durable_readback(tmp_path
         def __init__(self):
             self._store = store
 
+        async def run_model_override_reset_cleanup_if_current(self, *args):
+            return await real_async_store.run_model_override_reset_cleanup_if_current(*args)
+
         async def get_durable_model_override(self, session_key):
             nonlocal durable_reads
             result = await real_async_store.get_durable_model_override(session_key)
