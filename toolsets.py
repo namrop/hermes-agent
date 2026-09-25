@@ -49,7 +49,7 @@ _HERMES_CORE_TOOLS = [
     "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
     "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
     # Skills
-    "skills_list", "skill_view", "skill_manage",
+    "skills_list", "skill_view", "skill_manage", "beam_photon",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
@@ -425,7 +425,7 @@ TOOLSETS = {
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
-            "skills_list", "skill_view", "skill_manage",
+            "skills_list", "skill_view", "skill_manage", "beam_photon",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
@@ -458,7 +458,7 @@ TOOLSETS = {
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
-            "skills_list", "skill_view", "skill_manage",
+            "skills_list", "skill_view", "skill_manage", "beam_photon",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
@@ -487,7 +487,7 @@ TOOLSETS = {
             "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
             "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
             # Skills
-            "skills_list", "skill_view", "skill_manage",
+            "skills_list", "skill_view", "skill_manage", "beam_photon",
             # Browser automation
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
