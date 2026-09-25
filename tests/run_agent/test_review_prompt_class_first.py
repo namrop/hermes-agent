@@ -89,7 +89,8 @@ def test_combined_review_prompt_has_memory_section():
     """Memory half must still cover user facts and preferences."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
     assert "**Memory**" in prompt
-    assert "memory tool" in prompt
+    # Keeper ruling 2026-09-25: memory photons go to fact_store, not the trunk.
+    assert "fact_store action=add" in prompt
 
 
 

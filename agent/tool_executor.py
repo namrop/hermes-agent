@@ -51,6 +51,7 @@ from tools.tool_result_storage import (
     extract_persisted_path,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from agent.memory_manager import memory_tool_router as _memory_tool_router
 
 logger = logging.getLogger(__name__)
 
@@ -2406,9 +2407,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
-        elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
+        elif (_mem_router := _memory_tool_router(agent, function_name)) is not None:
             # Memory provider tools (hindsight_retain, honcho_search, etc.)
-            # These are not in the tool registry — route through MemoryManager.
+            # These are not in the tool registry — route through MemoryManager
+            # (or, in a post-turn review fork, the parent's fact_store router).
             spinner = None
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
@@ -2420,7 +2422,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _mem_result = None
             try:
                 def _execute(next_args: dict) -> Any:
-                    return agent._memory_manager.handle_tool_call(function_name, next_args)
+                    return _mem_router.handle_tool_call(function_name, next_args)
                 function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                     agent,
                     function_name=function_name,

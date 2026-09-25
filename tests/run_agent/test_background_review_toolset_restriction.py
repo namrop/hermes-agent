@@ -122,8 +122,10 @@ def test_background_review_installs_thread_local_whitelist():
 
     assert "whitelist" in captured, "set_thread_tool_whitelist was not called"
     whitelist = captured["whitelist"]
-    # memory + skills tools must be allowed
-    assert "memory" in whitelist
+    # skills tools must be allowed; the MEMORY.md/USER.md trunk tool never is
+    # (keeper ruling 2026-09-25: the review writes memory photons to the fact
+    # store; see test_background_review_fact_store_route.py)
+    assert "memory" not in whitelist
     assert "skill_manage" in whitelist
     assert "skill_view" in whitelist
     assert "skills_list" in whitelist

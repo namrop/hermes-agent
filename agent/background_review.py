@@ -446,6 +446,24 @@ _SKILL_ROUTING_RULES = (
 )
 
 
+# Keeper ruling 2026-09-25 (#nautilus, Task 633 review thread, Discord
+# 1553049869202096334): "review should write to the fact store not the trunk.
+# writing to the trunk is something we are doing now". The review's memory
+# half records memory photons with fact_store. The always-on trunk (MEMORY.md
+# and USER.md, written by the ``memory`` tool) is edited only in live
+# sessions. _run_review_in_thread enforces this: the ``memory`` tool is not
+# whitelisted, and fact_store is limited to adds and reads
+# (ReviewFactStoreRouter).
+_MEMORY_SAVE_RULES = (
+    "Save with fact_store action=add: one self-contained fact per call, with "
+    "the date and where it came from, category user_pref for preferences and "
+    "expectations (general, project or tool otherwise), and a few "
+    "comma-separated tags. Run fact_store action=search first and skip "
+    "anything already stored. Do not use the memory tool: MEMORY.md and "
+    "USER.md are the always-on trunk, edited only in live sessions with the "
+    "user. If fact_store is not available, there is nothing to save.\n\n"
+)
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Focus on:\n"
@@ -453,7 +471,8 @@ _MEMORY_REVIEW_PROMPT = (
     "preferences, or personal details worth remembering?\n"
     "2. Has the user expressed expectations about how you should behave, their work "
     "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
+    "If something stands out, save it as a memory photon. "
+    + _MEMORY_SAVE_RULES +
     "If nothing is worth saving, just say 'Nothing to save.' and stop."
 )
 
@@ -519,7 +538,8 @@ _COMBINED_REVIEW_PROMPT = (
     "**Memory**: who the user is. Did the user reveal persona, "
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
-    "preferences with the memory tool.\n\n"
+    "preferences as memory photons. "
+    + _MEMORY_SAVE_RULES +
     "**Skills**: how to do this class of task for this user. 'Nothing "
     "to save.' is a normal result for this half; act only when a "
     "signal below actually fired.\n\n"
@@ -613,6 +633,100 @@ def skills_loaded_in_conversation(messages: Optional[List[Dict]]) -> set:
     return names
 
 
+_REVIEW_FACT_STORE_TOOL = "fact_store"
+# Adds plus the read-only actions. update and remove stay with live sessions.
+_REVIEW_FACT_STORE_ACTIONS = frozenset(
+    {"add", "search", "probe", "related", "reason", "contradict", "list"}
+)
+# Every review-written memory photon carries this tag so they stay countable.
+REVIEW_FACT_TAG = "post-turn-review"
+
+
+class ReviewFactStoreRouter:
+    """Serve the parent's ``fact_store`` to a review fork, and nothing else.
+
+    The fork runs with ``skip_memory=True`` (no memory manager of its own, so
+    no prefetch/sync side effects on the provider). This router gives it the
+    parent's provider for one tool: adds and reads only, never update or
+    remove, and every add tagged :data:`REVIEW_FACT_TAG`.
+    """
+
+    def __init__(self, memory_manager: Any):
+        self._memory_manager = memory_manager
+
+    def has_tool(self, tool_name: str) -> bool:
+        return tool_name == _REVIEW_FACT_STORE_TOOL
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if tool_name != _REVIEW_FACT_STORE_TOOL:
+            return json.dumps({"error": f"{tool_name} is not available to the post-turn review"})
+        args = dict(args or {})
+        action = str(args.get("action") or "").strip().lower()
+        if action not in _REVIEW_FACT_STORE_ACTIONS:
+            return json.dumps({
+                "error": (
+                    f"fact_store action={action or '?'} is not available to the "
+                    "post-turn review: it may add memory photons and read them, "
+                    "not change or remove them."
+                )
+            })
+        if action == "add":
+            raw = args.get("tags") or ""
+            if isinstance(raw, (list, tuple)):
+                tags = [str(t).strip() for t in raw if str(t).strip()]
+            else:
+                tags = [t.strip() for t in str(raw).split(",") if t.strip()]
+            if REVIEW_FACT_TAG not in tags:
+                tags.append(REVIEW_FACT_TAG)
+            args["tags"] = ", ".join(tags)
+        return self._memory_manager.handle_tool_call(tool_name, args)
+
+
+def review_fact_store_router(agent: Any) -> Optional[ReviewFactStoreRouter]:
+    """A router over the parent's fact_store, or None when it has none."""
+    memory_manager = getattr(agent, "_memory_manager", None)
+    try:
+        if memory_manager is not None and memory_manager.has_tool(_REVIEW_FACT_STORE_TOOL):
+            return ReviewFactStoreRouter(memory_manager)
+    except Exception:
+        logger.debug("review fact_store router unavailable", exc_info=True)
+    return None
+
+
+def _copy_memory_provider_schemas(parent: Any, review_agent: Any) -> None:
+    """Give the fork the parent's memory-provider tool schemas.
+
+    The parent's ``tools[]`` carries them (inject_memory_provider_tools); the
+    fork, built without a memory manager, does not. Copying them keeps
+    ``tools[]`` closer to the parent's for prompt-cache parity and makes
+    fact_store a valid tool name. Dispatch is still limited by the whitelist.
+    """
+    memory_manager = getattr(parent, "_memory_manager", None)
+    parent_tools = getattr(parent, "tools", None)
+    fork_tools = getattr(review_agent, "tools", None)
+    if memory_manager is None or not isinstance(parent_tools, list) or not isinstance(fork_tools, list):
+        return
+    try:
+        provider_names = {
+            (s.get("name") or (s.get("function") or {}).get("name"))
+            for s in memory_manager.get_all_tool_schemas()
+            if isinstance(s, dict)
+        }
+    except Exception:
+        return
+    have = {t.get("function", {}).get("name") for t in fork_tools if isinstance(t, dict)}
+    valid = getattr(review_agent, "valid_tool_names", None)
+    if valid is None:
+        valid = set()
+        review_agent.valid_tool_names = valid
+    for tool in parent_tools:
+        name = (tool.get("function") or {}).get("name") if isinstance(tool, dict) else None
+        if name in provider_names and name not in have:
+            fork_tools.append(copy.deepcopy(tool))
+            valid.add(name)
+            have.add(name)
+
+
 def summarize_background_review_actions(
     review_messages: List[Dict],
     prior_snapshot: List[Dict],
@@ -652,7 +766,7 @@ def summarize_background_review_actions(
     # result JSON only says "Entry added"; the call arguments contain action,
     # target, and content previews.  Restricting to notify_tools also prevents
     # helper tools from surfacing as memory work just because they succeeded.
-    notify_tools = {"memory", "skill_manage", "beam_photon"}
+    notify_tools = {"memory", "skill_manage", "beam_photon", "fact_store"}
     all_tool_call_ids: set = set()
     call_details: dict = {}
     for msg in review_messages or []:
@@ -711,6 +825,21 @@ def summarize_background_review_actions(
         # Defensively normalize everything through a dict-typed alias so
         # the rest of the function can stay terse without per-call
         # ``isinstance`` guards (#59437).
+        _fs_detail = call_details.get(tcid) or {}
+        if isinstance(_fs_detail, dict) and _fs_detail.get("tool") == "fact_store":
+            # fact_store answers {"fact_id": N, "status": "added"}, no
+            # "success" key. Only adds are writes; the rest are reads.
+            if (
+                isinstance(data, dict)
+                and _fs_detail.get("action") == "add"
+                and data.get("status") == "added"
+            ):
+                line = f"Memory photon {data.get('fact_id', '?')} added"
+                preview = str(_fs_detail.get("content") or "").strip()
+                if verbose and preview:
+                    line += f": {preview[:120]}{'…' if len(preview) > 120 else ''}"
+                actions.append(line)
+            continue
         if not isinstance(data, dict) or not data.get("success"):
             continue
         message = data.get("message", "")
@@ -1200,6 +1329,15 @@ def _run_review_in_thread(
             review_agent._user_profile_enabled = agent._user_profile_enabled
             review_agent._memory_nudge_interval = 0
             review_agent._skill_nudge_interval = 0
+            # Keeper ruling 2026-09-25 (see _MEMORY_SAVE_RULES): the memory
+            # half writes memory photons through the parent's fact_store,
+            # never the MEMORY.md/USER.md trunk. The fork still has no memory
+            # manager of its own; tool dispatch reaches this router through
+            # agent.memory_manager.memory_tool_router.
+            _fact_router = review_fact_store_router(agent)
+            setattr(review_agent, "_review_fact_store", _fact_router)
+            if _fact_router is not None:
+                _copy_memory_provider_schemas(agent, review_agent)
             # PERSISTENCE ISOLATION (the curator-takeover root cause): the fork
             # shares the parent's session_id (set below, for prompt-cache
             # warmth), so without this it would write its harness turn ("Review
@@ -1294,13 +1432,12 @@ def _run_review_in_thread(
                 clear_thread_tool_whitelist,
             )
 
-            # Gate the built-in memory tool on the profile's memory_enabled flag.
-            # Hardcoding ["memory", "skills"] granted the review LLM the MEMORY.md
-            # read/write tool even when a profile set memory_enabled: false,
-            # contaminating a memory-disabled profile (#54937 layer 2).
+            # The built-in ``memory`` tool (MEMORY.md/USER.md, the always-on
+            # trunk) is never whitelisted: keeper ruling 2026-09-25, the review
+            # writes memory photons to the fact store and trunk edits happen in
+            # live sessions. fact_store is allowed only when the parent has one
+            # (ReviewFactStoreRouter limits it to adds and reads).
             review_toolsets = ["skills"]
-            if review_agent._memory_enabled or review_agent._user_profile_enabled:
-                review_toolsets.insert(0, "memory")
             review_whitelist = {
                 t["function"]["name"]
                 for t in get_tool_definitions(
@@ -1308,11 +1445,14 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            if getattr(review_agent, "_review_fact_store", None) is not None:
+                review_whitelist.add(_REVIEW_FACT_STORE_TOOL)
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
                     "Background review denied non-whitelisted tool: "
-                    "{tool_name}. Only memory/skill tools are allowed."
+                    "{tool_name}. Only skill tools and fact_store are allowed; "
+                    "MEMORY.md/USER.md are edited only in live sessions."
                 ),
             )
             try:

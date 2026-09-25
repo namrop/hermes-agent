@@ -40,6 +40,7 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
+from agent.memory_manager import memory_tool_router
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -3276,9 +3277,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
-    elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
+    elif (_mem_router := memory_tool_router(agent, function_name)) is not None:
+        # The agent's MemoryManager, or in a post-turn review fork the
+        # parent's fact_store router (agent.background_review).
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            return _finish_agent_tool(_mem_router.handle_tool_call(function_name, next_args), next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool

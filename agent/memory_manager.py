@@ -166,6 +166,24 @@ def memory_provider_tools_enabled(
         return False
 
 
+def memory_tool_router(agent: Any, function_name: str) -> Any:
+    """Return the object whose ``handle_tool_call`` serves a memory-provider tool.
+
+    Normally the agent's own MemoryManager. A post-turn review fork has no
+    memory manager (``skip_memory=True``) but may carry
+    ``_review_fact_store``, a router over the parent's fact_store
+    (agent.background_review.ReviewFactStoreRouter). Returns None when
+    neither serves ``function_name``.
+    """
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager and memory_manager.has_tool(function_name):
+        return memory_manager
+    router = getattr(agent, "_review_fact_store", None)
+    if router is not None and router.has_tool(function_name):
+        return router
+    return None
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
     memory_manager = getattr(agent, "_memory_manager", None)
