@@ -7295,6 +7295,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "model", "model_reported", "cost_status", "cost_source",
         "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode", "api_mode",
+        # Never coalesce already-qualified (including unresolved) labels with
+        # deltas that still need accounting-time route resolution.
+        "_billing_provider_resolved",
         # Usage contract v2: each response id is its own route, so deltas
         # carrying distinct ids never merge (one event per physical request).
         # Id-less deltas (None == None) still coalesce as before.
@@ -7310,6 +7313,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         API call.  After close() has stopped the writer, falls back to the
         synchronous path and may raise like :meth:`update_token_counts`.
         """
+        # Resolve while the caller's profile scope is still active. A bare
+        # unresolved label must not be reinterpreted under the writer's home.
+        from agent.usage_route import qualify_usage_provider
+
+        if kwargs.get("billing_provider") == "custom":
+            kwargs["billing_provider"] = qualify_usage_provider(
+                kwargs.get("billing_provider"), kwargs.get("billing_base_url")
+            )
+            kwargs["_billing_provider_resolved"] = True
         with self._token_queue_cond:
             thread = self._token_writer_thread
             writer_stopped = self._token_writer_stop and (
@@ -7571,6 +7583,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         provider_request_id: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        _billing_provider_resolved: bool = False,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -7593,6 +7606,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
         """
+        if not _billing_provider_resolved:
+            from agent.usage_route import qualify_usage_provider
+
+            billing_provider = qualify_usage_provider(billing_provider, billing_base_url)
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
@@ -7927,6 +7944,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_id or not task:
             return
+        from agent.usage_route import qualify_usage_provider
+
+        billing_provider = qualify_usage_provider(billing_provider, billing_base_url)
         # FK on session_model_usage.session_id → sessions.id: ensure the row
         # exists (same INSERT OR IGNORE guard update_token_counts uses — the
         # initial create_session() can fail under concurrent SQLite locking).
