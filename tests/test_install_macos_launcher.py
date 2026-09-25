@@ -39,6 +39,8 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
     venv_bin.mkdir(parents=True)
     minimal_path.mkdir()
 
+    bash = shutil.which("bash")
+    assert bash is not None
     dirname = shutil.which("dirname")
     assert dirname is not None
     (minimal_path / "dirname").symlink_to(dirname)
@@ -63,17 +65,32 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
             'get_command_link_display_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             "log_info() { :; }",
             "log_success() { :; }",
+            "log_warn() { :; }",
             _setup_path_function(),
             "setup_path",
         ]
     )
+    home = tmp_path / "home"
+    home.mkdir()
     env = os.environ | {
+        "HOME": str(home),
+        "SHELL": bash,
         "USE_VENV": "true",
         "INSTALL_DIR": str(install_dir),
         "DISTRO": "macos",
         "COMMAND_LINK_DIR": str(command_dir),
     }
-    subprocess.run(["/bin/bash", "-c", harness], env=env, check=True)
+    subprocess.run([bash, "-c", harness], env=env, check=True)
+
+    # Prove the bypass target really is broken without realpath.
+    assert shutil.which("realpath", path=str(minimal_path)) is None
+    broken = subprocess.run(
+        [venv_bin / "hermes", "--version"],
+        env=os.environ | {"LAUNCH_RESULT": str(result)},
+        text=True, capture_output=True,
+    )
+    assert broken.returncode != 0
+    assert "realpath" in broken.stderr
 
     completed = subprocess.run(
         [command_dir / "hermes", "--version"],

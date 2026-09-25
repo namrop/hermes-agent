@@ -12,6 +12,7 @@ membership or survival semantics.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -22,9 +23,16 @@ import pytest
 from hermes_cli import _subprocess_compat
 from hermes_cli._subprocess_compat import _kill_git_process_tree, bounded_git_probe
 
+BASH = shutil.which("bash")
+
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX process-group semantics"
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _require_bash():
+    assert BASH is not None, "these subprocess fixtures require Bash on PATH"
 
 
 def _write_forking_script(tmp_path, marker_name="child.pid"):
@@ -34,7 +42,7 @@ def _write_forking_script(tmp_path, marker_name="child.pid"):
     script.write_text(
         textwrap.dedent(
             f"""\
-            #!/bin/bash
+            #!{BASH}
             sleep 300 &
             echo $! > {marker}
             sleep 300
@@ -84,7 +92,7 @@ def test_timeout_kills_descendants(tmp_path):
 def test_posix_spawn_uses_own_process_group(tmp_path):
     """The probe child must lead its own process group (killpg precondition)."""
     script = tmp_path / "pgid.sh"
-    script.write_text("#!/bin/bash\necho \"$$ $(ps -o pgid= -p $$ | tr -d ' ')\"\n")
+    script.write_text(f"#!{BASH}\necho \"$$ $(ps -o pgid= -p $$ | tr -d ' ')\"\n")
     script.chmod(0o755)
 
     out = bounded_git_probe([str(script)], timeout=5.0)

@@ -4,9 +4,13 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+import os
+import shutil
 from unittest.mock import MagicMock
 
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
+
+BASH = shutil.which("bash")
 
 
 class _TestableEnv(BaseEnvironment):
@@ -188,11 +192,11 @@ class TestAtomicSnapshotConcurrencyBehavioral:
 
     def _run(self, script):
         import subprocess
-        return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True)
+        assert BASH is not None
+        return subprocess.run([BASH, "-c", script], capture_output=True, text=True)
 
     def test_concurrent_writes_never_tear_the_snapshot(self, tmp_path):
-        import shutil
-        if not shutil.which("bash"):
+        if not BASH:
             import pytest
             pytest.skip("bash required")
         import shlex
@@ -211,17 +215,21 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         # Reader: repeatedly source the snapshot and check PATH never absorbs
         # an `export `/`declare -x` fragment (the corruption signature).
         reader = (
-            "export PATH=/usr/bin:/bin; "
+            f"export PATH={_q(os.environ['PATH'])}; "
             "for i in $(seq 1 160); do "
             f"( source {_q(snap)} >/dev/null 2>&1 || true; "
             "case \"$PATH\" in *'declare -x'*|*'export '*) echo CORRUPT;; esac ); "
-            "done"
+            "done; echo READ_COMPLETE"
         )
         self._run(f"export -p > {_q(snap)}")  # seed a valid snapshot
         # 4 concurrent writers + 4 readers, repeated.
         w = " & ".join([writer] * 4)
         r = " & ".join([reader] * 4)
         procs = [self._run(f"{w} & {r} & wait") for _ in range(3)]
+        for proc in procs:
+            assert proc.returncode == 0, proc.stderr
+            assert "command not found" not in proc.stderr
+            assert proc.stdout.count("READ_COMPLETE") == 4, proc.stdout
         corrupt = any("CORRUPT" in p.stdout for p in procs)
         assert not corrupt, "snapshot tore — PATH absorbed a declare-x/export fragment"
         final = self._run(f"source {_q(snap)} >/dev/null 2>&1 && echo OK || echo BROKEN")
@@ -230,8 +238,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path):
         """If ``export -p`` fails, the ``&&``-chained mv must NOT clobber the
         existing good snapshot."""
-        import shutil
-        if not shutil.which("bash"):
+        if not BASH:
             import pytest
             pytest.skip("bash required")
         import shlex
@@ -257,10 +264,9 @@ class TestSnapshotFileModes:
     def test_snapshot_and_cwd_files_are_0600(self, tmp_path):
         import os
         from pathlib import Path
-        import shutil
         import stat
         import subprocess
-        if not shutil.which("bash"):
+        if not BASH:
             import pytest
             pytest.skip("bash required")
 
@@ -273,8 +279,9 @@ class TestSnapshotFileModes:
                 return self._temp_dir
 
             def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+                assert BASH is not None
                 proc = subprocess.Popen(
-                    ["/bin/bash", "-lc", cmd_string],
+                    [BASH, "-lc", cmd_string],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,

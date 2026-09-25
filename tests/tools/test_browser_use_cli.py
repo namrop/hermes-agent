@@ -13,6 +13,8 @@ Covers the three seams the integration relies on:
 """
 import json
 import os
+import shlex
+import shutil
 import stat
 import time
 
@@ -963,6 +965,9 @@ class TestInstallCli:
         assert "uv" in msg
 
     def test_successful_install_via_fake_uv(self, tmp_path, monkeypatch):
+        # Resolve before emptying PATH; keep the installer subprocess isolated.
+        chmod = shutil.which("chmod")
+        assert chmod is not None
         home = tmp_path / "home"
         bin_dir = home / "bin"
         bin_dir.mkdir(parents=True)
@@ -972,13 +977,13 @@ class TestInstallCli:
         # pins to None — restore the real resolver for this test.
         monkeypatch.setattr(bu_cli, "_find_cli", bu_cli._find_cli_unpatched)
         # fake uv: `uv tool install browser-use` drops a binary into UV_TOOL_BIN_DIR.
-        # Absolute /bin/chmod: PATH is emptied above, so bare chmod won't resolve.
+        # Use the resolved chmod, not an FHS-only /bin/chmod or a restored PATH.
         uv = tmp_path / "uv"
         uv.write_text(
             "#!/bin/sh\n"
             'target="$UV_TOOL_BIN_DIR/browser-use"\n'
             'echo "#!/bin/sh" > "$target"\n'
-            '/bin/chmod +x "$target"\n'
+            f'{shlex.quote(chmod)} +x "$target"\n'
         )
         uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
         import sys as _sys
@@ -989,6 +994,8 @@ class TestInstallCli:
         ok, msg = bu_cli.install_cli()
         assert ok is True, msg
         assert (bin_dir / "browser-use").exists()
+        assert os.access(bin_dir / "browser-use", os.X_OK)
+        assert os.environ["PATH"] == str(tmp_path / "empty")
 
     def test_failed_install_surfaces_stderr_tail(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
