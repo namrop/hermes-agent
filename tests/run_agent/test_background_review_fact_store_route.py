@@ -46,12 +46,12 @@ def test_router_tags_list_form_and_no_duplicate_tag():
     assert mm.calls[0][1]["tags"] == "a, post-turn-review"
 
 
-def test_router_allows_reads_refuses_remove_and_feedback():
+def test_router_allows_reads_refuses_unknown_actions_and_feedback():
     mm = _FakeManager()
     router = br.ReviewFactStoreRouter(mm)
     router.handle_tool_call("fact_store", {"action": "search", "query": "q"})
     assert mm.calls == [("fact_store", {"action": "search", "query": "q"})]
-    for action in ("remove", ""):
+    for action in ("purge", ""):
         out = json.loads(router.handle_tool_call("fact_store", {"action": action, "fact_id": 1}))
         assert "error" in out
     assert len(mm.calls) == 1
@@ -61,20 +61,48 @@ def test_router_allows_reads_refuses_remove_and_feedback():
 
 def _edit_router(monkeypatch, tmp_path, prior):
     mm = _FakeManager()
-    router = br.ReviewFactStoreRouter(mm)
+    log = tmp_path / "state" / "edits.jsonl"  # parent created on first write
+    router = br.ReviewFactStoreRouter(mm, log)
     monkeypatch.setattr(router, "_prior_row", lambda fact_id: prior)
-    log = tmp_path / "edits.jsonl"
-    monkeypatch.setattr(br, "_review_edit_log_path", lambda: log)
     return mm, router, log
 
 
-def test_edit_logs_prior_row_and_strips_trust(monkeypatch, tmp_path):
-    prior = {"fact_id": 7, "content": "old", "category": "general", "tags": "a", "trust_score": 0.5, "updated_at": "x"}
-    mm, router, log = _edit_router(monkeypatch, tmp_path, prior)
+PRIOR = {"fact_id": 7, "content": "old", "category": "general", "tags": "a", "trust_score": 0.5, "updated_at": "x"}
+
+
+def test_edit_logs_prior_row_and_keeps_trust(monkeypatch, tmp_path):
+    mm, router, log = _edit_router(monkeypatch, tmp_path, PRIOR)
     router.handle_tool_call("fact_store", {"action": "update", "fact_id": 7, "content": "new", "trust_delta": 0.3})
-    assert mm.calls == [("fact_store", {"action": "update", "fact_id": 7, "content": "new"})]
+    assert mm.calls == [("fact_store", {"action": "update", "fact_id": 7, "content": "new", "trust_delta": 0.3})]
     entry = json.loads(log.read_text().strip())
-    assert entry["fact_id"] == 7 and entry["prior"] == prior and entry["change"] == {"content": "new"}
+    assert entry["action"] == "update" and entry["fact_id"] == 7 and entry["prior"] == PRIOR
+    assert entry["change"] == {"content": "new", "trust_delta": 0.3}
+
+
+def test_trust_only_update_allowed_and_logged(monkeypatch, tmp_path):
+    mm, router, log = _edit_router(monkeypatch, tmp_path, PRIOR)
+    router.handle_tool_call("fact_store", {"action": "update", "fact_id": 7, "trust_delta": -0.1})
+    assert mm.calls == [("fact_store", {"action": "update", "fact_id": 7, "trust_delta": -0.1})]
+    assert json.loads(log.read_text().strip())["change"] == {"trust_delta": -0.1}
+
+
+def test_remove_logs_prior_row_then_forwards(monkeypatch, tmp_path):
+    mm, router, log = _edit_router(monkeypatch, tmp_path, PRIOR)
+    router.handle_tool_call("fact_store", {"action": "remove", "fact_id": 7})
+    assert mm.calls == [("fact_store", {"action": "remove", "fact_id": 7})]
+    entry = json.loads(log.read_text().strip())
+    assert entry["action"] == "remove" and entry["prior"] == PRIOR and entry["change"] is None
+
+
+def test_edit_log_path_from_config(tmp_path, monkeypatch):
+    target = tmp_path / "canon" / "12_runtime" / "state" / "memory_photons" / "review_edits.jsonl"
+    assert br._review_edit_log_path({"edit_log": str(target)}) == target
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    assert br._review_edit_log_path({}).name == br.REVIEW_EDIT_LOG_NAME
+    parent = _Obj()
+    parent._memory_manager = _FakeManager()
+    router = br.review_fact_store_router(parent, {"edit_log": str(target)})
+    assert router._edit_log_path == target
 
 
 def test_edit_refused_when_prior_version_cannot_be_recorded(monkeypatch, tmp_path):
@@ -88,7 +116,9 @@ def test_edit_refused_when_prior_version_cannot_be_recorded(monkeypatch, tmp_pat
     monkeypatch.setattr(router, "_prior_row", _boom)
     out = json.loads(router.handle_tool_call("fact_store", {"action": "update", "fact_id": 9, "content": "x"}))
     assert "could not record" in out["error"] and mm.calls == []
-    out = json.loads(router.handle_tool_call("fact_store", {"action": "update", "fact_id": 9, "trust_delta": 1}))
+    out = json.loads(router.handle_tool_call("fact_store", {"action": "remove", "fact_id": 9}))
+    assert "could not record" in out["error"] and mm.calls == []
+    out = json.loads(router.handle_tool_call("fact_store", {"action": "update", "fact_id": 9}))
     assert "needs content" in out["error"] and mm.calls == []
 
 
@@ -101,6 +131,12 @@ def test_summary_reports_edited_memory_photon_as_memory():
     actions = br.summarize_background_review_actions(msgs, [])
     assert actions == ["Memory photon 41 edited"]
     assert br._classify_review_result(actions) == "memory"
+    msgs = [
+        {"role": "assistant", "tool_calls": [{"id": "c2", "function": {
+            "name": "fact_store", "arguments": json.dumps({"action": "remove", "fact_id": 86})}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": json.dumps({"removed": True})},
+    ]
+    assert br.summarize_background_review_actions(msgs, []) == ["Memory photon 86 removed"]
 
 
 def test_router_factory_needs_a_parent_fact_store():
