@@ -46,17 +46,61 @@ def test_router_tags_list_form_and_no_duplicate_tag():
     assert mm.calls[0][1]["tags"] == "a, post-turn-review"
 
 
-def test_router_allows_reads_refuses_update_remove_and_feedback():
+def test_router_allows_reads_refuses_remove_and_feedback():
     mm = _FakeManager()
     router = br.ReviewFactStoreRouter(mm)
     router.handle_tool_call("fact_store", {"action": "search", "query": "q"})
     assert mm.calls == [("fact_store", {"action": "search", "query": "q"})]
-    for action in ("remove", "update", ""):
+    for action in ("remove", ""):
         out = json.loads(router.handle_tool_call("fact_store", {"action": action, "fact_id": 1}))
         assert "error" in out
     assert len(mm.calls) == 1
     assert not router.has_tool("fact_feedback")
     assert not router.has_tool("memory")
+
+
+def _edit_router(monkeypatch, tmp_path, prior):
+    mm = _FakeManager()
+    router = br.ReviewFactStoreRouter(mm)
+    monkeypatch.setattr(router, "_prior_row", lambda fact_id: prior)
+    log = tmp_path / "edits.jsonl"
+    monkeypatch.setattr(br, "_review_edit_log_path", lambda: log)
+    return mm, router, log
+
+
+def test_edit_logs_prior_row_and_strips_trust(monkeypatch, tmp_path):
+    prior = {"fact_id": 7, "content": "old", "category": "general", "tags": "a", "trust_score": 0.5, "updated_at": "x"}
+    mm, router, log = _edit_router(monkeypatch, tmp_path, prior)
+    router.handle_tool_call("fact_store", {"action": "update", "fact_id": 7, "content": "new", "trust_delta": 0.3})
+    assert mm.calls == [("fact_store", {"action": "update", "fact_id": 7, "content": "new"})]
+    entry = json.loads(log.read_text().strip())
+    assert entry["fact_id"] == 7 and entry["prior"] == prior and entry["change"] == {"content": "new"}
+
+
+def test_edit_refused_when_prior_version_cannot_be_recorded(monkeypatch, tmp_path):
+    mm, router, log = _edit_router(monkeypatch, tmp_path, None)
+    out = json.loads(router.handle_tool_call("fact_store", {"action": "update", "fact_id": 9, "content": "x"}))
+    assert "does not exist" in out["error"] and mm.calls == []
+
+    def _boom(fact_id):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(router, "_prior_row", _boom)
+    out = json.loads(router.handle_tool_call("fact_store", {"action": "update", "fact_id": 9, "content": "x"}))
+    assert "could not record" in out["error"] and mm.calls == []
+    out = json.loads(router.handle_tool_call("fact_store", {"action": "update", "fact_id": 9, "trust_delta": 1}))
+    assert "needs content" in out["error"] and mm.calls == []
+
+
+def test_summary_reports_edited_memory_photon_as_memory():
+    msgs = [
+        {"role": "assistant", "tool_calls": [{"id": "c1", "function": {
+            "name": "fact_store", "arguments": json.dumps({"action": "update", "fact_id": 41, "content": "fixed"})}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": json.dumps({"updated": True})},
+    ]
+    actions = br.summarize_background_review_actions(msgs, [])
+    assert actions == ["Memory photon 41 edited"]
+    assert br._classify_review_result(actions) == "memory"
 
 
 def test_router_factory_needs_a_parent_fact_store():

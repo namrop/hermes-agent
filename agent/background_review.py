@@ -452,14 +452,18 @@ _SKILL_ROUTING_RULES = (
 # half records memory photons with fact_store. The always-on trunk (MEMORY.md
 # and USER.md, written by the ``memory`` tool) is edited only in live
 # sessions. _run_review_in_thread enforces this: the ``memory`` tool is not
-# whitelisted, and fact_store is limited to adds and reads
+# whitelisted, and fact_store is limited to adds, logged edits and reads
 # (ReviewFactStoreRouter).
 _MEMORY_SAVE_RULES = (
     "Save with fact_store action=add: one self-contained fact per call, with "
     "the date and where it came from, category user_pref for preferences and "
     "expectations (general, project or tool otherwise), and a few "
     "comma-separated tags. Run fact_store action=search first and skip "
-    "anything already stored. Do not use the memory tool: MEMORY.md and "
+    "anything already stored. When the conversation shows a stored memory "
+    "photon is now wrong or out of date, correct it with fact_store "
+    "action=update (fact_id, content): keep the user's own quoted words and "
+    "say what changed and when. Edits do not remove facts or change trust. "
+    "Do not use the memory tool: MEMORY.md and "
     "USER.md are the always-on trunk, edited only in live sessions with the "
     "user. If fact_store is not available, there is nothing to save.\n\n"
 )
@@ -634,12 +638,24 @@ def skills_loaded_in_conversation(messages: Optional[List[Dict]]) -> set:
 
 
 _REVIEW_FACT_STORE_TOOL = "fact_store"
-# Adds plus the read-only actions. update and remove stay with live sessions.
+# Adds, edits, and the read-only actions. remove stays with live sessions.
+# Keeper 2026-09-25 (Discord 1553057447260987495): "I think it should be able
+# to edit the memory photons".
 _REVIEW_FACT_STORE_ACTIONS = frozenset(
-    {"add", "search", "probe", "related", "reason", "contradict", "list"}
+    {"add", "update", "search", "probe", "related", "reason", "contradict", "list"}
 )
 # Every review-written memory photon carries this tag so they stay countable.
 REVIEW_FACT_TAG = "post-turn-review"
+# Review edits overwrite the fact in place (the store keeps no history), so the
+# prior row is appended here first; an edit whose prior row cannot be recorded
+# is refused.
+REVIEW_EDIT_LOG_NAME = "memory_photon_review_edits.jsonl"
+
+
+def _review_edit_log_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / REVIEW_EDIT_LOG_NAME
 
 
 class ReviewFactStoreRouter:
@@ -647,8 +663,10 @@ class ReviewFactStoreRouter:
 
     The fork runs with ``skip_memory=True`` (no memory manager of its own, so
     no prefetch/sync side effects on the provider). This router gives it the
-    parent's provider for one tool: adds and reads only, never update or
-    remove, and every add tagged :data:`REVIEW_FACT_TAG`.
+    parent's provider for one tool: adds, edits and reads, never remove; every
+    add tagged :data:`REVIEW_FACT_TAG`; every edit logged with the prior row
+    to :data:`REVIEW_EDIT_LOG_NAME` and stripped of ``trust_delta`` (ratings are
+    a separate channel).
     """
 
     def __init__(self, memory_manager: Any):
@@ -656,6 +674,50 @@ class ReviewFactStoreRouter:
 
     def has_tool(self, tool_name: str) -> bool:
         return tool_name == _REVIEW_FACT_STORE_TOOL
+
+    def _prior_row(self, fact_id: int) -> Optional[Dict[str, Any]]:
+        """Read the fact as it stands, through the store's read-only reader."""
+        provider = getattr(self._memory_manager, "_tool_to_provider", {}).get(_REVIEW_FACT_STORE_TOOL)
+        store = getattr(provider, "_store", None)
+        if store is None:
+            raise RuntimeError("fact store unavailable")
+        with store.reader(timeout=5) as conn:
+            row = conn.execute(
+                "SELECT fact_id, content, category, tags, trust_score, updated_at "
+                "FROM facts WHERE fact_id = ?",
+                (int(fact_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = ("fact_id", "content", "category", "tags", "trust_score", "updated_at")
+        return {k: row[i] for i, k in enumerate(keys)}
+
+    def _record_edit(self, args: Dict[str, Any]) -> Optional[str]:
+        """Append the prior row + requested change. Returns an error or None."""
+        try:
+            fact_id = int(args.get("fact_id"))
+        except (TypeError, ValueError):
+            return "fact_store action=update needs an integer fact_id"
+        try:
+            prior = self._prior_row(fact_id)
+            if prior is None:
+                return f"memory photon {fact_id} does not exist"
+            from datetime import datetime, timezone
+
+            entry = {
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "by": "post-turn-review",
+                "fact_id": fact_id,
+                "prior": prior,
+                "change": {k: args[k] for k in ("content", "tags", "category") if k in args},
+            }
+            path = _review_edit_log_path()
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("post-turn review edit of memory photon refused: %s", exc)
+            return f"edit refused: could not record the prior version ({exc})"
+        return None
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name != _REVIEW_FACT_STORE_TOOL:
@@ -666,10 +728,17 @@ class ReviewFactStoreRouter:
             return json.dumps({
                 "error": (
                     f"fact_store action={action or '?'} is not available to the "
-                    "post-turn review: it may add memory photons and read them, "
-                    "not change or remove them."
+                    "post-turn review: it may add, edit and read memory photons, "
+                    "not remove them."
                 )
             })
+        if action == "update":
+            args.pop("trust_delta", None)
+            if not any(k in args for k in ("content", "tags", "category")):
+                return json.dumps({"error": "fact_store action=update needs content, tags or category"})
+            error = self._record_edit(args)
+            if error:
+                return json.dumps({"error": error})
         if action == "add":
             raw = args.get("tags") or ""
             if isinstance(raw, (list, tuple)):
@@ -797,6 +866,7 @@ def summarize_background_review_actions(
                     "name": args.get("name", ""),
                     "old_string": args.get("old_string", ""),
                     "new_string": args.get("new_string", ""),
+                    "fact_id": args.get("fact_id"),
                 }
 
     actions: List[str] = []
@@ -829,12 +899,12 @@ def summarize_background_review_actions(
         if isinstance(_fs_detail, dict) and _fs_detail.get("tool") == "fact_store":
             # fact_store answers {"fact_id": N, "status": "added"}, no
             # "success" key. Only adds are writes; the rest are reads.
-            if (
-                isinstance(data, dict)
-                and _fs_detail.get("action") == "add"
-                and data.get("status") == "added"
-            ):
+            line = None
+            if isinstance(data, dict) and _fs_detail.get("action") == "add" and data.get("status") == "added":
                 line = f"Memory photon {data.get('fact_id', '?')} added"
+            elif isinstance(data, dict) and _fs_detail.get("action") == "update" and data.get("updated") is True:
+                line = f"Memory photon {_fs_detail.get('fact_id', '?')} edited"
+            if line:
                 preview = str(_fs_detail.get("content") or "").strip()
                 if verbose and preview:
                     line += f": {preview[:120]}{'…' if len(preview) > 120 else ''}"
@@ -1436,7 +1506,7 @@ def _run_review_in_thread(
             # trunk) is never whitelisted: keeper ruling 2026-09-25, the review
             # writes memory photons to the fact store and trunk edits happen in
             # live sessions. fact_store is allowed only when the parent has one
-            # (ReviewFactStoreRouter limits it to adds and reads).
+            # (ReviewFactStoreRouter: adds, logged edits and reads; no remove).
             review_toolsets = ["skills"]
             review_whitelist = {
                 t["function"]["name"]
