@@ -463,6 +463,36 @@ class TestSyncSkills:
         assert len(manifest["new-skill"]) == 32
         assert len(manifest["old-skill"]) == 32
 
+
+    def test_copies_from_readonly_nix_tree_are_owner_writable(self, tmp_path):
+        """Bundled skills copied out of a read-only Nix store (0444 files,
+        0555 dirs) must land owner-writable, or skill_manage cannot patch
+        them (Sol, 2026-09-25: 32 bundled skills were stuck read-only)."""
+        bundled = self._setup_bundled(tmp_path)
+        (bundled / "category" / "new-skill" / "references").mkdir()
+        (bundled / "category" / "new-skill" / "references" / "r.md").write_text("ref")
+        ro_dir = stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+        all_paths = sorted(bundled.rglob("*"), key=lambda q: len(q.parts), reverse=True)
+        for q in all_paths:
+            os.chmod(q, ro_dir if q.is_dir() else stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+        os.chmod(bundled, ro_dir)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        try:
+            with self._patches(bundled, skills_dir, manifest_file):
+                result = sync_skills(quiet=True)
+            assert sorted(result["copied"]) == ["new-skill", "old-skill"]
+            copied = [skills_dir / "category" / "new-skill", skills_dir / "old-skill",
+                      skills_dir / "category" / "DESCRIPTION.md"]
+            for root in copied:
+                for q in [root, *(root.rglob("*") if root.is_dir() else [])]:
+                    assert os.access(q, os.W_OK), q
+            # Content-only hash is unchanged by the mode fix.
+            assert _dir_hash(skills_dir / "old-skill") == _dir_hash(bundled / "old-skill")
+        finally:
+            for q in [bundled, *bundled.rglob("*")]:
+                os.chmod(q, stat.S_IRWXU)
+
     def test_user_deleted_skill_not_re_added_and_stale_entries_cleaned(self, tmp_path):
         """In manifest but not on disk = user deleted it; don't re-add. And a
         manifest entry no longer present in bundled gets cleaned out."""

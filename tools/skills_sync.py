@@ -292,6 +292,48 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _make_owner_writable(root: Path) -> None:
+    """Give the owner read/write on a freshly copied skill (dirs also +x).
+
+    Bundled skills are copied out of the package install. Under Nix that is
+    the read-only store, and ``shutil.copytree``/``copy2`` carry its mode bits
+    (0444 files, 0555 dirs) into HERMES_HOME. The synced copy is the user's
+    copy -- the manifest logic already treats local edits as legitimate and
+    stops overwriting them -- so it has to be editable. On Sol this left 32
+    bundled skills unpatchable by skill_manage (seen 2026-09-25). #34972 fixed
+    only the delete/reset side of the same problem (``_rmtree_writable``).
+
+    Only permission bits change; ``_dir_hash`` hashes content, so update and
+    user-modification detection are unaffected. Group/other bits are left as
+    copied. Symlinks are not followed.
+    """
+    import stat
+
+    def _add(path: Path, bits: int) -> None:
+        try:
+            st = path.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                return
+            mode = stat.S_IMODE(st.st_mode)
+            if mode & bits != bits:
+                os.chmod(path, mode | bits)
+        except OSError:
+            logger.debug("Could not make %s owner-writable", path, exc_info=True)
+
+    dir_bits = stat.S_IRWXU
+    file_bits = stat.S_IRUSR | stat.S_IWUSR
+    if root.is_symlink():
+        return
+    if root.is_dir():
+        _add(root, dir_bits)
+        for child in root.rglob("*"):
+            if child.is_symlink():
+                continue
+            _add(child, dir_bits if child.is_dir() else file_bits)
+    elif root.exists():
+        _add(root, file_bits)
+
+
 def _safe_rel_install_path(path: Path, base: Path) -> str:
     """Return a normalized relative POSIX path, rejecting traversal/absolute paths."""
     rel = path.relative_to(base)
@@ -423,6 +465,7 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
             if not dest.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(src, dest)
+                _make_owner_writable(dest)
                 restored.append(folder_name)
         elif not canonical_ok:
             continue
@@ -851,6 +894,7 @@ def sync_skills(quiet: bool = False) -> dict:
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(skill_src, dest)
+                    _make_owner_writable(dest)
                     copied.append(skill_name)
                     manifest[skill_name] = bundled_hash
                     if not quiet:
@@ -907,6 +951,7 @@ def sync_skills(quiet: bool = False) -> dict:
                     shutil.move(str(dest), str(backup))
                     try:
                         shutil.copytree(skill_src, dest)
+                        _make_owner_writable(dest)
                         manifest[skill_name] = bundled_hash
                         updated.append(skill_name)
                         if not quiet:
@@ -955,6 +1000,7 @@ def sync_skills(quiet: bool = False) -> dict:
             try:
                 dest_desc.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(desc_md, dest_desc)
+                _make_owner_writable(dest_desc)
             except (OSError, IOError) as e:
                 logger.debug("Could not copy %s: %s", desc_md, e)
 
