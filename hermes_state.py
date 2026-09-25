@@ -7295,6 +7295,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "model", "model_reported", "cost_status", "cost_source",
         "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode", "api_mode",
+        # Usage contract v2: each response id is its own route, so deltas
+        # carrying distinct ids never merge (one event per physical request).
+        # Id-less deltas (None == None) still coalesce as before.
+        "provider_request_id",
     )
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
@@ -7564,6 +7568,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: Optional[str] = None,
         api_mode: Optional[str] = None,
         model_reported: Optional[str] = None,
+        provider_request_id: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
     ) -> None:
@@ -7713,6 +7718,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     session_id,
                     model=model,
                     model_reported=model_reported,
+                    provider_request_id=provider_request_id,
                     billing_provider=billing_provider,
                     billing_base_url=billing_base_url,
                     billing_mode=billing_mode,
@@ -7737,6 +7743,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         model: Optional[str],
         model_reported: Optional[str] = None,
+        provider_request_id: Optional[str] = None,
         billing_provider: Optional[str],
         billing_base_url: Optional[str],
         billing_mode: Optional[str],
@@ -7850,6 +7857,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # NULL means "no provider echo in scope", and the value's
                 # entire purpose is diverging from ``model`` on substitution.
                 model_reported=model_reported or None,
+                provider_request_id=provider_request_id or None,
                 provider=eff_provider,
                 api_mode=api_mode or None,
                 billing_base_url=eff_base_url,

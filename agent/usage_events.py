@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
     request_status TEXT NOT NULL DEFAULT 'ok',
     error_class TEXT,
     api_call_index INTEGER,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    provider_request_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events(session_id, timestamp DESC);
@@ -184,6 +185,10 @@ class UsageEventLedger:
         * ``model_reported`` is added — the provider-echoed served model,
           the substitution-detection signal (NULL when the transport
           echoes nothing; never copied from the requested ``model``).
+        * ``provider_request_id`` is added — the response id the transport
+          returned for this call (usage contract v2, keeper ratified
+          2026-09-25). Recorded raw; whether it identifies a physical
+          request is the union reader's call, not this writer's.
         """
         cols = {
             row["name"]
@@ -201,6 +206,8 @@ class UsageEventLedger:
                 )
         if "model_reported" not in cols:
             conn.execute("ALTER TABLE usage_events ADD COLUMN model_reported TEXT")
+        if "provider_request_id" not in cols:
+            conn.execute("ALTER TABLE usage_events ADD COLUMN provider_request_id TEXT")
 
     def append_event(self, **event: Any) -> Optional[str]:
         """Append one event row; returns its ``event_uid`` or ``None``.
@@ -224,8 +231,9 @@ class UsageEventLedger:
                            cache_write_tokens, reasoning_tokens,
                            cost_usd_micro, cost_status, cost_source,
                            pricing_version, latency_ms, request_status,
-                           error_class, api_call_index, created_at
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           error_class, api_call_index, created_at,
+                           provider_request_id
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         uid,
                         float(event.get("timestamp") or now),
@@ -258,6 +266,7 @@ class UsageEventLedger:
                         event.get("error_class"),
                         event.get("api_call_index"),
                         float(event.get("created_at") or now),
+                        event.get("provider_request_id") or None,
                     ),
                 )
             return uid
@@ -325,6 +334,7 @@ def record_model_delta_event(
     cost_status: Optional[str] = None,
     cost_source: Optional[str] = None,
     api_call_count: int = 0,
+    provider_request_id: Optional[str] = None,
 ) -> Optional[str]:
     """Append the event-spine mirror of one ``_record_model_usage`` delta.
 
@@ -340,6 +350,10 @@ def record_model_delta_event(
     does not echo one and is never defaulted from the requested ``model`` —
     an honest NULL beats a copied value; the whole point is detecting when
     they differ.
+
+    ``provider_request_id`` is the response id of the single API call this
+    delta accounts for (usage contract v2). Callers pass it only for a
+    one-call delta; multi-call aggregates never carry one.
     """
     ledger = get_event_ledger()
     if ledger is None:
@@ -369,6 +383,7 @@ def record_model_delta_event(
         cost_status=status,
         cost_source=cost_source,
         api_call_index=_int_or_zero(api_call_count) or None,
+        provider_request_id=provider_request_id or None,
     )
 
 

@@ -229,6 +229,33 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# Response-id prefixes that are provider-issued for each transport. Anything
+# else (Hermes' own "stream-<uuid>" placeholders, chat-completion ids from
+# arbitrary OpenAI-compatible servers) is not recorded as a request id.
+_PROVIDER_REQUEST_ID_PREFIXES = {
+    "anthropic_messages": "msg_",
+    "codex_responses": "resp_",
+}
+
+
+def _provider_request_id_for(response, *, api_mode, folded: bool = False):
+    """Return the provider response id for one accounted call, or None.
+
+    Usage-event contract v2 (keeper ratified 2026-09-25): the union reader
+    counts each physical request once across every harness that observed it,
+    keyed on this id. It is recorded raw; the reader decides per provider
+    whether the id identifies a physical request. ``folded`` deltas (MoA,
+    aggregator plus advisors in one delta) never carry an id, because one id
+    must not stand for several calls.
+    """
+    if folded:
+        return None
+    prefix = _PROVIDER_REQUEST_ID_PREFIXES.get(str(api_mode or ""))
+    response_id = getattr(response, "id", None)
+    if prefix and isinstance(response_id, str) and response_id.startswith(prefix):
+        return response_id
+    return None
+
 
 def _should_rearm_compression_budget(
     compression_attempts: int,
@@ -4046,12 +4073,16 @@ def run_conversation(
                     # usage, so without this the entire advisor spend — usually
                     # the bulk of a MoA turn — is invisible in token counts.
                     _moa_ref_cost = None
+                    # True once another call's usage is folded into this
+                    # delta; a folded delta must not carry one request id.
+                    _usage_folded = False
                     _moa_client = getattr(agent, "client", None)
                     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
                         try:
                             _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
                             if _ref_usage is not None:
                                 canonical_usage = canonical_usage + _ref_usage
+                                _usage_folded = True
                         except Exception as _moa_acct_exc:  # pragma: no cover - defensive
                             logger.debug("MoA reference usage accounting failed: %s", _moa_acct_exc)
                     # Flush the full-turn MoA trace (references + aggregator I/O)
@@ -4280,6 +4311,19 @@ def run_conversation(
                                 # chunk echoes only — never the request.
                                 model_reported=(
                                     getattr(response, "model", None) or None
+                                ),
+                                # Usage contract v2 (keeper ratified
+                                # 2026-09-25): the provider's response id
+                                # for this one call, so the union reader can
+                                # count it once across observers. Native
+                                # Messages ids (msg_) and Responses ids
+                                # (resp_) only; synthetic stream-<uuid> ids
+                                # and MoA's folded aggregator+advisor deltas
+                                # never carry one.
+                                provider_request_id=_provider_request_id_for(
+                                    response,
+                                    api_mode=agent.api_mode,
+                                    folded=_usage_folded,
                                 ),
                                 api_call_count=1,
                             )
