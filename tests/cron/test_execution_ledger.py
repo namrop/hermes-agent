@@ -69,6 +69,13 @@ def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     assert executions.latest_execution("immutable")["status"] == "completed"
 
 
+def test_default_retention_is_ten_thousand_runs():
+    # Fork setting (Luis, 2026-09-25): an upstream merge must not quietly restore 1,000.
+    from cron import executions
+
+    assert executions.MAX_TERMINAL_EXECUTIONS == 10000
+
+
 def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)

@@ -21,7 +21,11 @@ from hermes_time import now as _hermes_now
 # dashboard operations that temporarily enter another profile cannot leak that
 # profile's execution records into the import-time home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# Finished attempts kept across all jobs, newest first. Luis (Sol, 2026-09-25, #masthead message
+# 1553049562195824701): "I think we need to increase the number of jobs hermes keeps. something like 10,000 jobs
+# is better" -- "number of job runs I mean". At 1,000 the ledger held only about 11-16 hours on Sol, where
+# minute-level no-agent jobs fire all day, so last night's runs had aged out by the next morning.
+MAX_TERMINAL_EXECUTIONS = 10000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
