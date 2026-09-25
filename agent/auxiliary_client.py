@@ -7335,6 +7335,7 @@ def resolve_vision_provider_client(
     api_key: Optional[str] = None,
     async_mode: bool = False,
     main_runtime: Optional[Dict[str, Any]] = None,
+    _auto_recovery: bool = False,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
 
@@ -7344,9 +7345,16 @@ def resolve_vision_provider_client(
     stays conservative and only tries vision backends known to work today.
     """
     runtime = _normalize_main_runtime(main_runtime)
-    requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key
-    )
+    if _auto_recovery:
+        # The failed primary's task config must not be re-read as a model
+        # override for an unrelated auto-selected provider. Ordinary explicit
+        # auto calls still retain their intentional model overrides below.
+        requested = "auto"
+        resolved_model = resolved_base_url = resolved_api_key = resolved_api_mode = None
+    else:
+        requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
+            "vision", provider, model, base_url, api_key
+        )
     requested = _normalize_vision_provider(requested)
 
     def _finalize(resolved_provider: str, sync_client: Any, default_model: Optional[str]):
@@ -7567,6 +7575,44 @@ def resolve_vision_provider_client(
     if client is None:
         return requested, None, None
     return requested, client, final_model
+
+
+def _recover_unavailable_vision_client(
+    provider: str,
+    *,
+    main_runtime: Dict[str, Any],
+    async_mode: bool,
+) -> tuple[Optional[str], Optional[Any], Optional[str], Optional[str]]:
+    """Resolve a whole destination after a vision primary cannot build.
+
+    Configured task fallbacks precede the existing auto safety net. A provider
+    switch carries the destination model and wire mode, never the failed pair.
+    """
+    client, model, label = _try_configured_fallback_for_unavailable_client(
+        "vision", provider,
+    )
+    if client is not None:
+        destination = _fallback_destination("vision", client, model, label)
+        if async_mode:
+            client, model = _to_async_client(client, destination.model, is_vision=True)
+        else:
+            model = destination.model
+        return destination.provider, client, model, destination.api_mode
+
+    logger.warning(
+        "Vision provider %s and configured fallbacks unavailable; trying auto vision backends",
+        provider,
+    )
+    selected, client, model = resolve_vision_provider_client(
+        provider="auto", async_mode=async_mode, main_runtime=main_runtime,
+        _auto_recovery=True,
+    )
+    if client is None:
+        return selected, None, model, None
+    destination = _complete_fallback_destination(
+        selected or "", str(getattr(client, "base_url", "") or ""), None, model,
+    )
+    return destination.provider, client, destination.model, destination.api_mode
 
 
 def get_auxiliary_extra_body() -> dict:
@@ -9502,15 +9548,8 @@ def _call_llm_impl(
             main_runtime=main_runtime,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
-            logger.warning(
-                "Vision provider %s unavailable, falling back to auto vision backends",
-                resolved_provider,
-            )
-            effective_provider, client, final_model = resolve_vision_provider_client(
-                provider="auto",
-                model=resolved_model,
-                async_mode=False,
-                main_runtime=main_runtime,
+            effective_provider, client, final_model, resolved_api_mode = _recover_unavailable_vision_client(
+                resolved_provider, async_mode=False, main_runtime=main_runtime,
             )
         if client is None:
             raise RuntimeError(
@@ -10332,15 +10371,8 @@ async def _async_call_llm_impl(
             main_runtime=main_runtime,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
-            logger.warning(
-                "Vision provider %s unavailable, falling back to auto vision backends",
-                resolved_provider,
-            )
-            effective_provider, client, final_model = resolve_vision_provider_client(
-                provider="auto",
-                model=resolved_model,
-                async_mode=True,
-                main_runtime=main_runtime,
+            effective_provider, client, final_model, resolved_api_mode = _recover_unavailable_vision_client(
+                resolved_provider, async_mode=True, main_runtime=main_runtime,
             )
         if client is None:
             raise RuntimeError(
