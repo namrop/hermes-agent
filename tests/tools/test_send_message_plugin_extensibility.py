@@ -187,10 +187,31 @@ def test_cli_and_cron_share_plugin_target_normalization(plugin_platform, monkeyp
     }
 
 
-def test_send_message_remains_host_only(plugin_platform):
+def test_send_message_is_registered_but_opt_in(plugin_platform, monkeypatch):
+    from model_tools import get_tool_definitions
     from tools.registry import registry
+    from toolsets import TOOLSETS, resolve_toolset
 
-    assert registry.get_entry("send_message") is None
+    entry = registry.get_entry("send_message")
+    assert entry is not None
+    assert entry.toolset == "messaging"
+    for name in TOOLSETS:
+        if name.startswith("hermes-"):
+            assert "send_message" not in resolve_toolset(name), name
+
+    # Satisfy the real availability gate with a local session context, not a
+    # live gateway or credentials. Selection and disablement still apply.
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+
+    def names(enabled, disabled=None):
+        # Inspect the selected schemas before optional lazy tool-search wrapping.
+        return [tool["function"]["name"] for tool in get_tool_definitions(
+            enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )]
+
+    assert names(["messaging"]) == ["send_message"]
+    assert names(["messaging"], ["messaging"]) == []
 
 
 def test_force_reload_unregisters_profile_owned_platform(plugin_platform, monkeypatch):
@@ -268,4 +289,4 @@ print(json.dumps({"host_send": host_send, "cron": cron,
     payload = json.loads(completed.stdout.strip().splitlines()[-1])
     assert payload["host_send"]["chat_id"] == "@alice@example.com"
     assert payload["cron"]["chat_id"] == "@alice@example.com"
-    assert payload["model_registered"] is False
+    assert payload["model_registered"] is True
