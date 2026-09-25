@@ -2,9 +2,8 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, xai) instantiate and self-report the expected
-  capabilities + ABC-derived defaults.
+- Bundled providers are discovered from their manifests and self-report
+  capabilities + ABC-derived defaults, including explicit rendered lanes.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
   scenarios (explicit config wins ignoring availability, fallback walks
@@ -68,24 +67,50 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
+    """Bundled web plugins discover and register without freezing the catalog."""
 
     def test_all_bundled_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import list_providers
 
-        names = sorted(p.name for p in list_providers())
-        assert names == [
-            "brave-free",
-            "ddgs",
-            "exa",
-            "firecrawl",
-            "keenable",
-            "parallel",
-            "searxng",
-            "tavily",
-            "xai",
-        ]
+        from pathlib import Path
+        import yaml
+
+        root = Path(__file__).resolve().parents[3] / "plugins" / "web"
+        declared = set()
+        for manifest in root.glob("*/plugin.yaml"):
+            data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+            declared.update(data.get("provides_web_providers", []))
+        assert declared
+        names = [p.name for p in list_providers()]
+        assert declared <= set(names)
+        assert names == sorted(set(names))
+        _ensure_plugins_loaded()
+        assert [p.name for p in list_providers()] == names
+
+    def test_extension_preserves_providers_and_deduplicates_registration(self):
+        from agent.web_search_provider import WebSearchProvider
+        from agent.web_search_registry import list_providers, register_provider, restore_registration
+
+        class Extension(WebSearchProvider):
+            @property
+            def name(self):
+                return "fixture-web-extension"
+
+            def is_available(self):
+                return False
+
+        _ensure_plugins_loaded()
+        before = {p.name: p for p in list_providers()}
+        extension = Extension()
+        try:
+            register_provider(extension)
+            register_provider(extension)
+            providers = list_providers()
+            assert [p.name for p in providers] == sorted([*before, extension.name])
+            assert {p.name: p for p in providers} == {**before, extension.name: extension}
+        finally:
+            restore_registration(extension.name, extension, None)
 
     @pytest.mark.parametrize(
         "plugin_name,expected_search,expected_extract",
@@ -99,6 +124,8 @@ class TestBundledPluginsRegister:
             ("firecrawl", True, True),
             # xai: search-only via Grok's agentic web_search tool.
             ("xai", True, False),
+            ("cloakbrowser-acubens", False, True),
+            ("earthglass", False, True),
         ],
     )
     def test_capability_flags_match_spec(
@@ -114,6 +141,49 @@ class TestBundledPluginsRegister:
         assert provider is not None, f"plugin {plugin_name!r} not registered"
         assert provider.supports_search() is expected_search
         assert provider.supports_extract() is expected_extract
+
+    @pytest.mark.parametrize(
+        "name,lane,authenticated,required_env",
+        [
+            ("cloakbrowser-acubens", "stealth", False, "CLOAKBROWSER_ACUBENS_CDP_URL"),
+            ("earthglass", "authenticated", True, "EARTHGLASS_CDP_URL"),
+        ],
+    )
+    def test_rendered_lanes_are_explicit_and_declare_requirements(self, name, lane, authenticated, required_env):
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        provider = get_provider(name)
+        assert provider is not None
+        assert provider.auto_detect is False
+        assert provider.lane == lane
+        assert provider.authenticated is authenticated
+        assert required_env in provider.env_names
+        assert required_env in {v["key"] for v in provider.get_setup_schema()["env_vars"]}
+
+    def test_public_and_rendered_extract_tools_are_discovered(self):
+        from tools.registry import discover_builtin_tools, registry
+        from tools.web_tools import check_web_api_key, _web_requires_env
+
+        discover_builtin_tools()
+        for name in ("web_extract", "stealth_web_extract", "authenticated_web_extract"):
+            entry = registry.get_entry(name)
+            assert entry is not None
+            assert entry.toolset == "web"
+            assert entry.schema["name"] == name
+            assert entry.schema["parameters"]["required"] == ["urls"]
+            assert entry.is_async is True
+            assert callable(entry.handler)
+            if name == "web_extract":
+                assert entry.check_fn is check_web_api_key
+                assert entry.requires_env == _web_requires_env()
+            else:
+                # Rendered tools declare the lane; provider setup owns endpoint
+                # requirements. Registration must not probe/start a browser.
+                assert entry.requires_env == []
+                assert entry.check_fn() is True
+        names = registry.get_tool_names_for_toolset("web")
+        assert len(names) == len(set(names))
 
     @pytest.mark.parametrize(
         "plugin_name",

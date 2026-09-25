@@ -43,6 +43,10 @@ class TestGetToolset:
 
     def test_merges_registry_tools_into_builtin_toolset(self, monkeypatch):
         reg = ToolRegistry()
+        monkeypatch.setattr("tools.registry.registry", reg)
+        before = get_toolset("web")
+        # Warm resolution, then extend it, including a duplicate built-in.
+        original_tools = set(resolve_toolset("web"))
         reg.register(
             name="web_search_plus",
             toolset="web",
@@ -50,18 +54,31 @@ class TestGetToolset:
             handler=_dummy_handler,
         )
 
-        monkeypatch.setattr("tools.registry.registry", reg)
+        for name in ("web_search", "web_search_plus"):
+            reg.register(
+                name=name, toolset="web", schema=_make_schema(name),
+                handler=_dummy_handler,
+            )
 
         ts = get_toolset("web")
         assert ts is not None
-        assert set(ts["tools"]) == {"web_search", "web_extract", "web_search_plus"}
+        expected = original_tools | {"web_search_plus"}
+        assert set(ts["tools"]) == expected
+        assert len(ts["tools"]) == len(expected)
+        assert set(resolve_toolset("web")) == expected
+        assert get_toolset_info("web")["tool_count"] == len(expected)
+        assert set(get_toolset_info("web")["resolved_tools"]) == expected
+        assert ts["description"] == before["description"]
+        assert ts["includes"] == before["includes"]
+        assert len(reg.get_tool_names_for_toolset("web")) == 2
 
 
 
 class TestResolveToolset:
     def test_leaf_toolset(self):
         tools = resolve_toolset("web")
-        assert set(tools) == {"web_search", "web_extract"}
+        assert {"web_search", "web_extract", "stealth_web_extract", "authenticated_web_extract"} <= set(tools)
+        assert tools == sorted(set(get_toolset("web")["tools"]))
 
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
@@ -147,7 +164,11 @@ class TestGetToolsetInfo:
         info = get_toolset_info("web")
         assert info["name"] == "web"
         assert info["is_composite"] is False
-        assert info["tool_count"] == 2
+        assert info["description"] == get_toolset("web")["description"]
+        assert info["includes"] == []
+        assert info["resolved_tools"] == resolve_toolset("web")
+        assert set(info["direct_tools"]) == set(info["resolved_tools"])
+        assert info["tool_count"] == len(set(info["resolved_tools"]))
 
     def test_composite(self):
         info = get_toolset_info("debugging")
