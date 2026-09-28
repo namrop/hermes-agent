@@ -1901,6 +1901,70 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
 
+    def test_pinned_provider_uses_delegation_fallback_providers(self):
+        """A pinned child uses delegation.fallback_providers, its own
+        operator-chosen chain, and still never the parent's chain."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
+        ]
+        cfg = {
+            "provider": "zai",
+            "model": "glm-5.3",
+            "fallback_providers": [
+                {"provider": "openai-codex", "model": "gpt-6-luna"},
+                {"provider": "incomplete-entry"},
+            ],
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+                patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test pinned provider with its own fallback",
+                context=None,
+                toolsets=None,
+                model="glm-5.3",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="zai",
+                override_base_url="https://api.z.ai/api/coding/paas/v4/",
+                override_api_key="sk-zai-x",
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(
+            kwargs["fallback_model"],
+            [{"provider": "openai-codex", "model": "gpt-6-luna"}],
+        )
+
+    def test_unpinned_child_ignores_delegation_fallback_providers(self):
+        """Without a pin the child inherits the parent chain unchanged;
+        delegation.fallback_providers applies only to pinned children."""
+        parent = _make_mock_parent(depth=0)
+        parent_chain = [{"provider": "openrouter", "model": "gpt-4o-mini"}]
+        parent._fallback_chain = parent_chain
+        cfg = {"fallback_providers": [{"provider": "openai-codex", "model": "gpt-6-luna"}]}
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+                patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test unpinned",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], parent_chain)
+
     def test_pinned_acp_command_missing_raises(self):
         """A pinned delegation command absent from PATH must refuse the spawn
         loudly instead of silently falling back to the default transport
