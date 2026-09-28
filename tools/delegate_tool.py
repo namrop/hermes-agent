@@ -1858,8 +1858,14 @@ def _build_child_agent(
     # same class of silent-drag the override_provider filter-clearing below
     # already prevents for OpenRouter routing preferences.  Predictability >
     # liveness for explicit pins: the pinned child fails loudly instead.
+    #
+    # A pin may still name its OWN recovery path: delegation.fallback_providers
+    # (same shape as the top-level fallback_providers list).  That chain is
+    # chosen by the operator for the pin, so using it is not the silent
+    # reroute #80450 forbids.  Without it, a pinned child keeps no fallback.
+    pinned_fallback = _delegation_fallback_chain(delegation_cfg)
     parent_fallback = (
-        None
+        pinned_fallback
         if override_provider
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )
@@ -4612,6 +4618,28 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
+
+
+def _delegation_fallback_chain(delegation_cfg: dict) -> Optional[list]:
+    """Return the pinned-child fallback chain from ``delegation.fallback_providers``.
+
+    Accepts the same shape as the top-level ``fallback_providers`` list (a
+    single mapping is tolerated).  Entries without both ``provider`` and
+    ``model`` are dropped, matching ``AIAgent``'s own chain filter.  Returns
+    ``None`` when nothing usable is configured, so an unconfigured pin keeps
+    the #80450 behaviour of failing loudly.
+    """
+    raw = (delegation_cfg or {}).get("fallback_providers")
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return None
+    chain = [
+        dict(entry)
+        for entry in raw
+        if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
+    ]
+    return chain or None
 
 
 def _load_config() -> dict:
