@@ -4515,17 +4515,70 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         }
 
     # Provider is configured — resolve full credentials
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
+    try:
         runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
     except Exception as exc:
-        raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
-            f"Check that the provider is configured (API key set, valid provider name), "
-            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
-            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
-        ) from exc
+        # Same resolve-time gap as agent init: a benched/exhausted credential
+        # pool or a transient DNS blip raises here, before any child agent
+        # exists, so no downstream fallback machinery can see it and the whole
+        # delegation dies even when healthy rungs sit in ``fallback_providers``.
+        # (Observed 2026-09-18: the parent's own delegate_task failed with
+        # "Codex provider quota exhausted (429)" while zai and meridian were
+        # clear.) A misconfigured provider NAME still raises — walking would
+        # hide the typo.
+        from hermes_cli.fallback_config import (
+            classify_provider_resolve_error,
+            get_fallback_chain,
+            resolve_entry_api_key,
+        )
+
+        runtime = None
+        _reason = classify_provider_resolve_error(exc)
+        if _reason is not None:
+            _failed_provider = str(configured_provider or "").strip().lower()
+            for _entry in get_fallback_chain(_load_config()):
+                if not isinstance(_entry, dict):
+                    continue
+                _fb_provider = str(_entry.get("provider") or "").strip()
+                _fb_model = str(_entry.get("model") or "").strip()
+                if not _fb_provider or not _fb_model:
+                    continue
+                if _fb_provider.lower() == _failed_provider:
+                    continue
+                try:
+                    _fb_kwargs = {
+                        "requested": _fb_provider,
+                        "target_model": _fb_model,
+                    }
+                    if _entry.get("base_url"):
+                        _fb_kwargs["explicit_base_url"] = _entry["base_url"]
+                    _fb_key = resolve_entry_api_key(_entry)
+                    if _fb_key:
+                        _fb_kwargs["explicit_api_key"] = _fb_key
+                    runtime = resolve_runtime_provider(**_fb_kwargs)
+                except Exception:
+                    continue
+                # Provider and model move together — never run a fallback
+                # provider against the primary's model.
+                configured_provider = _fb_provider
+                configured_model = _fb_model
+                logger.warning(
+                    "Delegation provider resolve failed (%s: %s) — fell back to %s model %s",
+                    _reason,
+                    exc,
+                    _fb_provider,
+                    _fb_model,
+                )
+                break
+        if runtime is None:
+            raise ValueError(
+                f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+                f"Check that the provider is configured (API key set, valid provider name), "
+                f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
+                f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
+            ) from exc
 
     api_key = runtime.get("api_key", "")
     if not api_key:
