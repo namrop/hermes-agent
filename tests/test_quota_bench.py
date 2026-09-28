@@ -147,6 +147,91 @@ def test_ledger_provider_names_map_to_pool_names():
     assert qb.LEDGER_TO_POOL["openai"] == "openai-codex"
     assert qb.POOL_TO_LEDGER["zai"] == "z-ai"
 
+def test_claude_accounts_are_independent_and_native_anthropic_is_not_a_subscription():
+    r = run(
+        ["custom:meridian-primary", "custom:meridian-yugen", "anthropic", "openai-codex"],
+        {"custom:meridian-primary": obs("anthropic", used=99, limit=100, quota_name="seven_day"),
+         "custom:meridian-yugen": obs("anthropic", used=34, limit=100, quota_name="seven_day"),
+         "openai": obs("openai", used=1, limit=100)},
+    )
+    assert benched_names(r) == {"custom:meridian-primary"}
+    assert r["fail_open"] is False
+    assert next(a for a in r["assessments"] if a["pool_provider"] == "anthropic")["pct"] is None
+
+    native = run(["anthropic", "openai-codex"],
+                 {"anthropic": obs("anthropic", used=99, limit=100),
+                  "openai": obs("openai", used=1, limit=100)})
+    assert benched_names(native) == set()
+
+def test_latest_claude_weekly_is_keyed_by_account_and_validated_source(tmp_path):
+    primary = {**obs("anthropic", used=99, limit=100, quota_name="seven_day"),
+               "account_ref": None, "source_namespace": "sol:claude-code-quota"}
+    secondary = {**obs("anthropic", used=34, limit=100, quota_name="seven_day"),
+                 "account_ref": "claude-code-secondary", "source_namespace": "sol:claude-code-secondary-quota"}
+    unrelated = {**primary, "used_value": "100", "source_namespace": "unrelated:claude-code-quota"}
+    assert qb._claude_pool(unrelated) is None
+    rows = qb.latest_weekly_observations(_ledger(tmp_path, [unrelated, primary, secondary]))
+    assert rows["custom:meridian-primary"]["used_value"] == "99"
+    assert rows["custom:meridian-yugen"]["used_value"] == "34"
+    assert "anthropic" not in rows
+
+def test_claude_scoped_cap_is_not_an_account_wide_bench(tmp_path):
+    general = {**obs("anthropic", used=34, limit=100, quota_name="seven_day"),
+               "account_ref": "claude-code-secondary", "source_namespace": "sol:claude-code-secondary-quota",
+               "resets_at": iso(NOW + 3600)}
+    fable = {**general, "quota_name": "seven_day_fable", "used_value": "98"}
+    ledger = _ledger(tmp_path, [general, fable])
+    weekly = qb.latest_weekly_observations(ledger)
+    assert weekly["custom:meridian-yugen"]["used_value"] == "34"
+    r = run(["custom:meridian-yugen", "openai-codex"], weekly)
+    assert benched_names(r) == set()
+    scoped = qb.latest_claude_model_observations(ledger)
+    rows = qb.evaluate_model_benches(scoped, chain=r["chain"], threshold_pct=90,
+                                     max_age_seconds=5400, now=NOW)
+    assert rows == [{"pool_provider": "custom:meridian-yugen", "family": "fable",
+                     "until": pytest.approx(NOW + 3600)}]
+
+def test_scoped_cap_below_threshold_clears_only_its_own_account(tmp_path):
+    rows = []
+    for account_ref, suffix, used in ((None, "claude-code-quota", 98),
+                                      ("claude-code-secondary", "claude-code-secondary-quota", 5)):
+        rows.append({**obs("anthropic", used=used, limit=100, quota_name="seven_day_fable",
+                           resets_at=iso(NOW + 3600)), "account_ref": account_ref,
+                     "source_namespace": f"sol:{suffix}"})
+    scoped = qb.latest_claude_model_observations(_ledger(tmp_path, rows))
+    decisions = qb.evaluate_model_benches(
+        scoped, chain=["custom:meridian-primary", "custom:meridian-yugen"],
+        threshold_pct=90, max_age_seconds=5400, now=NOW)
+    assert [(r["pool_provider"], r["family"]) for r in decisions] == [
+        ("custom:meridian-primary", "fable")]
+
+
+def test_scoped_bench_reconciles_recovery_and_collector_gaps():
+    previous = [{"pool_provider": "custom:meridian-yugen", "family": "fable", "until": NOW + 3600}]
+    below = {**obs("anthropic", used=8, limit=100, quota_name="seven_day_fable"),
+             "measurement_confidence": "exact"}
+    key = ("custom:meridian-yugen", "fable")
+    kw = {"chain": ["custom:meridian-yugen"], "max_age_seconds": 5400,
+          "now": NOW, "fail_open": False}
+    assert qb.reconcile_model_benches(previous, [], {key: below}, **kw) == []
+    assert qb.reconcile_model_benches(previous, [], {}, **kw) == previous
+    assert qb.reconcile_model_benches(previous, [], {}, **{**kw, "now": NOW + 3601}) == []
+    assert qb.reconcile_model_benches(previous, [], {}, **{**kw, "fail_open": True}) == []
+    assert qb.reconcile_model_benches([{"pool_provider": [], "family": "fable", "until": NOW + 2}],
+                                      [], {}, **kw) == []
+
+
+def test_model_bench_reader_fails_open_when_expired_or_invalid(tmp_path):
+    from agent.model_quota_bench import model_quota_benched_until
+    import json
+    path = tmp_path / "quota_model_benches.json"
+    path.write_text("invalid-json")
+    assert model_quota_benched_until("custom:meridian-yugen", "claude-fable-5-5", home=tmp_path) is None
+    path.write_text(json.dumps({"version": 1, "benches": [
+        {"pool_provider": "custom:meridian-yugen", "family": "fable", "until": time.time() - 10}]}))
+    assert model_quota_benched_until("custom:meridian-yugen", "claude-fable-5-5", home=tmp_path) is None
+    assert model_quota_benched_until("anthropic", "claude-fable-5-5", home=tmp_path) is None
+
 
 # ── per-provider thresholds (keeper ruling 2026-08-31) ──────────────────────
 # opencode-go is estimated over a rolling window; benching it at 90% would be
@@ -436,10 +521,12 @@ def _ledger(tmp_path, rows):
     path = tmp_path / "quota_observations.sqlite3"
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE facts (canonical_json TEXT, provider TEXT, "
-                 "quota_name TEXT, occurred_or_observed_at TEXT)")
+                 "quota_name TEXT, occurred_or_observed_at TEXT, "
+                 "account_ref TEXT, source_namespace TEXT)")
     for rec in rows:
-        conn.execute("INSERT INTO facts VALUES (?, ?, ?, ?)",
-                     (json.dumps(rec), rec["provider"], rec["quota_name"], rec["observed_at"]))
+        conn.execute("INSERT INTO facts VALUES (?, ?, ?, ?, ?, ?)",
+                     (json.dumps(rec), rec["provider"], rec["quota_name"], rec["observed_at"],
+                      rec.get("account_ref"), rec.get("source_namespace", "test:quota")))
     conn.commit()
     conn.close()
     return path
@@ -503,6 +590,82 @@ def test_main_json_includes_unbench_rows(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["dry_run"] is True
     assert [r["action"] for r in payload["unbench"]] == ["unbench"]
+
+def test_model_bench_dry_run_and_apply_do_not_exhaust_whole_pool(tmp_path, monkeypatch, capsys):
+    home = _hermes_home(tmp_path, monkeypatch, {
+        "custom:meridian-primary": [_manual("custom:meridian-primary")],
+        "custom:meridian-yugen": [_manual("custom:meridian-yugen")],
+    })
+    (home / "config.yaml").write_text(
+        "model:\n  provider: custom:meridian-primary\n"
+        "fallback_providers:\n  - provider: custom:meridian-yugen\n    model: claude-opus-5-5\n")
+    now = time.time()
+    base = {**_live_obs("anthropic", used=30, resets_at=now + 3600),
+            "quota_name": "seven_day", "source_namespace": "sol:claude-code-secondary-quota",
+            "account_ref": "claude-code-secondary"}
+    primary = {**base, "source_namespace": "sol:claude-code-quota", "account_ref": None}
+    fable = {**base, "quota_name": "seven_day_fable", "used_value": "98"}
+    ledger = _ledger(tmp_path, [primary, base, fable])
+    auth_before = (home / "auth.json").read_bytes()
+    sidecar = home / "quota_model_benches.json"
+
+    assert qb.main(["--hermes-home", str(home), "--ledger", str(ledger), "--json"]) == 0
+    assert not sidecar.exists()
+    assert (home / "auth.json").read_bytes() == auth_before
+    capsys.readouterr()
+    assert qb.main(["--hermes-home", str(home), "--ledger", str(ledger), "--apply", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["applied"] == 0
+    assert json.loads(sidecar.read_text())["benches"] == [
+        {"pool_provider": "custom:meridian-yugen", "family": "fable",
+         "until": pytest.approx(int(now + 3600), abs=2)}]
+    assert (home / "auth.json").read_bytes() == auth_before
+
+
+def test_json_apply_reports_account_bench_and_isolates_claude_accounts(tmp_path, monkeypatch, capsys):
+    home = _hermes_home(tmp_path, monkeypatch, {
+        "custom:meridian-primary": [_manual("custom:meridian-primary")],
+        "custom:meridian-yugen": [_manual("custom:meridian-yugen")],
+    })
+    (home / "config.yaml").write_text(
+        "model:\n  provider: custom:meridian-primary\n"
+        "fallback_providers:\n  - provider: custom:meridian-yugen\n    model: claude-opus-5-5\n")
+    now = time.time()
+    records = []
+    for account, source, used in ((None, "claude-code-quota", 99),
+                                  ("claude-code-secondary", "claude-code-secondary-quota", 34)):
+        records.append({**_live_obs("anthropic", used=used, resets_at=now + 3600),
+                        "quota_name": "seven_day", "source_namespace": f"sol:{source}",
+                        "account_ref": account})
+    ledger = _ledger(tmp_path, records)
+    assert qb.main(["--hermes-home", str(home), "--ledger", str(ledger), "--apply", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["applied"] == 1
+    pool = json.loads((home / "auth.json").read_text())["credential_pool"]
+    assert pool["custom:meridian-primary"][0]["last_status"] == "exhausted"
+    assert pool["custom:meridian-yugen"][0].get("last_status") != "exhausted"
+
+
+def test_only_assessable_routes_spent_by_account_and_model_caps_fail_open(tmp_path, monkeypatch, capsys):
+    home = _hermes_home(tmp_path, monkeypatch, {})
+    (home / "config.yaml").write_text(
+        "model:\n  provider: custom:meridian-yugen\n  model: claude-fable-5-5\n"
+        "fallback_providers:\n  - provider: openai-codex\n    model: gpt-6-sol\n")
+    now = time.time()
+    ledger = _ledger(tmp_path, [
+        {**_live_obs("anthropic", used=25, resets_at=now + 3600),
+         "quota_name": "seven_day", "source_namespace": "sol:claude-code-secondary-quota",
+         "account_ref": "claude-code-secondary"},
+        {**_live_obs("anthropic", used=100, resets_at=now + 3600),
+         "quota_name": "seven_day_fable", "source_namespace": "sol:claude-code-secondary-quota",
+         "account_ref": "claude-code-secondary"},
+        {**_live_obs("codex", used=99, resets_at=now + 3600), "quota_name": "weekly"},
+    ])
+    assert qb.main(["--hermes-home", str(home), "--ledger", str(ledger), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["fail_open"] is True
+    assert payload["benched"] == []
+    assert payload["model_benches"] == []
 
 
 # --- Keeper amendment 2026-09-16: fail open releases the reserve -------------

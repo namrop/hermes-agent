@@ -2721,6 +2721,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # Deliberately NOT added to ``_unavailable_fallback_keys`` — that set is
     # session-permanent and benches expire, often within the same session.
     _fb_pool, _fb_pool_key = _fallback_pool_for_entry(fb)
+    from agent.model_quota_bench import model_quota_benched_until
+    _model_benched_until = model_quota_benched_until(
+        _fb_pool_key or fb_provider, fb_model, base_url=str(fb.get("base_url") or ""))
+    if _model_benched_until is not None:
+        logger.info("Fallback skip: %s/%s has a model-scoped bench until %s",
+                    fb_provider, fb_model, _model_benched_until)
+        return agent._try_activate_fallback(reason)
     _benched_until = _pool_quota_benched_until(_fb_pool)
     if _benched_until is not None:
         logger.debug(

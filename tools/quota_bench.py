@@ -5,6 +5,10 @@ Phase A of docs/NEXT.md item 3. Reads the codex-usage-tracker
 ``quota_observation_v1`` ledger, decides which providers in the *resolved
 routing chain* are over the utilization threshold, and (with ``--apply``)
 benches them in the Hermes credential pool until their quota window resets.
+Claude Code subscriptions through Meridian are keyed by account and source,
+never folded into the native Anthropic API-key pool. A model-family-only cap
+uses an atomic, expiry-aware quota_model_benches.json routing hint instead of
+marking the entire account's credentials exhausted.
 
 Defaults to a DRY RUN: it prints what it would bench and writes nothing.
 
@@ -52,6 +56,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -73,9 +78,23 @@ LEDGER_TO_POOL = {
     "kimi-coding": "kimi-coding",
     "deepseek": "deepseek",
     "openrouter": "openrouter",
-    "anthropic": "anthropic",
 }
 POOL_TO_LEDGER = {v: k for k, v in LEDGER_TO_POOL.items()}
+
+# Claude Code's OAuth subscription readings are NOT the native Anthropic API
+# key quota. Keep the two accounts' pool keys and quota series distinct.
+CLAUDE_ACCOUNT_POOLS = {
+    (None, "claude-code-quota"): "custom:meridian-primary",
+    ("claude-code-secondary", "claude-code-secondary-quota"): "custom:meridian-yugen",
+}
+
+def _claude_pool(rec: Dict[str, Any]) -> Optional[str]:
+    namespace = rec.get("source_namespace")
+    if rec.get("provider") != "anthropic" or not isinstance(namespace, str):
+        return None
+    if not namespace.startswith("sol:"):
+        return None
+    return CLAUDE_ACCOUNT_POOLS.get((rec.get("account_ref"), namespace.removeprefix("sol:")))
 
 # Per-provider threshold overrides (utilization %% at which to bench). Anything
 # absent here uses the global ``--threshold``.
@@ -191,19 +210,46 @@ def resolve_chain(hermes_home: Path) -> List[str]:
     return [p for p in chain if not (p in seen or seen.add(p))]
 
 
+def resolve_model_routes(hermes_home: Path) -> List[tuple[str, str]]:
+    """Preserve duplicate account routes when comparing model-specific caps."""
+    import yaml
+    cfg = yaml.safe_load((hermes_home / "config.yaml").read_text()) or {}
+    entries = [cfg.get("model")] + list(cfg.get("fallback_providers") or [])
+    return [(str(e.get("provider") or "").strip().lower(), str(e.get("model") or "").lower())
+            for e in entries if isinstance(e, dict) and e.get("provider")]
+
+
+def all_assessable_routes_benched(
+    assessments: List[Dict[str, Any]], model_rows: List[Dict[str, Any]],
+    routes: List[tuple[str, str]],
+) -> bool:
+    """Don't strand a model-only route when every observed route hit a cap."""
+    from agent.model_quota_bench import _model_family
+    account = {a["pool_provider"]: a for a in assessments if a["pct"] is not None}
+    scoped = {(r["pool_provider"], r["family"]) for r in model_rows}
+    assessable = [(provider, model) for provider, model in routes if provider in account]
+    return bool(assessable) and all(
+        account[provider]["over_threshold"] or (provider, _model_family(model)) in scoped
+        for provider, model in assessable
+    )
+
+
 def latest_weekly_observations(ledger: Path) -> Dict[str, Dict[str, Any]]:
-    """Latest weekly quota observation per ledger provider."""
+    """Latest weekly quota per pool; Claude Code is keyed by account and source."""
     uri = f"file:{ledger}?mode=ro"
     out: Dict[str, Dict[str, Any]] = {}
     with sqlite3.connect(uri, uri=True) as conn:
         placeholders = ",".join("?" * len(WEEKLY_QUOTA_NAMES))
         rows = conn.execute(
             f"""
-            SELECT canonical_json FROM facts f
-            WHERE quota_name IN ({placeholders})
-              AND occurred_or_observed_at = (
-                    SELECT MAX(occurred_or_observed_at) FROM facts g
-                    WHERE g.provider = f.provider AND g.quota_name = f.quota_name)
+            SELECT canonical_json FROM (
+                SELECT canonical_json,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY provider, quota_name, account_ref, source_namespace
+                           ORDER BY occurred_or_observed_at DESC
+                       ) AS newest
+                FROM facts WHERE quota_name IN ({placeholders})
+            ) WHERE newest = 1
             """,
             WEEKLY_QUOTA_NAMES,
         ).fetchall()
@@ -213,7 +259,7 @@ def latest_weekly_observations(ledger: Path) -> Dict[str, Dict[str, Any]]:
             rec = json.loads(payload)
         except Exception:
             continue
-        provider = rec.get("provider")
+        provider = _claude_pool(rec) if rec.get("provider") == "anthropic" else rec.get("provider")
         if not provider:
             continue
         # Prefer the earlier (more canonical) name when a provider reports both.
@@ -224,6 +270,80 @@ def latest_weekly_observations(ledger: Path) -> Dict[str, Dict[str, Any]]:
                 continue
         out[provider] = rec
     return out
+
+
+def latest_claude_model_observations(ledger: Path) -> Dict[tuple[str, str], Dict[str, Any]]:
+    """Read scoped weekly caps without collapsing accounts or model families."""
+    out: Dict[tuple[str, str], Dict[str, Any]] = {}
+    with sqlite3.connect(f"file:{ledger}?mode=ro", uri=True) as conn:
+        rows = conn.execute("""
+            SELECT canonical_json FROM (
+                SELECT canonical_json,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY provider, quota_name, account_ref, source_namespace
+                           ORDER BY occurred_or_observed_at DESC
+                       ) AS newest
+                FROM facts
+                WHERE provider = ? AND quota_name GLOB 'seven_day_*'
+            ) WHERE newest = 1
+        """, ("anthropic",)).fetchall()
+    for (payload,) in rows:
+        try:
+            rec = json.loads(payload)
+            pool = _claude_pool(rec)
+            name = rec.get("quota_name", "")
+            family = name.removeprefix("seven_day_")
+            if pool and re.fullmatch(r"[a-z][a-z0-9]*", family) and name != family:
+                out[(pool, family)] = rec
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def evaluate_model_benches(
+    observations: Dict[tuple[str, str], Dict[str, Any]], *, chain: List[str],
+    threshold_pct: float, max_age_seconds: float, now: float,
+) -> List[Dict[str, Any]]:
+    """Only model-specific, fresh, exact caps over threshold become routing hints."""
+    rows = []
+    for (pool, family), rec in sorted(observations.items()):
+        if pool not in chain or rec.get("measurement_confidence") != "exact":
+            continue
+        observed = _parse_iso(rec.get("observed_at"))
+        if observed is None or now - observed > max_age_seconds:
+            continue
+        used, limit = _num(rec.get("used_value")), _num(rec.get("limit_value"))
+        if used is None or limit is None or limit <= 0 or used / limit * 100 < threshold_pct:
+            continue
+        until = _parse_iso(rec.get("resets_at"))
+        if until is not None and until > now:
+            rows.append({"pool_provider": pool, "family": family, "until": until})
+    return rows
+
+
+def reconcile_model_benches(
+    previous: List[Dict[str, Any]], current: List[Dict[str, Any]],
+    observations: Dict[tuple[str, str], Dict[str, Any]], *, chain: List[str],
+    max_age_seconds: float, now: float, fail_open: bool,
+) -> List[Dict[str, Any]]:
+    """Keep no-signal benches until expiry; lift on fresh recovery or fail-open."""
+    if fail_open:
+        return []
+    desired = {(r["pool_provider"], r["family"]): r for r in current}
+    for row in previous:
+        if not isinstance(row, dict):
+            continue
+        key = (row.get("pool_provider"), row.get("family"))
+        if not isinstance(key[0], str) or not isinstance(key[1], str):
+            continue
+        until = _num(row.get("until"))
+        if key in desired or key[0] not in chain or until is None or until <= now:
+            continue
+        rec = observations.get(key)
+        observed = _parse_iso(rec.get("observed_at")) if rec else None
+        if observed is None or now - observed > max_age_seconds:
+            desired[key] = row
+    return [desired[key] for key in sorted(desired)]
 
 
 def evaluate(
@@ -243,7 +363,9 @@ def evaluate(
 
     for pool_provider in chain:
         ledger_provider = POOL_TO_LEDGER.get(pool_provider, pool_provider)
-        rec = observations.get(ledger_provider)
+        # A native Anthropic API-key pool must never inherit a Claude Code
+        # subscription bench, even when a caller supplies raw provider rows.
+        rec = None if pool_provider == "anthropic" else observations.get(ledger_provider)
         effective_threshold = thresholds.get(pool_provider, threshold_pct)
         row: Dict[str, Any] = {
             "pool_provider": pool_provider,
@@ -693,8 +815,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         provider_thresholds=provider_thresholds,
     )
 
-    # Benches this script wrote earlier, judged against the same fresh
-    # observations. Read-only here; the pool is only written under --apply.
+    # Model-family caps are separate from the credential-pool's account cap.
+    # Preserve a prior hint through a collector gap, but never past its cliff.
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.append(str(repo_root))
+    from agent.model_quota_bench import read_model_benches, write_model_benches
+
+    scoped = latest_claude_model_observations(args.ledger)
+    previous_models = read_model_benches(args.hermes_home)
+    scoped_candidates = evaluate_model_benches(
+        scoped, chain=chain, threshold_pct=args.threshold,
+        max_age_seconds=args.max_age_minutes * 60, now=now,
+    )
+    provisional_models = reconcile_model_benches(
+        previous_models, scoped_candidates, scoped, chain=chain,
+        max_age_seconds=args.max_age_minutes * 60, now=now, fail_open=False,
+    )
+    if all_assessable_routes_benched(
+        result["assessments"], provisional_models, resolve_model_routes(args.hermes_home)
+    ):
+        result["fail_open"] = True
+        result["benched"] = []
+    model_benches = [] if result["fail_open"] else provisional_models
+
+    # The fail-open decision includes model-scoped caps before pool unbenching.
     unbench_rows = evaluate_unbench(
         result["assessments"],
         read_pool_status(args.hermes_home),
@@ -703,17 +848,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         fail_open=result["fail_open"],
     )
     to_unbench = [r for r in unbench_rows if r["action"] == "unbench"]
+    model_changed = model_benches != previous_models
+    if args.apply and model_changed:
+        write_model_benches(args.hermes_home, model_benches)
 
     if args.json:
+        # Report persisted counts, not intentions; keep diagnostics off stdout.
+        import contextlib
+        import io
+        applied = lifted = 0
+        if args.apply:
+            diagnostics = io.StringIO()
+            with contextlib.redirect_stdout(diagnostics):
+                if to_unbench:
+                    lifted = apply_unbenches(to_unbench, hermes_home=args.hermes_home, verbose=False)
+                if result["benched"]:
+                    applied = apply_benches(result["benched"], hermes_home=args.hermes_home, verbose=False)
+            if diagnostics.getvalue():
+                print(diagnostics.getvalue(), file=sys.stderr, end="")
         print(json.dumps(
-            {**result, "unbench": unbench_rows, "applied": 0, "unbenched": 0,
+            {**result, "unbench": unbench_rows, "applied": applied, "unbenched": lifted,
+             "model_benches": model_benches, "model_updated": args.apply and model_changed,
              "dry_run": not args.apply},
             indent=2, default=str,
         ))
-        if args.apply and to_unbench:
-            apply_unbenches(to_unbench, hermes_home=args.hermes_home, verbose=False)
-        if args.apply and result["benched"]:
-            apply_benches(result["benched"], hermes_home=args.hermes_home, verbose=False)
         return 0
 
     mode = "APPLY" if args.apply else "DRY RUN — no writes"
@@ -728,6 +886,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("\nexisting benches (written by this script):")
         for row in unbench_rows:
             print(_fmt_unbench(row))
+    if model_changed:
+        label = "Updated" if args.apply else "Would update"
+        names = ", ".join(f"{r['pool_provider']}/{r['family']} until {_local(r['until'])}"
+                          for r in model_benches) or "clear scoped caps"
+        print(f"{label} model-scoped benches: {names}")
 
     # Un-bench first: a provider whose window reset must be back in the chain
     # before this run decides what to take out of it.
