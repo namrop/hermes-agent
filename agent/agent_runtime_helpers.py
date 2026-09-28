@@ -1520,6 +1520,19 @@ def _skip_benched_primary(agent) -> bool:
         if not primary_provider:
             return False
 
+        from agent.model_quota_bench import model_quota_benched_until
+        primary_rt = getattr(agent, "_primary_runtime", None) or {}
+        model_cliff = model_quota_benched_until(
+            primary_provider, primary_rt.get("model") or getattr(agent, "model", ""),
+            base_url=str(primary_rt.get("base_url") or getattr(agent, "base_url", "")))
+        if model_cliff is not None:
+            if agent._try_activate_fallback():
+                agent._vprint(
+                    f"{agent.log_prefix}⏭️  Primary {primary_provider}/{primary_rt.get('model')} "
+                    "has a model-scoped quota bench — starting on fallback.", force=True)
+                return True
+            return False
+
         from agent.credential_pool import load_pool
 
         pool = load_pool(primary_provider)
@@ -1549,6 +1562,51 @@ def _skip_benched_primary(agent) -> bool:
             return True
     except Exception as exc:  # never block a turn on this optimisation
         logging.debug("skip-benched-primary check failed: %s", exc)
+    return False
+
+
+def leave_benched_fallback(agent) -> bool:
+    """Move a cached session off a newly benched fallback at turn start.
+
+    If nothing later works, retain the serving client rather than stranding
+    the session. The bench is checked again next turn; no permanent skip set.
+    """
+    try:
+        from agent.chat_completion_helpers import (
+            _fallback_entry_key, _fallback_pool_for_entry, _pool_quota_benched_until,
+        )
+        from agent.model_quota_bench import model_quota_benched_until
+
+        fb = getattr(agent, "_active_fallback_entry", None)
+        if not isinstance(fb, dict):
+            return False
+        pool, key = _fallback_pool_for_entry(fb)
+        cliff = (_pool_quota_benched_until(pool) or
+                 model_quota_benched_until(key or fb.get("provider", ""),
+                                           fb.get("model", ""),
+                                           base_url=str(fb.get("base_url") or "")))
+        if cliff is None:
+            return False
+        chain = getattr(agent, "_fallback_chain", None) or []
+        pos = next((i for i, entry in enumerate(chain)
+                    if _fallback_entry_key(entry) == _fallback_entry_key(fb)), None)
+        if pos is None:
+            return False
+        saved_index = agent._fallback_index
+        saved_cooldown = getattr(agent, "_rate_limited_until", 0)
+        saved_deferred = getattr(agent, "_busy_deferred_fallbacks", [])
+        agent._fallback_index = pos + 1
+        agent._busy_deferred_fallbacks = []
+        if agent._try_activate_fallback():
+            logger.info("Left newly benched fallback %s/%s for %s/%s",
+                        fb.get("provider"), fb.get("model"), agent.provider, agent.model)
+            return True
+        agent._fallback_index = saved_index
+        agent._rate_limited_until = saved_cooldown
+        agent._busy_deferred_fallbacks = saved_deferred
+        agent._active_fallback_entry = fb
+    except Exception:
+        logger.debug("leave-benched-fallback check failed", exc_info=True)
     return False
 
 
@@ -1626,6 +1684,17 @@ def restore_primary_runtime(agent) -> bool:
         # fallback attempts for the session.  Fixes #20465.
         agent._fallback_index = 0
         _skip_benched_primary(agent)
+        return False
+
+    if leave_benched_fallback(agent):
+        return False
+    from agent.model_quota_bench import model_quota_benched_until
+    primary_rt = agent._primary_runtime or {}
+    if model_quota_benched_until(
+        str(primary_rt.get("provider") or ""), str(primary_rt.get("model") or ""),
+        base_url=str(primary_rt.get("base_url") or ""),
+    ) is not None:
+        leave_busy_fallback(agent)
         return False
 
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():

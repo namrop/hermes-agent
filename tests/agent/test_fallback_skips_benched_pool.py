@@ -178,6 +178,30 @@ def _make_agent(chain):
 
 
 class TestCandidateLoop:
+    def test_model_only_bench_skips_fable_leg_but_not_opus_on_same_account(
+        self, patch_pool, monkeypatch, tmp_path
+    ):
+        import json
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "quota_model_benches.json").write_text(json.dumps({"version": 1, "benches": [
+            {"pool_provider": "custom:meridian-yugen", "family": "fable", "until": time.time() + 3600}]}))
+        patch_pool({"custom:meridian-yugen": FakePool("custom:meridian-yugen", [
+            _entry("custom:meridian-yugen", 0, status=STATUS_OK, reset_at=None)])})
+        agent = _make_agent([
+            {"provider": "custom:meridian-yugen", "model": "claude-fable-5-5"},
+            {"provider": "custom:meridian-yugen", "model": "claude-opus-5-5"},
+        ])
+        reached = []
+
+        def _capture(provider, model=None, **kwargs):
+            reached.append((provider, model))
+            raise RuntimeError("stop after bench checks")
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", _capture)
+        cch.try_activate_fallback(agent, None)
+        assert reached == [("custom:meridian-yugen", "claude-opus-5-5")]
+        assert agent._unavailable_fallback_keys == set()
+
     def test_benched_entry_is_skipped_and_the_chain_walks_past_it(
         self, patch_pool, monkeypatch
     ):
@@ -216,6 +240,50 @@ class TestCandidateLoop:
         agent = _make_agent([{"provider": "kimi-coding", "model": "k3"}])
         assert cch.try_activate_fallback(agent, None) is False  # chain exhausted
         assert agent._unavailable_fallback_keys == set()
+
+
+def test_active_fallback_newly_benched_moves_to_the_next_route(tmp_path, monkeypatch):
+    from agent import agent_runtime_helpers as arh
+    import json
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "quota_model_benches.json").write_text(json.dumps({"version": 1, "benches": [
+        {"pool_provider": "custom:meridian-yugen", "family": "fable", "until": time.time() + 3600}]}))
+    agent = _make_agent([
+        {"provider": "custom:meridian-yugen", "model": "claude-fable-5-5"},
+        {"provider": "openai-codex", "model": "gpt-6-sol"},
+    ])
+    agent._fallback_activated = True
+    agent._fallback_index = 1
+    agent._active_fallback_entry = agent._fallback_chain[0]
+    agent.provider = "custom:meridian-yugen"
+    agent.model = "claude-fable-5-5"
+    visited = []
+    agent._try_activate_fallback = lambda: visited.append(agent._fallback_index) or True
+    assert arh.leave_benched_fallback(agent) is True
+    assert visited == [1]
+    assert agent._unavailable_fallback_keys == set()
+
+
+def test_restore_turn_moves_off_a_newly_benched_fallback(tmp_path, monkeypatch):
+    from agent import agent_runtime_helpers as arh
+    import json
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "quota_model_benches.json").write_text(json.dumps({"version": 1, "benches": [
+        {"pool_provider": "custom:meridian-yugen", "family": "fable", "until": time.time() + 3600}]}))
+    agent = _make_agent([
+        {"provider": "custom:meridian-yugen", "model": "claude-fable-5-5"},
+        {"provider": "openai-codex", "model": "gpt-6-sol"},
+    ])
+    agent._fallback_activated = True
+    agent._active_fallback_entry = agent._fallback_chain[0]
+    agent._fallback_index = 1
+    agent.provider = "custom:meridian-yugen"
+    agent.model = "claude-fable-5-5"
+    agent._rate_limited_until = time.monotonic() + 3600
+    reached = []
+    agent._try_activate_fallback = lambda: reached.append(agent._fallback_index) or True
+    assert arh.restore_primary_runtime(agent) is False
+    assert reached == [1]
 
 
 # ── 3. A reactive mark preserves the bench's cliff ───────────────────────────

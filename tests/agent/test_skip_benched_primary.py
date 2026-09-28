@@ -121,3 +121,16 @@ def test_fails_open_when_the_pool_raises(monkeypatch):
     agent = make_agent()
     assert arh._skip_benched_primary(agent) is False
     assert agent.activated_calls == 0
+
+def test_model_only_bench_skips_fable_primary_but_not_opus(tmp_path, monkeypatch, patch_pool):
+    import json
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "quota_model_benches.json").write_text(json.dumps({"version": 1, "benches": [
+        {"pool_provider": "custom:meridian-yugen", "family": "fable", "until": time.time() + 3600}]}))
+    patch_pool(FakePool(available=True, next_at=None))
+    agent = make_agent(provider="custom:meridian-yugen")
+    agent._primary_runtime["model"] = "claude-fable-5-5"
+    assert arh._skip_benched_primary(agent) is True
+    agent._fallback_activated = False
+    agent._primary_runtime["model"] = "claude-opus-5-5"
+    assert arh._skip_benched_primary(agent) is False
