@@ -9,6 +9,7 @@ Covers: local image file sending, file-not-found handling, fallback on error,
 import asyncio
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -123,10 +124,12 @@ class TestDiscordSendImageFile:
         pdf = tmp_path / "sample.pdf"
         pdf.write_bytes(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
 
-        mock_channel = MagicMock()
-        mock_msg = MagicMock()
-        mock_msg.id = 100
-        mock_channel.send = AsyncMock(return_value=mock_msg)
+        mock_msg = SimpleNamespace(id=100, attachments=[SimpleNamespace(filename="renamed.pdf")])
+        mock_channel = SimpleNamespace(
+            type=SimpleNamespace(value=0),
+            guild=SimpleNamespace(filesize_limit=8 * 1024 * 1024),
+            send=AsyncMock(return_value=mock_msg),
+        )
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
         with patch.object(discord_mod_ref, "File", MagicMock()) as file_cls:
@@ -145,18 +148,21 @@ class TestDiscordSendImageFile:
         # image-batch path; the singular file= handle form could race the
         # multipart encoder and silently drop the attachment).
         sent_files = mock_channel.send.call_args.kwargs.get("files")
-        assert sent_files and len(sent_files) == 1
-        assert file_cls.call_args.kwargs["filename"] == "renamed.pdf"
+        assert sent_files == [file_cls.return_value]
+        mock_channel.send.assert_awaited_once_with(content=None, files=sent_files)
+        file_cls.assert_called_once_with(str(pdf), filename="renamed.pdf")
 
     def test_send_video_uploads_file_attachment(self, adapter, tmp_path):
         """send_video should upload a native Discord attachment."""
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 50)
 
-        mock_channel = MagicMock()
-        mock_msg = MagicMock()
-        mock_msg.id = 101
-        mock_channel.send = AsyncMock(return_value=mock_msg)
+        mock_msg = SimpleNamespace(id=101, attachments=[SimpleNamespace(filename="clip.mp4")])
+        mock_channel = SimpleNamespace(
+            type=SimpleNamespace(value=0),
+            guild=SimpleNamespace(filesize_limit=8 * 1024 * 1024),
+            send=AsyncMock(return_value=mock_msg),
+        )
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
         with patch.object(discord_mod_ref, "File", MagicMock()) as file_cls:
@@ -172,8 +178,9 @@ class TestDiscordSendImageFile:
         assert result.message_id == "101"
         # #66797: path-based File sent via plural files=[...] (see above).
         sent_files = mock_channel.send.call_args.kwargs.get("files")
-        assert sent_files and len(sent_files) == 1
-        assert file_cls.call_args.kwargs["filename"] == "clip.mp4"
+        assert sent_files == [file_cls.return_value]
+        mock_channel.send.assert_awaited_once_with(content=None, files=sent_files)
+        file_cls.assert_called_once_with(str(video), filename="clip.mp4")
 
 
 # ---------------------------------------------------------------------------

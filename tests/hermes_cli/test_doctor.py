@@ -247,6 +247,8 @@ class TestHonchoDoctorConfigDetection:
 
 
 def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+    # This fixture describes a host install, regardless of the test runner.
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
     monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
     monkeypatch.setenv("TERMINAL_CONTAINER_DISK", "2048")

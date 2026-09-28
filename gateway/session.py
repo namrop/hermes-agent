@@ -1291,6 +1291,36 @@ class AsyncSessionStore:
     def __init__(self, store: "SessionStore") -> None:
         self._store = store
 
+    async def run_model_override_reset_cleanup_if_current(
+        self,
+        session_key: str,
+        expected_session_id: Optional[str],
+        cleanup: Callable[[], None],
+    ) -> None:
+        """Finalize on the loop, without waiting synchronously for store I/O.
+
+        The callback owns gateway volatile state and must never run in the
+        generic worker wrapper. Try the existing lock without blocking, yielding
+        cancellably under contention. Inside the lock there is no await, load
+        or durable write: ownership check and cleanup are one short transition.
+        """
+        store = self._store
+        while True:
+            if not store._lock.acquire(blocking=False):
+                await asyncio.sleep(0.01)
+                continue
+            try:
+                if store._loaded:
+                    store._run_model_override_reset_cleanup_locked(
+                        session_key, expected_session_id, cleanup
+                    )
+                    return
+            finally:
+                store._lock.release()
+            # Loading may take the lock and touch disk. Recheck ownership on
+            # the loop after the worker finishes; never send cleanup to it.
+            await asyncio.to_thread(store._ensure_loaded)
+
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
         if not callable(attr):
@@ -3218,26 +3248,37 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
-            if entry is None:
-                if expected_session_id is not None:
-                    raise SessionRouteChangedError(
-                        "The gateway route no longer belongs to the requested session."
-                    )
-                cleanup()
-                return
-            if (
-                expected_session_id is not None
-                and entry.session_id != expected_session_id
-            ):
+            self._run_model_override_reset_cleanup_locked(
+                session_key, expected_session_id, cleanup
+            )
+
+    def _run_model_override_reset_cleanup_locked(
+        self,
+        session_key: str,
+        expected_session_id: Optional[str],
+        cleanup: Callable[[], None],
+    ) -> None:
+        """Cached ownership check only; caller holds _lock and has loaded state."""
+        entry = self._entries.get(session_key)
+        if entry is None:
+            if expected_session_id is not None:
                 raise SessionRouteChangedError(
                     "The gateway route no longer belongs to the requested session."
                 )
-            if entry.model_override is not None:
-                raise SessionModelOverrideChangedError(
-                    "A newer explicit model selection superseded this reset."
-                )
             cleanup()
+            return
+        if (
+            expected_session_id is not None
+            and entry.session_id != expected_session_id
+        ):
+            raise SessionRouteChangedError(
+                "The gateway route no longer belongs to the requested session."
+            )
+        if entry.model_override is not None:
+            raise SessionModelOverrideChangedError(
+                "A newer explicit model selection superseded this reset."
+            )
+        cleanup()
 
     def get_durable_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Read one model override from durable routing stores, not memory.

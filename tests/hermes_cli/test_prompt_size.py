@@ -64,14 +64,15 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
 
 
 
-def test_skills_breakdown_shape_sorted_and_attributed(isolated_home):
+@pytest.mark.parametrize("platform", ["cli", "cron", "api_server"])
+def test_skills_breakdown_shape_sorted_and_attributed(isolated_home, platform):
     """Per-skill breakdown reports index-line + on-disk SKILL.md bytes.
 
     Seeded before the first build (skills prompt is cached per-process).
     """
     _seed_skill(isolated_home, "small-skill", "short desc")
     _seed_skill(isolated_home, "big-skill", "a much longer description " * 20)
-    data = compute_prompt_breakdown("cli")
+    data = compute_prompt_breakdown(platform)
     skills = data["skills_breakdown"]
     names = {s["name"] for s in skills}
     assert {"small-skill", "big-skill"} <= names

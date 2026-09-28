@@ -635,6 +635,28 @@ def _touch_project(store: Path, working_dir: str) -> None:
         logger.debug("Could not update project metadata %s: %s", meta_path, exc)
 
 
+def _is_registered_project(store: Path, directory: Path) -> bool:
+    """True when ``projects/<hash>.json`` registers exactly ``directory``.
+
+    Hash-addressed: one metadata read per candidate directory. The recorded
+    workdir must be absolute and normalize to the same directory, so a stale,
+    relative or mismatched entry never claims ownership.
+    """
+    try:
+        meta_path = _project_meta_path(store, _project_hash(str(directory)))
+        if not meta_path.is_file():
+            return False
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        workdir = meta.get("workdir") if isinstance(meta, dict) else None
+        return (
+            isinstance(workdir, str)
+            and Path(workdir).is_absolute()
+            and _normalize_path(workdir) == directory
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def _list_projects(store: Path) -> List[Dict]:
     """Return all registered projects under the store."""
     projects_dir = store / _PROJECTS_DIRNAME
@@ -847,6 +869,26 @@ class CheckpointManager:
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
 
+        ledger = _load_ledger(store, dir_hash)
+        if not ledger or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+            for entry in ledger.values()
+        ):
+            # Missing/corrupt provenance is not evidence of agent ownership.
+            # Fail before staging or taking a pre-rollback snapshot.
+            return {
+                "success": False,
+                "error": (
+                    "Selective rollback cannot be proven: the agent-write ledger "
+                    "is missing, empty, unreadable or invalid. Pre-ledger checkpoints do "
+                    "not provide selective protection. No files were changed. "
+                    "Use /rollback <target> --all (or --force) only if you intend "
+                    "a full restore that may overwrite your edits."
+                ),
+            }
+
         # Stage the current tree so the name-only diff sees new files too.
         _run_git(["add", "-A"], store, abs_dir,
                  timeout=_GIT_TIMEOUT * 2, index_file=index_file)
@@ -860,14 +902,6 @@ class CheckpointManager:
         if not ok:
             return {"success": False, "error": f"Could not compute changed files: {err}"}
 
-        ledger = _load_ledger(store, dir_hash)
-        if not ledger:
-            # No agent-write ledger yet (pre-existing store, or Hermes has
-            # not written any files here since the ledger was introduced).
-            # Signal callers to fall back to a full restore rather than
-            # skipping every file.
-            return {"success": True, "restore": [], "skipped": [],
-                    "ledger_empty": True}
         restore: List[str] = []
         skipped: List[str] = []
         for rel in names_out.splitlines():
@@ -1099,6 +1133,8 @@ class CheckpointManager:
         hand-edited after Hermes' last write — per the agent-write ledger —
         are left untouched, and only Hermes-authored changes are reverted.
         The result gains ``skipped_user_edits`` listing the preserved paths.
+        Missing or unreadable ownership evidence returns an error without
+        changing files; pre-ledger checkpoints require explicit ``safe=False``.
         """
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1129,22 +1165,17 @@ class CheckpointManager:
             plan = self.safe_restore_plan(abs_dir, commit_hash)
             if not plan.get("success"):
                 return {"success": False, "error": plan.get("error", "Safe-restore plan failed")}
-            if plan.get("ledger_empty"):
-                # No agent-write history to compare against — fall back to
-                # the classic full restore rather than restoring nothing.
-                restore_paths = None
-            else:
-                restore_paths = plan["restore"]
-                skipped_user_edits = plan["skipped"]
-                if not restore_paths:
-                    return {
-                        "success": True,
-                        "restored_to": commit_hash[:8],
-                        "reason": "nothing to restore (all changed files were user-edited)",
-                        "directory": abs_dir,
-                        "restored_files": [],
-                        "skipped_user_edits": skipped_user_edits,
-                    }
+            restore_paths = plan["restore"]
+            skipped_user_edits = plan["skipped"]
+            if not restore_paths:
+                return {
+                    "success": True,
+                    "restored_to": commit_hash[:8],
+                    "reason": "nothing to restore (all changed files were user-edited)",
+                    "directory": abs_dir,
+                    "restored_files": [],
+                    "skipped_user_edits": skipped_user_edits,
+                }
 
         # Take a pre-rollback snapshot so you can undo the undo.
         self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
@@ -1208,18 +1239,30 @@ class CheckpointManager:
         return result
 
     def get_working_dir_for_path(self, file_path: str) -> str:
-        """Resolve a file path to its working directory for checkpointing."""
+        """Resolve a file path to the working directory that owns it.
+
+        Walk up from the file's directory and stop at the NEAREST ancestor
+        that is either a registered checkpoint project or carries a project
+        marker. A checkpoint tracking an unmarked directory inside another
+        project keeps its own ledger (also after manager recreation), and a
+        nested project with its own marker is never captured by a registered
+        ancestor such as a terminal cwd. Registration is hash-addressed, so
+        each level is one metadata lookup, not a scan of every project.
+        """
         path = _normalize_path(file_path)
         if path.is_dir():
             candidate = path
         else:
             candidate = path.parent
 
+        store = _store_path(CHECKPOINT_BASE)
         markers = {".git", "pyproject.toml", "package.json", "Cargo.toml",
                     "go.mod", "Makefile", "pom.xml", ".hg", "Gemfile"}
         check = candidate
         while check != check.parent:
-            if any((check / m).exists() for m in markers):
+            if _is_registered_project(store, check) or any(
+                (check / m).exists() for m in markers
+            ):
                 return str(check)
             check = check.parent
 

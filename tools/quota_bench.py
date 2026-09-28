@@ -161,7 +161,7 @@ def load_hermes_env(hermes_home: Path) -> int:
     if not env_path.exists():
         return 0
     loaded = 0
-    for raw in env_path.read_text().splitlines():
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -188,9 +188,21 @@ def resolve_chain(hermes_home: Path) -> List[str]:
     set, not over every provider in the ledger — otherwise an unrelated spent
     provider (e.g. a drained openrouter balance) skews "are they all spent".
     """
-    import yaml  # deferred: only needed when actually resolving
+    # Keep the explicit --hermes-home scope even in a process whose active
+    # profile differs. ContextVar scoping does not mutate other tasks' env.
+    # Direct `python tools/quota_bench.py` only puts tools/ on sys.path.
+    # Match the existing pool-import fallback: an installed Hermes wins.
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.append(str(repo_root))
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_cli.config import load_config_readonly
 
-    cfg = yaml.safe_load((hermes_home / "config.yaml").read_text()) or {}
+    token = set_hermes_home_override(hermes_home)
+    try:
+        cfg = load_config_readonly()
+    finally:
+        reset_hermes_home_override(token)
     chain: List[str] = []
 
     model_cfg = cfg.get("model")
@@ -570,7 +582,7 @@ def read_pool_status(hermes_home: Path) -> Dict[str, List[Dict[str, Any]]]:
     """
     auth_path = hermes_home / "auth.json"
     try:
-        store = json.loads(auth_path.read_text())
+        store = json.loads(auth_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     pool = store.get("credential_pool") if isinstance(store, dict) else None

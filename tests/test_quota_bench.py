@@ -50,6 +50,106 @@ def benched_names(result):
     return {r["pool_provider"] for r in result["benched"]}
 
 
+def test_resolve_chain_effective_config_is_scoped_and_readonly(tmp_path, monkeypatch):
+    from hermes_constants import (
+        get_hermes_home, set_hermes_home_override, reset_hermes_home_override,
+    )
+    import os
+
+    first, second, managed = (tmp_path / name for name in ('first', 'second', 'managed'))
+    for home in (first, second, managed):
+        home.mkdir()
+    (first / 'config.yaml').write_text(
+        'model:\n  provider: ${QUOTA_TEST_PROVIDER}\nfallback_providers:\n'
+        '  - provider: café\n  - provider: ZAI\n  - provider: café\n', encoding='utf-8',
+    )
+    (second / 'config.yaml').write_text(
+        'model:\n  provider: anthropic\nfallback_providers:\n  - provider: deepseek\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('QUOTA_TEST_PROVIDER', 'ZAI')
+    original_configs = {home: (home / 'config.yaml').read_bytes() for home in (first, second)}
+    env_home = os.environ.get('HERMES_HOME')
+    token = set_hermes_home_override(second)
+    try:
+        assert qb.resolve_chain(first) == ['zai', 'café']
+        assert qb.resolve_chain(second) == ['anthropic', 'deepseek']
+        (managed / 'config.yaml').write_text('model:\n  provider: ${QUOTA_MANAGED_PROVIDER}\n', encoding='utf-8')
+        monkeypatch.setenv('QUOTA_MANAGED_PROVIDER', 'openai-codex')
+        monkeypatch.setenv('HERMES_MANAGED_DIR', str(managed))
+        assert qb.resolve_chain(first) == ['openai-codex', 'café', 'zai']
+        assert qb.resolve_chain(second) == ['openai-codex', 'deepseek']
+        assert get_hermes_home() == second
+        assert os.environ.get('HERMES_HOME') == env_home
+        # The canonical reader may seed the normal home directory skeleton;
+        # readonly describes consumption of its returned dict, not zero I/O.
+        for home, content in original_configs.items():
+            assert (home / 'config.yaml').read_bytes() == content
+            assert not (home / 'auth.json').exists()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_resolve_chain_restores_context_on_reader_error(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import config
+    original = get_hermes_home()
+
+    def fail():
+        assert get_hermes_home() == tmp_path
+        raise OSError('synthetic config failure')
+
+    monkeypatch.setattr(config, 'load_config_readonly', fail)
+    with pytest.raises(OSError, match='synthetic config failure'):
+        qb.resolve_chain(tmp_path)
+    assert get_hermes_home() == original
+
+
+def test_utf8_environment_and_auth_reads(tmp_path, monkeypatch):
+    import json
+    import os
+    monkeypatch.delenv('QUOTA_UTF8_FIXTURE', raising=False)
+    (tmp_path / '.env').write_text('QUOTA_UTF8_FIXTURE="café 東京"\n', encoding='utf-8')
+    (tmp_path / 'auth.json').write_text(json.dumps({
+        'credential_pool': {'synthetic': [{'id': 'fixture', 'label': 'café 東京'}]},
+    }, ensure_ascii=False), encoding='utf-8')
+    original = Path.read_text
+
+    def utf8_only(path, *args, **kwargs):
+        assert kwargs.get('encoding') == 'utf-8'
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', utf8_only)
+    assert qb.load_hermes_env(tmp_path) == 1
+    assert os.environ['QUOTA_UTF8_FIXTURE'] == 'café 東京'
+    assert qb.read_pool_status(tmp_path)['synthetic'][0]['label'] == 'café 東京'
+
+
+def test_main_explicit_home_dry_run_uses_synthetic_ledger(tmp_path, monkeypatch, capsys):
+    import json
+    import sqlite3
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+
+    requested = tmp_path / 'requested'
+    requested.mkdir()
+    (requested / 'config.yaml').write_text('model:\n  provider: ${QUOTA_CLI_PROVIDER}\n', encoding='utf-8')
+    monkeypatch.setenv('QUOTA_CLI_PROVIDER', 'café')
+    ledger = tmp_path / 'synthetic.sqlite3'
+    with sqlite3.connect(ledger) as conn:
+        conn.execute('CREATE TABLE facts (provider TEXT, quota_name TEXT, occurred_or_observed_at TEXT, canonical_json TEXT)')
+    token = set_hermes_home_override(tmp_path / 'other-home')
+    try:
+        assert qb.main(['--hermes-home', str(requested), '--ledger', str(ledger), '--json']) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result['chain'] == ['café']
+        assert result['dry_run'] is True
+        assert result['applied'] == result['unbenched'] == 0
+        assert not (requested / 'auth.json').exists()
+        assert get_hermes_home() == tmp_path / 'other-home'
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_under_threshold_is_not_benched():
     r = run(["zai", "openai-codex"],
             {"z-ai": obs("z-ai", used=88, limit=100),

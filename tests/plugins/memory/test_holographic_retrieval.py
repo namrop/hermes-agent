@@ -168,10 +168,11 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     """
     r = hoisted_retriever
     query = "deploy target setting"
-    new_results = r.search(query)
 
-    # --- pre-fix reference ---
+    # Snapshot before search records retrievals: both algorithms must rank
+    # the same candidates, including their pre-retrieval metadata.
     candidates = r._fts_candidates(query, None, 0.3, 10 * 3)
+    new_results = r.search(query)
     query_tokens = r._tokenize(query)
     scored = []
     for fact in candidates:
@@ -197,6 +198,18 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
         fact.pop("hrr_vector", None)
 
     assert new_results == old_results
+
+
+def test_search_counts_only_returned_facts_once(hoisted_retriever):
+    r = hoisted_retriever
+    before = {f["fact_id"]: f["retrieval_count"] for f in r.store.list_facts(limit=100)}
+    candidates = r._fts_candidates("deploy target setting", None, 0.3, 10 * 3)
+    results = r.search("deploy target setting")
+    returned = {f["fact_id"] for f in results}
+    assert len(returned) == len(results) == 10
+    assert returned < {f["fact_id"] for f in candidates}
+    after = {f["fact_id"]: f["retrieval_count"] for f in r.store.list_facts(limit=100)}
+    assert after == {fid: count + (fid in returned) for fid, count in before.items()}
 
 
 def test_related_encodes_role_atoms_once(hoisted_retriever, monkeypatch):

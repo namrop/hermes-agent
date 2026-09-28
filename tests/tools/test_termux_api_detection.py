@@ -158,6 +158,11 @@ class TestDetectAudioEnvironmentTermuxFallback:
     no longer see the misleading 'Termux:API Android app is not installed'
     warning when the package-manager probe is inconclusive."""
 
+    @pytest.fixture(autouse=True)
+    def host_audio_environment(self, monkeypatch):
+        # The fixture is Android/Termux on the host, not a container.
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+
     def test_inconclusive_probes_with_binary_does_not_emit_app_warning(
         self, monkeypatch
     ):

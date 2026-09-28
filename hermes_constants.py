@@ -5,6 +5,7 @@ without risk of circular imports.
 """
 
 import os
+import re
 import shutil
 import stat
 import sys
@@ -1446,6 +1447,51 @@ def translate_cwd_for_wsl_backend(cwd: str) -> str:
 _container_detected: bool | None = None
 
 
+def _container_cgroup_path(path: str) -> bool:
+    """Membership paths, not runtime service names such as containerd.service."""
+    return bool(re.search(
+        r"/(?:docker|podman|libpod|lxc|containerd|crio)/[^/]+"
+        r"|/(?:docker|podman|libpod|cri-containerd|crio)-[^/]+\.scope(?:/|$)"
+        r"|/lxc\.payload\.[^/]+"
+        r"|/kubepods(?:/|[-.])", path,
+    ))
+
+
+def _container_mount(line: str) -> bool:
+    """Interpret mountinfo's root, mount point and filesystem-specific fields."""
+    before, sep, after = line.partition(" - ")
+    fields, fs_fields = before.split(), after.split()
+    if not sep or len(fields) < 6 or len(fs_fields) < 3:
+        return False
+    # mountinfo escapes whitespace and backslashes with octal sequences.
+    def unescape(value: str) -> str:
+        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
+
+    root, target = map(unescape, fields[3:5])
+    fs_type, _source, options = fs_fields[:3]
+    storage = re.compile(
+        r"/(?:docker/(?:overlay2|containers)|containerd/[^, :]+|"
+        r"containers/storage/overlay|kubelet/pods|lxc)/"
+    )
+    if target == "/":
+        if storage.search(root):
+            return True
+        if fs_type in {"overlay", "fuse.overlayfs"}:
+            return any(
+                storage.search(unescape(value))
+                for option in options.split(",")
+                for key, _, value in [option.partition("=")]
+                if key in {"lowerdir", "upperdir", "workdir"}
+            )
+    if target in {"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}:
+        return bool(storage.search(root))
+    if fs_type in {"cgroup", "cgroup2"} and (
+        target == "/sys/fs/cgroup" or target.startswith("/sys/fs/cgroup/")
+    ):
+        return _container_cgroup_path(root)
+    return False
+
+
 def is_container() -> bool:
     """Return True when running inside a container.
 
@@ -1457,7 +1503,8 @@ def is_container() -> bool:
     Kubernetes/k3s) were previously missed. To cover those, also check:
       * ``KUBERNETES_SERVICE_HOST`` env var — set in every Kubernetes pod.
       * ``kubepods`` / ``containerd`` / ``crio`` markers in ``/proc/1/cgroup``.
-      * the same markers in ``/proc/self/mountinfo`` (cgroup-v2 fallback).
+      * container rootfs, identity-file or cgroup mounts in mountinfo
+        (cgroup-v2 fallback), never host-side child mounts.
 
     Result is cached for the process lifetime.  Import-safe — no heavy deps.
 
@@ -1476,22 +1523,24 @@ def is_container() -> bool:
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
         _container_detected = True
         return True
-    _CGROUP_MARKERS = ("docker", "podman", "/lxc/", "kubepods", "containerd", "crio")
     try:
         with open("/proc/1/cgroup", "r", encoding="utf-8") as f:
-            cgroup = f.read()
-            if any(marker in cgroup for marker in _CGROUP_MARKERS):
+            if any(
+                _container_cgroup_path(parts[2])
+                for line in f
+                for parts in [line.strip().split(":", 2)]
+                if len(parts) == 3
+            ):
                 _container_detected = True
                 return True
     except OSError:
         pass
-    # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
-    # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
+    # cgroup v2 may hide membership behind "0::/". Inspect the process's
+    # root filesystem / runtime-provided files, NOT arbitrary child mounts:
+    # a host running Docker/containerd has those child mounts too.
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
+            if any(_container_mount(line) for line in f):
                 _container_detected = True
                 return True
     except OSError:

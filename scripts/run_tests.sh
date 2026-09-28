@@ -11,7 +11,7 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
-#   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
+#   * Pytest-capable HERMES_PYTHON first, then .venv, venv, ~/.hermes/...
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -36,67 +36,49 @@ set -euo pipefail
 # ── Locate repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Nix editable environments must import this checkout, not packaged source.
+export HERMES_PYTHON_SRC_ROOT="$REPO_ROOT"
 
 # ── Locate python ───────────────────────────────────────────────────────────
-# Probe local venvs first; fall back to the Nix devShell's editable venv
-# (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras:
-# pytest, pytest-asyncio, pytest-timeout, ruff, ty).
-#
-# A candidate must have pytest INSTALLED, not merely exist. The release venv
-# at ~/.hermes/hermes-agent/venv has bin/activate but no pytest, so an
-# existence-only probe selected it in checkouts/worktrees without a local
-# .venv — every file then died with "No module named pytest" and the run
-# reported "0 tests passed" (which reads green at a glance even though the
-# exit code is 1). Skip such a venv and keep probing instead.
-VENV=""
-VENV_PYTHON=""
-SKIPPED_VENVS=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
-      VENV="$candidate"
-      VENV_PYTHON="$candidate/bin/python"
-      break
-    fi
-    SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
+# An explicit pytest-capable HERMES_PYTHON wins over a possibly stale .venv.
+# This lets Python-only Nix runs match production's Python/SQLite without
+# entering the devShell (whose npm setup hook is unrelated to these tests).
+# An inherited RELEASE interpreter may lack pytest: probe, then fall back
+# to local venvs as before. Non-Nix users need no HERMES_PYTHON setting.
+PYTHON=""
+if [ -n "${HERMES_PYTHON:-}" ]; then
+  if [ -x "$HERMES_PYTHON" ] && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
+    PYTHON="$HERMES_PYTHON"
+  else
+    echo "▶ skipping HERMES_PYTHON without pytest: $HERMES_PYTHON" >&2
   fi
-  # Native Windows venv layout: python.exe and activate live under
-  # Scripts/, and there is no bin/. Anyone running this script from
-  # Git Bash / MSYS with a `python -m venv`- or uv-created venv hits
-  # this branch — without it the canonical runner refuses to start.
-  if [ -f "$candidate/Scripts/activate" ]; then
-    if "$candidate/Scripts/python.exe" -c 'import pytest' 2>/dev/null; then
-      VENV="$candidate"
-      VENV_PYTHON="$candidate/Scripts/python.exe"
-      break
-    fi
-    SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
-  fi
-done
+fi
 
-if [ -n "$SKIPPED_VENVS" ]; then
-  for skipped in $SKIPPED_VENVS; do
-    echo "▶ skipping venv without pytest: $skipped" >&2
+if [ -z "$PYTHON" ]; then
+  for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+    # Preserve both POSIX and native Windows (Git Bash/MSYS) venv layouts.
+    for layout in bin Scripts; do
+      executable=python
+      if [ "$layout" = Scripts ]; then executable=python.exe; fi
+      if [ -f "$candidate/$layout/activate" ]; then
+        if "$candidate/$layout/$executable" -c 'import pytest' 2>/dev/null; then
+          PYTHON="$candidate/$layout/$executable"
+          break 2
+        fi
+        echo "▶ skipping venv without pytest: $candidate/$layout" >&2
+      fi
+    done
   done
 fi
 
-if [ -n "$VENV" ]; then
-  PYTHON="$VENV_PYTHON"
-elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
-    && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
-  # Guard with an import check: HERMES_PYTHON may point at the RELEASE
-  # venv (no pytest) when inherited from a wrapped `hermes` binary rather
-  # than the devShell hook.
-  PYTHON="$HERMES_PYTHON"
-  echo "▶ no local venv — using Nix dev venv via HERMES_PYTHON: $PYTHON"
-else
+if [ -z "$PYTHON" ]; then
   echo "error: no virtualenv with pytest found in $REPO_ROOT/.venv or $REPO_ROOT/venv," >&2
-  echo "       and HERMES_PYTHON is not a python with pytest (enter the Nix devShell or create a venv)" >&2
-  if [ -n "$SKIPPED_VENVS" ]; then
-    echo "       (skipped for missing pytest:$SKIPPED_VENVS — install dev extras there, or create $REPO_ROOT/.venv)" >&2
-  fi
+  echo "       ~/.hermes/hermes-agent/venv, or HERMES_PYTHON; see docs/testing.md" >&2
   exit 1
 fi
+
+echo "▶ interpreter: $PYTHON"
+"$PYTHON" -c 'import platform, sqlite3; print(f"  Python {platform.python_version()}; SQLite {sqlite3.sqlite_version}")'
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
@@ -124,6 +106,14 @@ for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT T
 done
 
 # ── Test-runner knobs (computed before we drop env) ────────────────────────
+# Preserve explicit disposable/profile and XDG locations, never credentials.
+LOCATION_ENV=()
+for _location_var in HERMES_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR; do
+  if [ -n "${!_location_var:-}" ]; then
+    LOCATION_ENV+=("$_location_var=${!_location_var}")
+  fi
+done
+
 # The runner's own documented environment knobs must survive the hermetic
 # `env -i` below, or they are silent no-ops for anyone invoking this script:
 #
@@ -169,6 +159,8 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  HERMES_PYTHON_SRC_ROOT="$REPO_ROOT" \
+  ${LOCATION_ENV[@]+"${LOCATION_ENV[@]}"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
   TZ=UTC \

@@ -215,9 +215,15 @@ class TestMatrixSendVoiceMSC3245:
 
 
     @pytest.mark.asyncio
-    async def test_send_voice_transcodes_non_ogg_to_opus(self):
+    @pytest.mark.parametrize("mime_lookup", ["native", None, "application/ogg"])
+    async def test_send_voice_transcodes_non_ogg_to_opus(self, monkeypatch, mime_lookup):
         """Non-Ogg audio reaching send_voice (e.g. direct text_to_speech MP3)
         is transcoded to Ogg/Opus at the adapter boundary (issue #14841)."""
+        if mime_lookup != "native":
+            monkeypatch.setattr(
+                "plugins.platforms.matrix.adapter.mimetypes.guess_type",
+                lambda filename: (mime_lookup, None),
+            )
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             f.write(b"fake mp3 data")
             temp_path = f.name
@@ -263,4 +269,56 @@ class TestMatrixSendVoiceMSC3245:
             os.unlink(temp_path)
             if os.path.exists(converted_path):
                 os.unlink(converted_path)
+
+    @pytest.mark.asyncio
+    async def test_failed_transcode_keeps_mp3_media_type(self, tmp_path):
+        """An actual helper failure sends the original bytes and MIME, not Ogg."""
+        audio = tmp_path / "voice.mp3"
+        audio.write_bytes(b"original mp3")
+        self.adapter._client.send_message_event = AsyncMock(return_value="$sent")
+        with patch("plugins.platforms.matrix.adapter.shutil.which", return_value="/fake/ffmpeg"), \
+             patch("plugins.platforms.matrix.adapter.subprocess.run", return_value=SimpleNamespace(returncode=1)) as ffmpeg, \
+             patch("plugins.platforms.matrix.adapter._matrix_voice_metadata_for_file", return_value={}):
+            result = await self.adapter.send_voice("!room:example.org", str(audio))
+        assert result.success
+        ffmpeg.assert_called_once()
+        assert not os.path.exists(ffmpeg.call_args.args[0][-1])
+        content = self.adapter._client.send_message_event.call_args.args[2]
+        assert content["info"]["mimetype"] == "audio/mpeg"
+        assert self.upload_call is not None
+        assert self.upload_call["mime_type"] == "audio/mpeg"
+        assert self.upload_call["data"] == b"original mp3"
+        assert self.upload_call["filename"] == "voice.mp3"
+        assert audio.read_bytes() == b"original mp3"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("extension", ["ogg", "oga", "opus"])
+    async def test_ogg_voice_without_host_mime_database(self, tmp_path, extension):
+        audio = tmp_path / f"voice.{extension}"
+        audio.write_bytes(b"ogg opus")
+        self.adapter._client.send_message_event = AsyncMock(return_value="$sent")
+        with patch("plugins.platforms.matrix.adapter.mimetypes.guess_type", return_value=(None, None)), \
+             patch("plugins.platforms.matrix.adapter._matrix_transcode_voice_to_ogg") as transcode, \
+             patch("plugins.platforms.matrix.adapter._matrix_voice_metadata_for_file", return_value={}):
+            result = await self.adapter.send_voice("!room:example.org", str(audio))
+        assert result.success
+        transcode.assert_not_called()
+        assert self.upload_call is not None
+        assert self.upload_call["mime_type"] == "audio/ogg"
+        assert self.adapter._client.send_message_event.call_args.args[2]["info"]["mimetype"] == "audio/ogg"
+        assert audio.exists()
+
+    @pytest.mark.asyncio
+    async def test_document_ogg_keeps_general_mime_lookup(self, tmp_path):
+        document = tmp_path / "document.ogg"
+        document.write_bytes(b"non-voice ogg")
+        self.adapter._client.send_message_event = AsyncMock(return_value="$sent")
+        with patch("plugins.platforms.matrix.adapter.mimetypes.guess_type", return_value=("application/ogg", None)):
+            result = await self.adapter.send_document("!room:example.org", str(document))
+        assert result.success
+        assert self.upload_call is not None
+        assert self.upload_call["mime_type"] == "application/ogg"
+        content = self.adapter._client.send_message_event.call_args.args[2]
+        assert content["info"]["mimetype"] == "application/ogg"
+        assert "org.matrix.msc3245.voice" not in content
 

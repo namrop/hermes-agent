@@ -2992,7 +2992,15 @@ class MatrixAdapter(BasePlatformAdapter):
             )
 
         fname = file_name or p.name
-        ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        # send_voice selects Ogg/Opus (or accepts an existing Ogg input).
+        # Host MIME databases may call .ogg application/ogg or omit it entirely.
+        # A failed transcode still has its original suffix and keeps normal MIME
+        # lookup, as do all non-voice uploads.
+        ct = (
+            "audio/ogg"
+            if is_voice and p.suffix.lower() in (".ogg", ".oga", ".opus")
+            else mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        )
         data = p.read_bytes()
         # ffprobe/ffmpeg probing is blocking (subprocess timeouts up to 15s) —
         # run it off the event loop so voice uploads never stall the adapter.

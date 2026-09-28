@@ -38,6 +38,9 @@ from tools.checkpoint_manager import (
 def work_dir(tmp_path):
     d = tmp_path / "project"
     d.mkdir()
+    # Ordinary fixtures declare their root; unmarked-root regressions below
+    # supply their own adversarial ancestor rather than depending on the host.
+    (d / "pyproject.toml").write_text("[project]\nname = 'fixture'\n")
     (d / "main.py").write_text("print('hello')\n")
     (d / "README.md").write_text("# Project\n")
     return d
@@ -365,16 +368,53 @@ class TestSafeRestore:
         assert result["success"] is True
         assert (work_dir / "main.py").read_text() == "print('hello')\n"
 
-    def test_safe_restore_falls_back_to_full_when_no_ledger(self, mgr, work_dir):
-        """Empty ledger (pre-existing stores) → classic full restore."""
+    @pytest.mark.parametrize("ledger_state", ["missing", "corrupt", "non_mapping", "empty", "unreadable", "invalid_utf8", "invalid_entry"])
+    def test_safe_restore_refuses_unproven_ownership(
+        self, mgr, work_dir, checkpoint_base, monkeypatch, ledger_state,
+    ):
+        """Pre-ledger/unreadable provenance never permits an implicit full restore."""
+        from tools.checkpoint_manager import _ledger_path
+
         base = self._checkpoint(mgr, work_dir)
         (work_dir / "main.py").write_text("changed without ledger\n")
+        (work_dir / "user.txt").write_text("user-created\n")
+        ledger_path = _ledger_path(_store_path(checkpoint_base), _project_hash(str(work_dir)))
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        if ledger_state in {"corrupt", "non_mapping", "empty"}:
+            ledger_path.write_text({"corrupt": "{broken", "non_mapping": "[]", "empty": "{}"}[ledger_state])
+        if ledger_state == "invalid_utf8":
+            ledger_path.write_bytes(b"\xff")
+        if ledger_state == "invalid_entry":
+            ledger_path.write_text(json.dumps({str(work_dir / "main.py"): {"sha256": 42}}))
+        if ledger_state == "unreadable":
+            real_read = Path.read_text
+            def denied(path, *args, **kwargs):
+                if path == ledger_path:
+                    raise PermissionError("fixture ledger unreadable")
+                return real_read(path, *args, **kwargs)
+            monkeypatch.setattr(Path, "read_text", denied)
 
+        before = {p.name: p.read_bytes() for p in work_dir.iterdir() if p.is_file()}
+        checkpoints_before = mgr.list_checkpoints(str(work_dir))
+        plan = mgr.safe_restore_plan(str(work_dir), base)
+        assert plan["success"] is False
         result = mgr.restore(str(work_dir), base, safe=True)
+        assert result["success"] is False
+        assert "selective rollback cannot be proven" in result["error"].lower()
+        assert "pre-ledger" in result["error"].lower()
+        assert "--all" in result["error"] and "--force" in result["error"]
+        assert before == {p.name: p.read_bytes() for p in work_dir.iterdir() if p.is_file()}
+        assert mgr.list_checkpoints(str(work_dir)) == checkpoints_before
+
+        # Explicit full restore remains available, with its undo snapshot.
+        result = mgr.restore(str(work_dir), base, safe=False)
         assert result["success"] is True
         assert (work_dir / "main.py").read_text() == "print('hello')\n"
-        # Fallback path: no per-file classification in the result.
-        assert "skipped_user_edits" not in result
+        snapshots = mgr.list_checkpoints(str(work_dir))
+        assert len(snapshots) == len(checkpoints_before) + 1
+        assert "pre-rollback snapshot" in snapshots[0]["reason"]
+        assert mgr.restore(str(work_dir), snapshots[0]["hash"], safe=False)["success"]
+        assert (work_dir / "main.py").read_text() == "changed without ledger\n"
 
     def test_safe_restore_removes_agent_created_file_keeps_user_edit(self, mgr, work_dir):
         base = self._checkpoint(mgr, work_dir)
@@ -416,6 +456,126 @@ class TestSafeRestore:
 # =========================================================================
 
 class TestWorkingDirResolution:
+    @pytest.mark.parametrize("reopen", [False, True])
+    def test_registered_root_beats_adversarial_parent_marker(
+        self, tmp_path, checkpoint_base, monkeypatch, reopen,
+    ):
+        from tools.checkpoint_manager import _ledger_path, _load_ledger
+
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        (tmp_path / "package.json").write_text("{}")
+        root = tmp_path / "unmarked-project"
+        (root / "src").mkdir(parents=True)
+        agent_file = root / "src" / "main.py"
+        user_file = root / "README.md"
+        agent_file.write_text("original\n")
+        user_file.write_text("original notes\n")
+        manager = CheckpointManager(enabled=True)
+        assert manager.ensure_checkpoint(str(root), "initial")
+        base = manager.list_checkpoints(str(root))[0]["hash"]
+        if reopen:
+            manager = CheckpointManager(enabled=True)
+        agent_file.write_text("agent change\n")
+        user_file.write_text("user edit\n")
+        manager.record_agent_write(str(agent_file))
+        store = _store_path(checkpoint_base)
+        assert str(agent_file) in _load_ledger(store, _project_hash(str(root)))
+        assert not _ledger_path(store, _project_hash(str(tmp_path))).exists()
+        assert manager.get_working_dir_for_path(str(agent_file)) == str(root)
+        result = manager.restore(str(root), base, safe=True)
+        assert result["success"]
+        assert agent_file.read_text() == "original\n"
+        assert user_file.read_text() == "user edit\n"
+
+    def test_nested_registered_roots_keep_separate_ownership_after_reopen(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        from tools.checkpoint_manager import _load_ledger
+
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        parent = tmp_path / "parent"
+        child = parent / "nested"
+        child.mkdir(parents=True)
+        (parent / "package.json").write_text("{}")
+        outer = parent / "outer.py"
+        inner = child / "inner.py"
+        outer.write_text("outer baseline\n")
+        inner.write_text("inner baseline\n")
+        manager = CheckpointManager(enabled=True)
+        assert manager.ensure_checkpoint(str(parent))
+        assert manager.ensure_checkpoint(str(child))
+        base = manager.list_checkpoints(str(child))[0]["hash"]
+        manager = CheckpointManager(enabled=True)
+        for file in (outer, inner):
+            file.write_text("agent\n")
+            manager.record_agent_write(str(file))
+        store = _store_path(checkpoint_base)
+        assert set(_load_ledger(store, _project_hash(str(parent)))) == {str(outer)}
+        assert set(_load_ledger(store, _project_hash(str(child)))) == {str(inner)}
+        assert manager.restore(str(child), base, safe=True)["success"]
+        assert inner.read_text() == "inner baseline\n"
+        assert outer.read_text() == "agent\n"
+
+    @pytest.mark.parametrize("reopen", [False, True])
+    def test_registered_ancestor_does_not_capture_nested_marker_project(
+        self, tmp_path, checkpoint_base, monkeypatch, reopen,
+    ):
+        """A registered parent (e.g. a terminal cwd) must not swallow a nested
+        project that carries its own marker: nearest owner wins."""
+        from tools.checkpoint_manager import _load_ledger
+
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        ws = tmp_path / "workspace"
+        repo = ws / "repo"
+        repo.mkdir(parents=True)
+        (repo / "pyproject.toml").write_text("[project]\nname = 'nested'\n")
+        (ws / "notes.txt").write_text("workspace\n")
+        app = repo / "app.py"
+        app.write_text("baseline\n")
+        manager = CheckpointManager(enabled=True)
+        # Terminal-style checkpoint registers the unmarked parent directly.
+        assert manager.ensure_checkpoint(str(ws), "terminal cwd")
+        if reopen:
+            manager = CheckpointManager(enabled=True)
+        assert manager.get_working_dir_for_path(str(app)) == str(repo)
+        assert manager.ensure_checkpoint(str(repo), "file edit")
+        app.write_text("agent\n")
+        manager.record_agent_write(str(app))
+        store = _store_path(checkpoint_base)
+        assert str(app) in _load_ledger(store, _project_hash(str(repo)))
+        assert str(app) not in _load_ledger(store, _project_hash(str(ws)))
+        assert manager.list_checkpoints(str(repo))
+        # Unmarked files directly under the registered parent still map to it.
+        assert manager.get_working_dir_for_path(str(ws / "notes.txt")) == str(ws)
+
+    def test_metadata_requires_hash_identity_and_real_containment(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        root = tmp_path / "project"
+        child = root / "src"
+        child.mkdir(parents=True)
+        (root / "package.json").write_text("{}")
+        edited = child / "main.py"
+        edited.write_text("x\n")
+        manager = CheckpointManager(enabled=True)
+        assert manager.ensure_checkpoint(str(root))
+        store = _store_path(checkpoint_base)
+        # A more-specific path under somebody else's hash is not a registration.
+        _project_meta_path(store, "0" * 16).write_text(json.dumps({"workdir": str(child)}))
+        # Relative, malformed and string-prefix-only matches are not owners.
+        for key, workdir in [("1" * 16, "src"), ("2" * 16, 42),
+                             (_project_hash(str(tmp_path / "proj")), str(tmp_path / "proj"))]:
+            _project_meta_path(store, key).write_text(json.dumps({"workdir": workdir}))
+        assert manager.get_working_dir_for_path(str(edited)) == str(root)
+        # A symlink escaping the registered root is resolved before containment.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "package.json").write_text("{}")
+        (outside / "file.py").write_text("outside\n")
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        assert manager.get_working_dir_for_path(str(root / "link" / "file.py")) == str(outside)
+
     def test_resolves_project_root_markers(self, tmp_path, fake_home):
         m = CheckpointManager(enabled=True)
 
