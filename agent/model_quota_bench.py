@@ -27,7 +27,7 @@ def _model_family(model: str) -> str | None:
 
 def read_model_benches(home: Path) -> list[dict[str, Any]]:
     try:
-        data = json.loads((home / BENCH_FILE).read_text())
+        data = json.loads((home / BENCH_FILE).read_text(encoding="utf-8"))
         if data.get("version") != 1 or not isinstance(data.get("benches"), list):
             return []
         return data["benches"]

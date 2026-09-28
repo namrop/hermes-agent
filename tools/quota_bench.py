@@ -181,13 +181,8 @@ def load_hermes_env(hermes_home: Path) -> int:
     return loaded
 
 
-def resolve_chain(hermes_home: Path) -> List[str]:
-    """Pool provider names in routing order: primary first, then each leg.
-
-    Deduplicated, order preserved. The fail-open test is evaluated over *this*
-    set, not over every provider in the ledger — otherwise an unrelated spent
-    provider (e.g. a drained openrouter balance) skews "are they all spent".
-    """
+def _effective_config(hermes_home: Path) -> Dict[str, Any]:
+    """Read the requested home's effective config for both quota route views."""
     # Keep the explicit --hermes-home scope even in a process whose active
     # profile differs. ContextVar scoping does not mutate other tasks' env.
     # Direct `python tools/quota_bench.py` only puts tools/ on sys.path.
@@ -200,9 +195,19 @@ def resolve_chain(hermes_home: Path) -> List[str]:
 
     token = set_hermes_home_override(hermes_home)
     try:
-        cfg = load_config_readonly()
+        return load_config_readonly()
     finally:
         reset_hermes_home_override(token)
+
+
+def resolve_chain(hermes_home: Path) -> List[str]:
+    """Pool provider names in routing order: primary first, then each leg.
+
+    Deduplicated, order preserved. The fail-open test is evaluated over *this*
+    set, not over every provider in the ledger — otherwise an unrelated spent
+    provider (e.g. a drained openrouter balance) skews "are they all spent".
+    """
+    cfg = _effective_config(hermes_home)
     chain: List[str] = []
 
     model_cfg = cfg.get("model")
@@ -224,9 +229,14 @@ def resolve_chain(hermes_home: Path) -> List[str]:
 
 def resolve_model_routes(hermes_home: Path) -> List[tuple[str, str]]:
     """Preserve duplicate account routes when comparing model-specific caps."""
-    import yaml
-    cfg = yaml.safe_load((hermes_home / "config.yaml").read_text()) or {}
-    entries = [cfg.get("model")] + list(cfg.get("fallback_providers") or [])
+    cfg = _effective_config(hermes_home)
+    primary = cfg.get("model")
+    entries = []
+    if isinstance(primary, dict):
+        # The canonical loader normalizes the primary to model.default;
+        # fallback entries keep their model key. Copy, never mutate the cache.
+        entries.append({**primary, "model": primary.get("default") or primary.get("model") or ""})
+    entries.extend(cfg.get("fallback_providers") or [])
     return [(str(e.get("provider") or "").strip().lower(), str(e.get("model") or "").lower())
             for e in entries if isinstance(e, dict) and e.get("provider")]
 

@@ -136,7 +136,11 @@ def test_main_explicit_home_dry_run_uses_synthetic_ledger(tmp_path, monkeypatch,
     monkeypatch.setenv('QUOTA_CLI_PROVIDER', 'café')
     ledger = tmp_path / 'synthetic.sqlite3'
     with sqlite3.connect(ledger) as conn:
-        conn.execute('CREATE TABLE facts (provider TEXT, quota_name TEXT, occurred_or_observed_at TEXT, canonical_json TEXT)')
+        conn.execute(
+            'CREATE TABLE facts (provider TEXT, quota_name TEXT, '
+            'occurred_or_observed_at TEXT, canonical_json TEXT, '
+            'account_ref TEXT, source_namespace TEXT)'
+        )
     token = set_hermes_home_override(tmp_path / 'other-home')
     try:
         assert qb.main(['--hermes-home', str(requested), '--ledger', str(ledger), '--json']) == 0
@@ -148,6 +152,53 @@ def test_main_explicit_home_dry_run_uses_synthetic_ledger(tmp_path, monkeypatch,
         assert get_hermes_home() == tmp_path / 'other-home'
     finally:
         reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("primary_key", ["model", "default"])
+def test_model_routes_use_effective_config_and_preserve_account_duplicates(tmp_path, monkeypatch, primary_key):
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+
+    requested = tmp_path / "requested"
+    requested.mkdir()
+    path = requested / "config.yaml"
+    path.write_text(
+        "model:\n  provider: ${QUOTA_ROUTES_PROVIDER}\n"
+        f"  {primary_key}: claude-opus-5-5\n"
+        "fallback_providers:\n  - provider: ${QUOTA_ROUTES_PROVIDER}\n    model: claude-sonnet-5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("QUOTA_ROUTES_PROVIDER", "custom:meridian-yugen")
+    original = path.read_bytes()
+    other = tmp_path / "other"
+    token = set_hermes_home_override(other)
+    try:
+        assert qb.resolve_model_routes(requested) == [
+            ("custom:meridian-yugen", "claude-opus-5-5"),
+            ("custom:meridian-yugen", "claude-sonnet-5"),
+        ]
+        assert qb.resolve_chain(requested) == ["custom:meridian-yugen"]
+        assert get_hermes_home() == other
+        assert path.read_bytes() == original
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_bench_reader_uses_utf8(tmp_path, monkeypatch):
+    import json
+    from agent.model_quota_bench import BENCH_FILE, read_model_benches
+
+    rows = [{"pool_provider": "custom:meridian-yugen", "label": "café 東京"}]
+    path = tmp_path / BENCH_FILE
+    path.write_text(json.dumps({"version": 1, "benches": rows}, ensure_ascii=False), encoding="utf-8")
+    original = Path.read_text
+
+    def require_utf8(target, *args, **kwargs):
+        if target == path:
+            assert kwargs.get("encoding") == "utf-8"
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", require_utf8)
+    assert read_model_benches(tmp_path) == rows
 
 
 def test_under_threshold_is_not_benched():
