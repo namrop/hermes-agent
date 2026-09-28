@@ -1592,8 +1592,14 @@ class ProcessRegistry:
     # ----- Query Methods -----
 
     def is_completion_consumed(self, session_id: str) -> bool:
-        """Check if a completion notification was already consumed via wait/log."""
+        """Whether a terminal result was consumed via the tool, wait, or log."""
         return session_id in self._completion_consumed
+
+    def acknowledge_completion(self, session_id: str) -> None:
+        """A terminal tool result has been returned to its caller."""
+        session = self.get(session_id)
+        if session is not None and session.exited:
+            self._completion_consumed.add(session.id)
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
@@ -1872,17 +1878,20 @@ class ProcessRegistry:
         self._reconcile_local_exit(session)
 
         with session._lock:
+            # Snapshot exit BEFORE output: a process finishing after this
+            # read must not make an earlier running snapshot acknowledge it.
+            exited = session.exited
             output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
 
         result = {
             "session_id": session.id,
             "command": session.command,
-            "status": "exited" if session.exited else "running",
+            "status": "exited" if exited else "running",
             "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at),
             "output_preview": output_preview,
         }
-        if session.exited:
+        if exited:
             result["exit_code"] = session.exit_code
             result["completion_reason"] = session.completion_reason
             result["termination_source"] = session.termination_source
@@ -1895,8 +1904,9 @@ class ProcessRegistry:
             # We DO record it in _poll_observed so the CLI's inline drain still
             # dedups (the agent already saw the exit in this turn's poll result)
             # without affecting the gateway/tui watchers, which only consult
-            # _completion_consumed.
-            self._poll_observed.add(session_id)
+            # _completion_consumed. The model-facing process tool explicitly
+            # acknowledges an exited result after serializing it for the agent.
+            self._poll_observed.add(session.id)
         if session.detached:
             result["detached"] = True
             result["note"] = "Process recovered after restart -- output history unavailable"
@@ -1941,7 +1951,7 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
         if session.exited and observed_completion_output:
-            self._completion_consumed.add(session_id)
+            self._completion_consumed.add(session.id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -2002,7 +2012,7 @@ class ProcessRegistry:
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self._completion_consumed.add(session.id)
                 result = {
                     "status": "exited",
                     "command": session.command,
@@ -2105,7 +2115,7 @@ class ProcessRegistry:
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
-                self._completion_consumed.add(session_id)
+                self._completion_consumed.add(session.id)
             return result
 
         # Kill via PTY, Popen (local), or env execute (non-local)
@@ -2141,7 +2151,7 @@ class ProcessRegistry:
                         session.exit_code = None
                         output = strip_ansi(session.output_buffer[-2000:])
                     if consume_output:
-                        self._completion_consumed.add(session_id)
+                        self._completion_consumed.add(session.id)
                     self._move_to_finished(session)
                     return {
                         "status": "already_exited",
@@ -2173,7 +2183,7 @@ class ProcessRegistry:
             with session._lock:
                 output = strip_ansi(session.output_buffer[-2000:])
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._completion_consumed.add(session.id)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
@@ -3097,7 +3107,14 @@ def _handle_process(args, **kw):
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
-            return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
+            result = process_registry.poll(session_id)
+            response = json.dumps(_redact_process_result(result), ensure_ascii=False)
+            # A model-facing terminal result is consumption, unlike internal
+            # status polling. A queued watcher event must not wake another turn
+            # for the same result, including when a short ID prefix was used.
+            if result.get("status") == "exited":
+                process_registry.acknowledge_completion(result["session_id"])
+            return response
         elif action == "log":
             return json.dumps(_redact_process_result(process_registry.read_log(
                 session_id, offset=args.get("offset"), limit=args.get("limit", 200))), ensure_ascii=False)

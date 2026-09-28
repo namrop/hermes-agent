@@ -1,5 +1,21 @@
 # Architecture Decision Records
 
+## 2026-09-28: Consumed process completions do not start a second gateway answer
+
+Status: Accepted — source repair; not deployed or restarted under this commission.
+
+Origin: Luis supplied Discord message `1553991236426268719` as a delayed second-answer example, then approved the repair in `1553993126169935873`: "Yes exactly. Patch it and stop before deployment and restart".
+
+The rendering process's terminal result was already returned by `process poll`, but the watcher queued the same completion and the gateway started a second turn after the main answer. The producer's event was delivered once; the **information** was delivered twice, through the tool and the notification.
+
+Decision and implementation:
+- The model-facing `process poll` handler acknowledges an exited result after serialization. Internal `ProcessRegistry.poll()` remains a read-only status query. Running polls do not acknowledge a future result; status and output use the same observation snapshot.
+- Acknowledgments use the canonical process ID, including when the caller supplied a short prefix. Existing wait/log/kill consumption follows the same identity.
+- Gateway completion events carry structured producer records through queueing. Consumption is rechecked before injection, at handler entry, and when draining a busy turn's queue. A consumed event does not start another turn; a mixed batch retains unseen results with the existing formatter's bounds and redaction.
+- Completion events stay separate in the busy FIFO so filtering one cannot discard adjacent user input or another completion. Unseen completions, watch-pattern events, and delegated-task results retain their delivery paths.
+
+This is lifecycle-local acknowledgment, not a new durable exactly-once protocol. No notification setting, provider route, transcript history, or live service configuration changes are part of this repair.
+
 ## 2026-09-18: Gateway `/model default` clears only the conversation override; bare `moa` selects the configured MoA default
 
 Status: Accepted — source implementation; fleet pin/activation is separate.

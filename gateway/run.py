@@ -9199,6 +9199,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             overflow.insert(0, next_queued)
         return pending_event
 
+    def _dequeue_pending_agent_event(self, adapter, session_key):
+        """Drain consumed completion events without losing the next FIFO item."""
+        while True:
+            event = _dequeue_pending_event(adapter, session_key)
+            event = self._promote_queued_event(session_key, adapter, event)
+            if event is None or self._refresh_process_completion_event(event):
+                return event
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
@@ -10626,7 +10634,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # never splices into a running turn. Plugin events carry untrusted
         # payload text, so queue those through the gateway FIFO to keep their
         # security metadata separate from pending user input.
-        if getattr(event, "internal", False) and not event.allow_gateway_control:
+        if getattr(event, "internal", False) and (
+            not event.allow_gateway_control
+            or (getattr(event, "metadata", None) or {}).get("process_completions")
+        ):
+            # Completion records must stay separate from user text and other
+            # events; merging text would lose their independent acknowledgments.
             self._queue_or_replace_pending_event(session_key, event)
             return True
         if getattr(event, "internal", False):
@@ -16889,6 +16902,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
+        if not self._refresh_process_completion_event(event):
+            return None
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -25725,6 +25740,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.error("Watch notification injection error: %s", exc)
 
+    @staticmethod
+    def _process_completion_consumed(evt: dict) -> bool:
+        from tools.process_registry import process_registry
+
+        sid = str(evt.get("session_id") or "")
+        if not process_registry.is_completion_consumed(sid):
+            return False
+        started_at = evt.get("started_at")
+        if started_at is None:
+            return True  # legacy events have no incarnation stamp
+        session = process_registry.get(sid)
+        return session is not None and session.started_at == started_at
+
+    def _refresh_process_completion_event(self, event: MessageEvent) -> bool:
+        """Recheck consumption after the event has waited behind an active turn.
+
+        Keep structured, producer-stamped records on internal events so mixed
+        batches can lose consumed entries without losing unseen siblings. User
+        text and other internal events are never parsed as completion records.
+        """
+        if not getattr(event, "internal", False):
+            return True
+        metadata = getattr(event, "metadata", None) or {}
+        records = metadata.get("process_completions")
+        if not isinstance(records, list) or not records:
+            return True
+        remaining = [r for r in records if not self._process_completion_consumed(r)]
+        if len(remaining) == len(records):
+            return True
+        if not remaining:
+            logger.info("Suppressing consumed process completion event (%s)",
+                        ", ".join(str(r.get("session_id")) for r in records))
+            return False
+        event.metadata = {**metadata, "process_completions": remaining}
+        # Keep the coalesced formatter's existing redaction and output bounds
+        # even when removing consumed entries leaves only one result.
+        event.text = self._format_coalesced_process_completions(
+            [("", r, None) for r in remaining]
+        )
+        return True
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -25839,6 +25895,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
         try:
             metadata = {}
+            if evt.get("type") == "completion":
+                metadata["process_completions"] = evt.get("process_completions") or [dict(evt)]
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
@@ -25850,6 +25908,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata=metadata,
             )
+            if not self._refresh_process_completion_event(synth_event):
+                return True  # output already returned inline; no wake needed
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -26128,7 +26188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ))
 
     @staticmethod
-    def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
+    def _format_coalesced_process_completions(entries: list[tuple[str, dict, Optional[asyncio.Future]]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
         lines = [
             f"[IMPORTANT: {len(entries)} background processes completed for this session.",
@@ -26207,7 +26267,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             delivered = None
             for _text, candidate_evt, _future in entries:
                 delivered = await self._deliver_completion_notification(
-                    synth_text, candidate_evt,
+                    synth_text, {**candidate_evt, "process_completions": [
+                        evt for _text, evt, _future in entries
+                    ]},
                 )
                 if delivered is not None:
                     break
@@ -30103,14 +30165,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
-                # /queue overflow: after consuming the adapter's "next-up"
-                # slot, promote the next queued event into it so the
-                # recursive run's drain will see it.  This keeps the slot
-                # occupied for the full FIFO chain, which (a) preserves
-                # order, and (b) causes any mid-chain /queue to correctly
-                # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                # Preserve FIFO promotion while dropping completion events
+                # whose terminal result was consumed during this active turn.
+                pending_event = self._dequeue_pending_agent_event(adapter, session_key)
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
