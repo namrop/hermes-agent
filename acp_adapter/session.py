@@ -396,6 +396,34 @@ class SessionManager:
         if state is not None:
             self._persist(state)
 
+    def discard_empty_sessions(self) -> int:
+        """Drop the stored rows of this process's sessions that were never used.
+
+        ``session/new`` writes a row straight away, so a client that opens a
+        session and never prompts it (a provider health check reading the
+        model list, a thread opened and abandoned) leaves an empty, untitled
+        row in the shared session history. Called when the ACP process
+        exits; same rule as the CLI's exit path: only rows with no messages,
+        no title and no child sessions are removed, checked and deleted in
+        one transaction (``SessionDB.delete_session_if_empty``). Returns the
+        number of rows removed.
+        """
+        db = self._get_db()
+        if db is None:
+            return 0
+        with self._lock:
+            candidates = [sid for sid, state in self._sessions.items() if not state.history]
+        removed = 0
+        for session_id in candidates:
+            try:
+                if db.delete_session_if_empty(
+                    session_id, sessions_dir=get_hermes_home() / "sessions"
+                ):
+                    removed += 1
+            except Exception:
+                logger.debug("Could not discard empty ACP session %s", session_id, exc_info=True)
+        return removed
+
     # ---- persistence via SessionDB ------------------------------------------
 
     def _get_db(self):
@@ -614,6 +642,7 @@ class SessionManager:
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         config = load_config()
@@ -642,6 +671,10 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            # Same chain the gateway, cron, CLI and one-shot runs use. Without
+            # it an ACP session has nowhere to go when its provider is benched
+            # or capped: it keeps retrying the capped provider instead.
+            "fallback_model": get_fallback_chain(config) or None,
         }
 
         try:

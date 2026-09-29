@@ -1,11 +1,71 @@
 """Tests for acp_adapter.entry startup wiring."""
 
+import asyncio
+import os
+import signal
 import sys
 
 import acp
 import pytest
 
 from acp_adapter import entry
+
+
+class _RecordingSessionManager:
+    def __init__(self):
+        self.discard_calls = 0
+
+    def discard_empty_sessions(self):
+        self.discard_calls += 1
+        return 0
+
+
+def _fake_acp_agent_class(manager):
+    class FakeAgent:
+        session_manager = manager
+
+    return FakeAgent
+
+
+def test_main_discards_unused_sessions_when_the_client_disconnects(monkeypatch):
+    manager = _RecordingSessionManager()
+
+    async def fake_run_agent(agent, **kwargs):
+        return None  # stdin closed: the ACP server returns
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
+    monkeypatch.setattr(acp, "run_agent", fake_run_agent)
+    monkeypatch.setattr("acp_adapter.server.HermesACPAgent", _fake_acp_agent_class(manager))
+
+    entry.main([])
+
+    assert manager.discard_calls == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no loop signal handlers on Windows")
+def test_main_sigterm_stops_the_server_and_discards_unused_sessions(monkeypatch):
+    """Clients such as T3 Code stop `hermes acp` with SIGTERM; cleanup must still run."""
+    manager = _RecordingSessionManager()
+
+    async def fake_run_agent(agent, **kwargs):
+        # An unhandled SIGTERM would kill the test run itself, so only send
+        # one once the server has installed its handler.
+        assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
+    monkeypatch.setattr(acp, "run_agent", fake_run_agent)
+    monkeypatch.setattr("acp_adapter.server.HermesACPAgent", _fake_acp_agent_class(manager))
+
+    entry.main([])
+
+    assert manager.discard_calls == 1
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
 def test_main_enables_unstable_protocol(monkeypatch):

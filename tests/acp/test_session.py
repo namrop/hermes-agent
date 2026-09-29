@@ -110,6 +110,48 @@ class TestCreateSession:
 
         assert state.agent.session_cwd == "/tmp/project"
 
+    def test_make_agent_passes_the_configured_fallback_chain(self, monkeypatch):
+        """ACP sessions walk the same fallback chain as the gateway and cron.
+
+        Without it a session whose provider is benched or capped keeps
+        retrying that provider instead of moving down the chain.
+        """
+
+        class FakeAgent:
+            model = "glm-5.3"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        config = {
+            "model": {"default": "glm-5.3", "provider": "opencode-go"},
+            "fallback_providers": [
+                {"provider": "custom:meridian-yugen", "model": "claude-opus-5-5"},
+                {"provider": "kimi-coding", "model": "k3"},
+            ],
+            "mcp_servers": {},
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "chat_completions",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        chain = state.agent.kwargs["fallback_model"]
+        assert [(entry["provider"], entry["model"]) for entry in chain] == [
+            ("custom:meridian-yugen", "claude-opus-5-5"),
+            ("kimi-coding", "k3"),
+        ]
+
 
 
 
@@ -375,3 +417,32 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+class TestDiscardEmptySessions:
+    def test_drops_only_sessions_that_were_never_used(self, tmp_path):
+        """An unprompted session (a health check, an abandoned thread) leaves no row."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        unused = manager.create_session(cwd="/work")
+        used = manager.create_session(cwd="/work")
+        used.history.append({"role": "user", "content": "hello"})
+        used.history.append({"role": "assistant", "content": "hi"})
+        manager.save_session(used.session_id)
+        assert db.get_session(unused.session_id) is not None
+
+        assert manager.discard_empty_sessions() == 1
+
+        assert db.get_session(unused.session_id) is None
+        assert db.get_session(used.session_id) is not None
+
+    def test_keeps_a_row_whose_messages_reached_the_db_before_memory(self, tmp_path):
+        """Mid-first-turn the agent has flushed messages that history lacks yet."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session(cwd="/work")
+        db.append_message(state.session_id, role="user", content="first prompt")
+
+        assert manager.discard_empty_sessions() == 0
+
+        assert db.get_session(state.session_id) is not None

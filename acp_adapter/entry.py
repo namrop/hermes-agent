@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -270,12 +271,39 @@ def main(argv: list[str] | None = None) -> None:
 
     agent = HermesACPAgent()
     try:
-        asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
+        asyncio.run(_serve(acp, agent, logger))
     except KeyboardInterrupt:
         logger.info("Shutting down (KeyboardInterrupt)")
     except Exception:
         logger.exception("ACP agent crashed")
         sys.exit(1)
+
+
+async def _serve(acp_module, agent, logger: logging.Logger) -> None:
+    """Run the ACP server; on the way out, drop sessions that were never used.
+
+    Clients stop ``hermes acp`` by closing stdin or with SIGTERM (T3 Code
+    does the latter, then SIGKILL a second later). Python's default SIGTERM
+    handling exits without running any cleanup, so SIGTERM cancels the
+    server task instead and both paths reach the ``finally`` below.
+    """
+    task = asyncio.current_task()
+    if task is not None:
+        try:
+            asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass  # No loop signal handlers here (Windows); SIGTERM keeps its default.
+    try:
+        await acp_module.run_agent(agent, use_unstable_protocol=True)
+    except asyncio.CancelledError:
+        logger.info("Shutting down (SIGTERM)")
+    finally:
+        try:
+            removed = agent.session_manager.discard_empty_sessions()
+            if removed:
+                logger.info("Discarded %d unused ACP session(s)", removed)
+        except Exception:
+            logger.debug("Could not discard unused ACP sessions", exc_info=True)
 
 
 if __name__ == "__main__":
