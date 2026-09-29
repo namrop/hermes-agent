@@ -1068,6 +1068,29 @@ class HermesACPAgent(acp.Agent):
             )
             return None
 
+    def _reopened_session_meta(self, state: SessionState) -> Optional[dict]:
+        """``_meta`` for session/load and session/resume responses.
+
+        Provenance plus ``_meta.hermes.systemPrompt``: the system prompt
+        Hermes stored for the session, which the history replay cannot carry.
+        """
+        hermes_session_id = getattr(state.agent, "session_id", None)
+        if not isinstance(hermes_session_id, str) or not hermes_session_id:
+            hermes_session_id = state.session_id
+        meta = self._provenance_meta(state.session_id, hermes_session_id) or {}
+        row = None
+        try:
+            db = self.session_manager._get_db()
+            if db is not None:
+                row = db.get_session(hermes_session_id)
+        except Exception:
+            logger.debug("Could not read stored system prompt for %s", hermes_session_id, exc_info=True)
+        # get_session resolves the hashed prompt store into ``system_prompt``.
+        prompt = (row or {}).get("system_prompt")
+        if isinstance(prompt, str) and prompt:
+            meta = {**meta, "hermes": {**(meta.get("hermes") or {}), "systemPrompt": prompt}}
+        return meta or None
+
     async def _send_session_info_update(
         self,
         session_id: str,
@@ -1437,6 +1460,40 @@ class HermesACPAgent(acp.Agent):
         return None
 
     @staticmethod
+    def _history_record_meta(
+        message: dict[str, Any],
+        base: dict[str, Any] | None = None,
+        *,
+        timestamp_only: bool = False,
+    ) -> dict[str, Any] | None:
+        """``_meta`` for a replayed message: what Hermes stored about it.
+
+        Under ``_meta.hermes``: ``timestamp`` (epoch seconds), ``finishReason``,
+        ``apiContent`` (the text the model actually received, e.g. with the
+        recalled-memory block, when it differs from what the user typed) and
+        ``platformMessageId``. Only fields Hermes stored are sent. ``base``
+        (the compaction-summary flags) is merged in.
+        """
+        record: dict[str, Any] = {}
+        timestamp = message.get("timestamp")
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            record["timestamp"] = timestamp
+        if not timestamp_only:
+            finish_reason = message.get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                record["finishReason"] = finish_reason
+            api_content = message.get("api_content")
+            if isinstance(api_content, str) and api_content and api_content != message.get("content"):
+                record["apiContent"] = api_content
+            platform_message_id = message.get("message_id")
+            if platform_message_id:
+                record["platformMessageId"] = str(platform_message_id)
+        meta = dict(base or {})
+        if record:
+            meta["hermes"] = {**record, **(meta.get("hermes") or {})}
+        return meta or None
+
+    @staticmethod
     def _history_message_update(
         *,
         role: str,
@@ -1529,7 +1586,9 @@ class HermesACPAgent(acp.Agent):
                     update = self._history_message_update(
                         role=role,
                         text=text,
-                        field_meta=self._history_summary_meta(message, text),
+                        field_meta=self._history_record_meta(
+                            message, self._history_summary_meta(message, text)
+                        ),
                     )
                     if update is not None and not await _send(update):
                         return
@@ -1537,21 +1596,29 @@ class HermesACPAgent(acp.Agent):
 
             if role == "assistant":
                 thought = self._history_reasoning_text(message)
-                if thought and not await _send(self._history_thought_update(thought)):
-                    return
+                if thought:
+                    thought_update = self._history_thought_update(thought)
+                    thought_meta = self._history_record_meta(message, timestamp_only=True)
+                    if thought_meta:
+                        thought_update.field_meta = thought_meta
+                    if not await _send(thought_update):
+                        return
 
                 text = self._history_message_text(message)
                 if text:
                     update = self._history_message_update(
                         role=role,
                         text=text,
-                        field_meta=self._history_summary_meta(message, text),
+                        field_meta=self._history_record_meta(
+                            message, self._history_summary_meta(message, text)
+                        ),
                     )
                     if update is not None and not await _send(update):
                         return
 
                 tool_calls = message.get("tool_calls")
                 if isinstance(tool_calls, list):
+                    call_meta = self._history_record_meta(message, timestamp_only=True)
                     for tool_call in tool_calls:
                         if not isinstance(tool_call, dict):
                             continue
@@ -1560,7 +1627,10 @@ class HermesACPAgent(acp.Agent):
                             continue
                         tool_name, args = self._history_tool_call_name_args(tool_call)
                         active_tool_calls[tool_call_id] = (tool_name, args)
-                        if not await _send(build_tool_start(tool_call_id, tool_name, args)):
+                        start = build_tool_start(tool_call_id, tool_name, args)
+                        if call_meta:
+                            start.field_meta = call_meta
+                        if not await _send(start):
                             return
                 continue
 
@@ -1574,14 +1644,16 @@ class HermesACPAgent(acp.Agent):
                     continue
                 result = message.get("content")
                 result_text = result if isinstance(result, str) else None
-                if not await _send(
-                    build_tool_complete(
-                        tool_call_id,
-                        tool_name,
-                        result=result_text,
-                        function_args=function_args,
-                    )
-                ):
+                complete = build_tool_complete(
+                    tool_call_id,
+                    tool_name,
+                    result=result_text,
+                    function_args=function_args,
+                )
+                result_meta = self._history_record_meta(message, timestamp_only=True)
+                if result_meta:
+                    complete.field_meta = result_meta
+                if not await _send(complete):
                     return
                 if tool_name == "todo":
                     plan_update = _build_plan_update_from_todo_result(result_text)
@@ -1652,9 +1724,7 @@ class HermesACPAgent(acp.Agent):
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                session_id, getattr(state.agent, "session_id", session_id)
-            ),
+            field_meta=self._reopened_session_meta(state),
         )
 
     async def resume_session(
@@ -1688,9 +1758,7 @@ class HermesACPAgent(acp.Agent):
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                state.session_id, getattr(state.agent, "session_id", state.session_id)
-            ),
+            field_meta=self._reopened_session_meta(state),
         )
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:

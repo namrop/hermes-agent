@@ -178,7 +178,8 @@ class TestMcpRegistrationE2E:
         # Completion should contain human-readable output rather than forcing raw JSON panes.
         assert complete_event.content
         assert "hello" in complete_event.content[0].content.text
-        assert complete_event.raw_output is None
+        # The full result rides along in raw_output for clients that keep the record.
+        assert "hello" in complete_event.raw_output
 
     def test_patch_mode_tool_start_defers_diff_to_edit_approval_prompt(self):
         update = build_tool_start(

@@ -358,6 +358,59 @@ class TestListAndFork:
         assert resp.sessions[0].updated_at == "123.0"
 
     @pytest.mark.asyncio
+    async def test_load_replays_what_hermes_stored_about_each_message(self, tmp_path):
+        """The drill-down needs the stored record, not only the rendered chat."""
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="rec-1", source="discord", model="m")
+        db.update_system_prompt("rec-1", "You are Lux.")
+        db.append_message(
+            "rec-1", role="user", content="hello", timestamp=1000.0,
+            api_content="hello\n\n<memory-context>recalled</memory-context>",
+        )
+        db.append_message(
+            "rec-1", role="assistant", content=None, timestamp=1001.0, finish_reason="tool_calls",
+            tool_calls=[{"id": "call-1", "type": "function",
+                         "function": {"name": "terminal", "arguments": '{"command": "ls"}'}}],
+        )
+        big = '{"output": "' + "x" * 20000 + '", "exit_code": 0}'
+        db.append_message(
+            "rec-1", role="tool", content=big, tool_call_id="call-1", tool_name="terminal",
+            timestamp=1002.0,
+        )
+        db.append_message("rec-1", role="assistant", content="done", timestamp=1003.0, finish_reason="stop")
+        server = HermesACPAgent(
+            session_manager=SessionManager(agent_factory=lambda: MagicMock(name="A"), db=db)
+        )
+        conn = MagicMock(spec=acp.Client)
+        conn.session_update = AsyncMock()
+        server._conn = conn
+
+        resp = await server.load_session(cwd="/tmp", session_id="rec-1")
+
+        updates = [c.kwargs["update"] for c in conn.session_update.await_args_list]
+
+        def wire_meta(update):
+            return update.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)["_meta"]["hermes"]
+
+        user = next(u for u in updates if isinstance(u, UserMessageChunk))
+        assert wire_meta(user) == {
+            "timestamp": 1000.0,
+            "apiContent": "hello\n\n<memory-context>recalled</memory-context>",
+        }
+        start = next(u for u in updates if isinstance(u, ToolCallStart))
+        assert start.raw_input == {"command": "ls"}
+        assert wire_meta(start) == {"timestamp": 1001.0}
+        done = next(u for u in updates if isinstance(u, ToolCallProgress))
+        assert done.raw_output == big
+        assert wire_meta(done) == {"timestamp": 1002.0}
+        reply = [u for u in updates if isinstance(u, AgentMessageChunk)][-1]
+        assert wire_meta(reply) == {"timestamp": 1003.0, "finishReason": "stop"}
+        assert resp.field_meta["hermes"]["systemPrompt"] == "You are Lux."
+
+        resumed = await server.resume_session(cwd="/tmp", session_id="rec-1")
+        assert resumed.field_meta["hermes"]["systemPrompt"] == "You are Lux."
+
+    @pytest.mark.asyncio
     async def test_list_sessions_says_where_each_session_started(self, agent):
         with patch.object(
             agent.session_manager,

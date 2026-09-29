@@ -169,7 +169,9 @@ class TestBuildToolStart:
         assert result.title == "navigate: https://x.com"
         assert result.kind == "fetch"
         assert result.content[0].content.text == '{\n  "url": "https://x.com"\n}'
-        assert result.raw_input is None
+        assert result.raw_input == args
+        wire = result.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
+        assert wire["rawInput"] == args
 
 
 
@@ -193,7 +195,16 @@ class TestBuildToolComplete:
         content_item = result.content[0]
         assert isinstance(content_item, ContentToolCallContent)
         assert "total 42" in content_item.content.text
-        assert result.raw_output is None
+        assert result.raw_output == "total 42\ndrwxr-xr-x 2 root root 4096 ..."
+
+    def test_raw_output_is_the_whole_result_when_the_display_is_cut(self):
+        """The drill-down reads raw_output; only the rendered content is shortened."""
+        result_text = '{"output": "' + "x" * 50000 + '", "exit_code": 0}'
+        result = build_tool_complete("tc-long", "terminal", result_text)
+        assert len(result.content[0].content.text) < 10000
+        assert result.raw_output == result_text
+        wire = result.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
+        assert wire["rawOutput"] == result_text
 
 
 
@@ -225,7 +236,7 @@ class TestBuildToolComplete:
         assert "README.md:3" in text
         assert "TODO: fix this" in text
         assert "Results truncated" in text
-        assert result.raw_output is None
+        assert result.raw_output.startswith('{"total_count":2')
 
 
 
@@ -233,18 +244,19 @@ class TestBuildToolComplete:
 
 
 
-    def test_build_tool_complete_generically_formats_unknown_json_dict_without_raw_output(self):
+    def test_build_tool_complete_generically_formats_unknown_json_dict(self):
+        raw = '{"results":[{"id":"obs-1","status":"active","content":"Recall should render as a readable summary."}],"trust":"lower-trust archive evidence"}'
         result = build_tool_complete(
             "tc-recall-search",
             "memory_archive_search",
-            '{"results":[{"id":"obs-1","status":"active","content":"Recall should render as a readable summary."}],"trust":"lower-trust archive evidence"}',
+            raw,
         )
         text = result.content[0].content.text
         assert "memory_archive_search result" in text
         assert "lower-trust archive evidence" in text
         assert "Recall should render as a readable summary" in text
         assert "{\"results\"" not in text
-        assert result.raw_output is None
+        assert result.raw_output == raw
 
 
 

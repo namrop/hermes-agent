@@ -1057,18 +1057,24 @@ def build_tool_start(
     builders, fall back to a minimal, valid start event. Mirrors
     ``get_cute_tool_message`` in ``agent/display.py``, wrapped for the same
     reason on the CLI side.
+
+    ``raw_input`` always carries the full arguments, whatever the rendered
+    content shows, so a client can keep the complete record of the call.
     """
     try:
-        return _build_tool_start(
+        update = _build_tool_start(
             tool_call_id, tool_name, arguments, edit_diff=edit_diff
         )
     except Exception as exc:  # noqa: BLE001 — a tool-call render must never abort the turn
         logger.debug("ACP tool-start render failed for %r: %s", tool_name, exc)
         safe_name = tool_name if isinstance(tool_name, str) and tool_name else "tool"
-        return acp.start_tool_call(
+        update = acp.start_tool_call(
             tool_call_id, safe_name, kind=get_tool_kind(safe_name),
             content=None, locations=[], raw_input=None,
         )
+    if arguments:
+        update.raw_input = arguments
+    return update
 
 
 def _build_tool_start(
@@ -1295,12 +1301,8 @@ def _build_tool_start(
     content = [acp.tool_content(acp.text_block(args_text))]
     return acp.start_tool_call(
         tool_call_id, title, kind=kind, content=content, locations=locations,
-        raw_input=None if tool_name in _POLISHED_TOOLS else arguments,
+        raw_input=arguments,
     )
-
-
-def _is_structured_json_result(result: Optional[str]) -> bool:
-    return isinstance(_json_loads_maybe(result), (dict, list))
 
 
 def build_tool_complete(
@@ -1310,7 +1312,11 @@ def build_tool_complete(
     function_args: Optional[Dict[str, Any]] = None,
     snapshot: Any = None,
 ) -> ToolCallProgress:
-    """Create a ToolCallUpdate (progress) event for a completed tool call."""
+    """Create a ToolCallUpdate (progress) event for a completed tool call.
+
+    ``content`` is the rendered view and may be shortened; ``raw_output`` is
+    always the whole result string, as the model received it.
+    """
     kind = get_tool_kind(tool_name)
     if tool_name == "web_extract":
         error_text = _format_web_extract_result(result)
@@ -1327,7 +1333,7 @@ def build_tool_complete(
         kind=kind,
         status="failed" if _tool_result_failed(result, tool_name) else "completed",
         content=content,
-        raw_output=None if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result) else result,
+        raw_output=result,
     )
 
 
