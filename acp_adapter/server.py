@@ -1767,12 +1767,16 @@ class HermesACPAgent(acp.Agent):
             updated_at = s.get("updated_at")
             if updated_at is not None and not isinstance(updated_at, str):
                 updated_at = str(updated_at)
+            source = s.get("source")
             sessions.append(
                 SessionInfo(
                     session_id=s["session_id"],
                     cwd=s["cwd"],
                     title=s.get("title"),
                     updated_at=updated_at,
+                    # Where the session started (acp, discord, cli, cron...),
+                    # so a client can group or filter the ones it didn't start.
+                    field_meta={"hermes": {"source": source}} if source else None,
                 )
             )
 

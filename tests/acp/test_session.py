@@ -323,13 +323,16 @@ class TestPersistence:
 
 
 
-    def test_only_restores_acp_sessions(self, manager):
-        """get_session should not restore non-ACP sessions from DB."""
+    def test_restores_sessions_started_on_other_platforms(self, manager):
+        """get_session opens a CLI (or Discord, cron...) session, as the CLI's /resume does."""
         db = manager._get_db()
-        # Manually create a CLI session in the DB.
         db.create_session(session_id="cli-session-123", source="cli", model="test")
-        # Should not be found via ACP SessionManager.
-        assert manager.get_session("cli-session-123") is None
+        db.append_message("cli-session-123", role="user", content="from the terminal")
+
+        state = manager.get_session("cli-session-123")
+
+        assert state is not None
+        assert [m["content"] for m in state.history] == ["from the terminal"]
 
     def test_sessions_searchable_via_fts(self, manager):
         """ACP sessions stored in SessionDB are searchable via FTS5."""
@@ -446,3 +449,114 @@ class TestDiscardEmptySessions:
         assert manager.discard_empty_sessions() == 0
 
         assert db.get_session(state.session_id) is not None
+
+    def test_keeps_empty_sessions_this_process_only_opened(self, tmp_path):
+        """Opening someone else's empty session must not delete it on exit."""
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="api-empty", source="api_server", model="m")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        assert manager.update_cwd("api-empty", "/work") is not None
+
+        assert manager.discard_empty_sessions() == 0
+
+        assert db.get_session("api-empty") is not None
+
+
+class TestSessionsStartedElsewhere:
+    """Sessions Hermes started on other platforms open and list over ACP."""
+
+    @staticmethod
+    def _discord_session(db):
+        db.create_session(
+            session_id="discord-1",
+            source="discord",
+            model="claude-opus-5-5",
+            model_config={"max_iterations": 180, "gateway_runtime": {"provider": "zai"}},
+        )
+        db.append_message("discord-1", role="user", content="hello from discord")
+        db.append_message("discord-1", role="assistant", content="hi")
+        return "discord-1"
+
+    def test_lists_sessions_from_every_platform(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        self._discord_session(db)
+        db.create_session(session_id="cli-1", source="cli", model="m")
+        db.append_message("cli-1", role="user", content="from the terminal")
+        db.create_session(session_id="discord-empty", source="discord", model="m")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        acp = manager.create_session(cwd="/work")
+        acp.history.append({"role": "user", "content": "from T3"})
+        manager.save_session(acp.session_id)
+
+        listed = {item["session_id"]: item for item in manager.list_sessions()}
+
+        assert set(listed) == {"discord-1", "cli-1", acp.session_id}
+        assert listed["discord-1"]["source"] == "discord"
+        assert listed["cli-1"]["source"] == "cli"
+        assert listed[acp.session_id]["source"] == "acp"
+
+    def test_opening_one_leaves_its_stored_record_untouched(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        sid = self._discord_session(db)
+        before = [(m["id"], m["timestamp"], m["content"]) for m in db.get_messages(sid)]
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+
+        state = manager.update_cwd(sid, "/work")
+
+        assert state is not None
+        assert [m["content"] for m in state.history] == ["hello from discord", "hi"]
+        after = [(m["id"], m["timestamp"], m["content"]) for m in db.get_messages(sid)]
+        assert after == before
+        row = db.get_session(sid)
+        assert row["source"] == "discord"
+        model_config = json.loads(row["model_config"])
+        assert model_config["max_iterations"] == 180
+        assert model_config["gateway_runtime"] == {"provider": "zai"}
+
+    def test_saving_one_never_rewrites_its_stored_messages(self, tmp_path):
+        """/reset or /compress over ACP must not delete another platform's transcript."""
+        db = SessionDB(tmp_path / "state.db")
+        sid = self._discord_session(db)
+        before = [(m["id"], m["content"]) for m in db.get_messages(sid)]
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.update_cwd(sid, "/work")
+        assert state is not None
+
+        state.history.clear()
+        manager.save_session(sid)
+
+        assert [(m["id"], m["content"]) for m in db.get_messages(sid)] == before
+
+    def test_opening_one_uses_the_current_default_model(self, tmp_path):
+        """Like the CLI's /resume: the stored model/provider pair may be a fallback's."""
+        db = SessionDB(tmp_path / "state.db")
+        sid = self._discord_session(db)
+        calls = []
+
+        def factory(**kwargs):
+            calls.append(kwargs)
+            return _mock_agent()
+
+        manager = SessionManager(agent_factory=None, db=db)
+        manager._make_agent = factory  # type: ignore[method-assign]
+
+        assert manager.update_cwd(sid, "/work") is not None
+
+        assert calls[0]["model"] is None
+        assert calls[0]["requested_provider"] is None
+
+    def test_reopening_an_acp_session_does_not_rewrite_its_messages(self, tmp_path):
+        """Loading after a restart used to delete and re-insert every live row."""
+        db = SessionDB(tmp_path / "state.db")
+        first = SessionManager(agent_factory=_mock_agent, db=db)
+        state = first.create_session(cwd="/work")
+        state.history.append({"role": "user", "content": "hello"})
+        state.history.append({"role": "assistant", "content": "hi"})
+        first.save_session(state.session_id)
+        before = [(m["id"], m["timestamp"]) for m in db.get_messages(state.session_id)]
+
+        restarted = SessionManager(agent_factory=_mock_agent, db=db)
+        assert restarted.update_cwd(state.session_id, "/elsewhere") is not None
+
+        assert [(m["id"], m["timestamp"]) for m in db.get_messages(state.session_id)] == before
+        assert json.loads(db.get_session(state.session_id)["model_config"])["cwd"] == "/elsewhere"

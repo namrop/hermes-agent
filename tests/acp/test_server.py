@@ -357,6 +357,21 @@ class TestListAndFork:
         assert resp.sessions[0].title == "Fix Zed session history"
         assert resp.sessions[0].updated_at == "123.0"
 
+    @pytest.mark.asyncio
+    async def test_list_sessions_says_where_each_session_started(self, agent):
+        with patch.object(
+            agent.session_manager,
+            "list_sessions",
+            return_value=[
+                {"session_id": "d-1", "cwd": ".", "title": "t", "updated_at": 1.0, "source": "discord"},
+                {"session_id": "a-1", "cwd": "/w", "title": "t", "updated_at": 2.0, "source": "acp"},
+            ],
+        ):
+            resp = await agent.list_sessions()
+
+        dumped = [s.model_dump(by_alias=True, exclude_none=True) for s in resp.sessions]
+        assert [d["_meta"]["hermes"]["source"] for d in dumped] == ["discord", "acp"]
+
 
 
 

@@ -166,6 +166,23 @@ def _clear_task_cwd(task_id: str) -> None:
         logger.debug("Failed to clear ACP task cwd override", exc_info=True)
 
 
+def _stored_session_cwd(row: Dict[str, Any]) -> str:
+    """Working directory of a stored session.
+
+    ACP keeps it in ``model_config`` JSON; the CLI in the ``cwd`` column;
+    gateway and cron sessions have none (``"."``).
+    """
+    mc = row.get("model_config")
+    if mc:
+        try:
+            meta = json.loads(mc)
+            if isinstance(meta, dict) and meta.get("cwd"):
+                return str(meta["cwd"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return str(row.get("cwd") or ".")
+
+
 @dataclass
 class SessionState:
     """Tracks per-session state for an ACP-managed Hermes agent."""
@@ -181,6 +198,14 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    # Platform that started the session ("acp", "discord", "cli", "cron"...).
+    # Sessions started elsewhere open over ACP like the CLI's /resume, but
+    # their stored transcript and metadata stay theirs: new turns reach the DB
+    # only through the agent's own appends, never through a rewrite here.
+    source: str = "acp"
+    # True only for sessions this process created (session/new, fork). Only
+    # those are candidates for the never-used cleanup on exit.
+    created_here: bool = False
 
 
 class SessionManager:
@@ -220,6 +245,7 @@ class SessionManager:
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
             cancel_event=threading.Event(),
+            created_here=True,
         )
         with self._lock:
             self._sessions[session_id] = state
@@ -272,6 +298,7 @@ class SessionManager:
             model=getattr(agent, "model", original.model) or original.model,
             history=copy.deepcopy(original.history),
             cancel_event=threading.Event(),
+            created_here=True,
         )
         with self._lock:
             self._sessions[new_id] = state
@@ -281,17 +308,25 @@ class SessionManager:
         return state
 
     def list_sessions(self, cwd: str | None = None) -> List[Dict[str, Any]]:
-        """Return lightweight info dicts for all sessions (memory + database)."""
+        """Return lightweight info dicts for all sessions (memory + database).
+
+        Lists sessions from every platform that have messages, not only the
+        ones ACP started; each entry carries its ``source``. Hidden and child
+        sessions (subagent runs, compression continuations) stay out, as in
+        every other session list.
+        """
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
         db = self._get_db()
         persisted_rows: dict[str, dict[str, Any]] = {}
 
         if db is not None:
             try:
-                for row in db.list_sessions_rich(source="acp", limit=1000):
+                for row in db.list_sessions_rich(
+                    limit=1000, min_message_count=1, order_by_last_active=True
+                ):
                     persisted_rows[str(row["id"])] = dict(row)
             except Exception:
-                logger.debug("Failed to load ACP sessions from DB", exc_info=True)
+                logger.debug("Failed to load sessions from DB", exc_info=True)
 
         # Collect in-memory sessions first.
         with self._lock:
@@ -322,6 +357,7 @@ class SessionManager:
                         "updated_at": _format_updated_at(
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
                         ),
+                        "source": s.source,
                     }
                 )
 
@@ -332,14 +368,7 @@ class SessionManager:
             message_count = int(row.get("message_count") or 0)
             if message_count <= 0:
                 continue
-            # Extract cwd from model_config JSON.
-            session_cwd = "."
-            mc = row.get("model_config")
-            if mc:
-                try:
-                    session_cwd = json.loads(mc).get("cwd", ".")
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            session_cwd = _stored_session_cwd(row)
             if normalized_cwd and _normalize_cwd_for_compare(session_cwd) != normalized_cwd:
                 continue
             results.append({
@@ -349,20 +378,27 @@ class SessionManager:
                 "history_len": message_count,
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
+                "source": row.get("source") or "acp",
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
         return results
 
     def update_cwd(self, session_id: str, cwd: str) -> Optional[SessionState]:
-        """Update the working directory for a session and its tool overrides."""
+        """Update the working directory for a session and its tool overrides.
+
+        Only the session's metadata is written. The transcript is already in
+        the DB (this is how session/load and session/resume open a session),
+        and rewriting it would give every message a new row id and drop the
+        columns the in-memory history does not carry.
+        """
         cwd = _translate_acp_cwd(cwd)
         state = self.get_session(session_id)  # checks DB too
         if state is None:
             return None
         state.cwd = cwd
         _register_task_cwd(session_id, cwd)
-        self._persist(state)
+        self._persist(state, messages=False)
         return state
 
     def cleanup(self) -> None:
@@ -412,7 +448,11 @@ class SessionManager:
         if db is None:
             return 0
         with self._lock:
-            candidates = [sid for sid, state in self._sessions.items() if not state.history]
+            candidates = [
+                sid
+                for sid, state in self._sessions.items()
+                if state.created_here and not state.history
+            ]
         removed = 0
         for session_id in candidates:
             try:
@@ -448,12 +488,19 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> None:
+    def _persist(self, state: SessionState, *, messages: bool = True) -> None:
         """Write session state to the database.
 
         Creates the session record if it doesn't exist, then replaces all
-        stored messages with the current in-memory history.
+        stored messages with the current in-memory history (unless
+        ``messages`` is False, or the agent persists them itself).
+
+        A session another platform started is never written here: its row
+        and transcript belong to that platform, and turns taken over ACP are
+        appended by the agent itself.
         """
+        if state.source != "acp":
+            return
         db = self._get_db()
         if db is None:
             return
@@ -488,6 +535,9 @@ class SessionManager:
                     db.update_session_meta(state.session_id, cwd_json, model_str)
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
+
+            if not messages:
+                return
 
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during
@@ -535,7 +585,15 @@ class SessionManager:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
-        """Load a session from the database into memory, recreating the AIAgent."""
+        """Load a session from the database into memory, recreating the AIAgent.
+
+        Any platform's session can be opened, as the CLI's /resume allows. An
+        ACP session gets back the model and provider it last ran on. A session
+        started elsewhere runs on the current default model and fallback
+        chain instead: its stored model/provider pair records what served it
+        last, which may have been a fallback, and the gateway keeps its
+        runtime in a different shape.
+        """
         import threading
 
         db = self._get_db()
@@ -551,28 +609,26 @@ class SessionManager:
         if row is None:
             return None
 
-        # Only restore ACP sessions.
-        if row.get("source") != "acp":
-            return None
-
-        # Extract cwd from model_config.
-        cwd = "."
-        requested_provider = row.get("billing_provider")
-        restored_base_url = row.get("billing_base_url")
+        source = str(row.get("source") or "acp")
+        cwd = _stored_session_cwd(row)
+        model = None
+        requested_provider = None
+        restored_base_url = None
         restored_api_mode = None
-        mc = row.get("model_config")
-        if mc:
-            try:
-                meta = json.loads(mc)
-                if isinstance(meta, dict):
-                    cwd = meta.get("cwd", ".")
-                    requested_provider = meta.get("provider") or requested_provider
-                    restored_base_url = meta.get("base_url") or restored_base_url
-                    restored_api_mode = meta.get("api_mode") or restored_api_mode
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        model = row.get("model") or None
+        if source == "acp":
+            requested_provider = row.get("billing_provider")
+            restored_base_url = row.get("billing_base_url")
+            mc = row.get("model_config")
+            if mc:
+                try:
+                    meta = json.loads(mc)
+                    if isinstance(meta, dict):
+                        requested_provider = meta.get("provider") or requested_provider
+                        restored_base_url = meta.get("base_url") or restored_base_url
+                        restored_api_mode = meta.get("api_mode") or restored_api_mode
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            model = row.get("model") or None
 
         # Load conversation history. repair_alternation: this restore feeds
         # LIVE REPLAY — the loaded list becomes the resumed agent's working
@@ -607,11 +663,14 @@ class SessionManager:
             model=model or getattr(agent, "model", "") or "",
             history=history,
             cancel_event=threading.Event(),
+            source=source,
         )
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
-        logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
+        logger.info(
+            "Restored %s session %s from DB (%d messages)", source, session_id, len(history)
+        )
         return state
 
     def _delete_persisted(self, session_id: str) -> bool:
