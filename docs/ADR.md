@@ -13,6 +13,11 @@ Decision:
 
 Consequences: clients that ignore `_meta` see what they saw before, plus one extra tool call per child. T3 Code's Hermes adapter reads the tool name to choose icons and labels and turns child records into its Agents panel.
 
+Follow-up (same day, found in a T3 browser test against this branch):
+- A completion's arguments are now decoded. The agent loop's step callback hands them over as the model's JSON string, which reached clients as a string and replaced the start's arguments, so T3 labelled a file search "Searched code" and two subagents "Started a subagent".
+- A child keeps the `delegate_task` call it started under. The step callback completes `delegate_task` before its children start, which emptied the queue the parent id was read from, so children went out without `parentToolCallId`. The last started `delegate_task` call is now kept outside that queue, and each child's parent is fixed at its first record.
+- Replayed tool calls keep `toolName` next to the replay record's `timestamp`; the replay record used to replace the whole `_meta`.
+
 ## 2026-10-01: ACP audio prompts are transcribed like gateway voice notes
 
 Status: Accepted — source implementation (branch `luis/acp-audio-prompts-20261001`); not deployed when written.

@@ -19,6 +19,7 @@ from acp.schema import AgentPlanUpdate, PlanEntry
 from .tools import (
     build_tool_complete,
     build_tool_start,
+    coerce_tool_arguments,
     make_tool_call_id,
 )
 
@@ -135,6 +136,12 @@ def make_tool_progress_cb(
 
     subagent_call_ids: Dict[str, str] = {}
     subagent_goals: Dict[str, str] = {}
+    # The delegate_task call each child belongs to, fixed when the child starts.
+    # delegate_task can return before its children start (background
+    # delegation), and its completion empties the per-name queue, so the last
+    # started delegate_task call is also kept where completion does not clear it.
+    subagent_parent_call_ids: Dict[str, str] = {}
+    last_delegate_call_id: list[str | None] = [None]
 
     def _latest_tool_call_id(name: str) -> str | None:
         queue = tool_call_ids.get(name)
@@ -165,11 +172,15 @@ def make_tool_progress_cb(
         parent_id = parent_id if isinstance(parent_id, str) and parent_id else None
         # Child-of-child tasks already carry parentAgentId; their parent is a
         # synthetic child call, not a visible top-level delegate tool call.
-        parent_tool_call_id = (
-            subagent_call_ids.get(parent_id)
-            if parent_id is not None
-            else _latest_tool_call_id("delegate_task")
-        )
+        parent_tool_call_id = subagent_parent_call_ids.get(subagent_id)
+        if parent_tool_call_id is None:
+            parent_tool_call_id = (
+                subagent_call_ids.get(parent_id)
+                if parent_id is not None
+                else _latest_tool_call_id("delegate_task") or last_delegate_call_id[0]
+            )
+            if parent_tool_call_id is not None:
+                subagent_parent_call_ids[subagent_id] = parent_tool_call_id
 
         if event_type == "subagent.complete":
             reported_status = str(kwargs.get("status") or "completed").lower()
@@ -282,6 +293,8 @@ def make_tool_progress_cb(
             queue = deque([queue])
             tool_call_ids[name] = queue
         queue.append(tc_id)
+        if name == "delegate_task":
+            last_delegate_call_id[0] = tc_id
 
         snapshot = None
         if name in {"write_file", "patch", "skill_manage"}:
@@ -375,7 +388,8 @@ def make_step_cb(
                         tc_id,
                         tool_name,
                         result=str(result) if result is not None else None,
-                        function_args=function_args or meta.get("args"),
+                        function_args=coerce_tool_arguments(function_args)
+                        or meta.get("args"),
                         snapshot=meta.get("snapshot"),
                     )
                     _send_update(conn, session_id, loop, update)

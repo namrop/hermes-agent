@@ -211,6 +211,18 @@ def _json_loads_maybe(value: Optional[str]) -> Any:
         return None
 
 
+def coerce_tool_arguments(value: Any) -> Optional[Dict[str, Any]]:
+    """Tool arguments as a dict, or None.
+
+    The agent loop's step callback hands over the model's arguments as the JSON
+    string the API returned; clients need the decoded object, and a string here
+    would replace the arguments the start event carried.
+    """
+    if isinstance(value, str):
+        value = _json_loads_maybe(value)
+    return value if isinstance(value, dict) else None
+
+
 def _tool_result_failed(result: Optional[str], tool_name: str | None = None) -> bool:
     """Return True when a structured Hermes tool result clearly failed.
 
@@ -1310,7 +1322,7 @@ def build_tool_complete(
     tool_call_id: str,
     tool_name: str,
     result: Optional[str] = None,
-    function_args: Optional[Dict[str, Any]] = None,
+    function_args: Optional[Dict[str, Any] | str] = None,
     snapshot: Any = None,
 ) -> ToolCallProgress:
     """Create a ToolCallUpdate (progress) event for a completed tool call.
@@ -1318,6 +1330,7 @@ def build_tool_complete(
     ``content`` is the rendered view and may be shortened; ``raw_output`` is
     always the whole result string, as the model received it.
     """
+    function_args = coerce_tool_arguments(function_args)
     kind = get_tool_kind(tool_name)
     if tool_name == "web_extract":
         error_text = _format_web_extract_result(result)

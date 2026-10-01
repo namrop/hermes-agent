@@ -1645,7 +1645,6 @@ class HermesACPAgent(acp.Agent):
 
                 tool_calls = message.get("tool_calls")
                 if isinstance(tool_calls, list):
-                    call_meta = self._history_record_meta(message, timestamp_only=True)
                     for tool_call in tool_calls:
                         if not isinstance(tool_call, dict):
                             continue
@@ -1655,8 +1654,10 @@ class HermesACPAgent(acp.Agent):
                         tool_name, args = self._history_tool_call_name_args(tool_call)
                         active_tool_calls[tool_call_id] = (tool_name, args)
                         start = build_tool_start(tool_call_id, tool_name, args)
-                        if call_meta:
-                            start.field_meta = call_meta
+                        # The replay record joins the tool's own identity under _meta.hermes.
+                        start.field_meta = self._history_record_meta(
+                            message, start.field_meta, timestamp_only=True
+                        )
                         if not await _send(start):
                             return
                 continue
@@ -1677,9 +1678,9 @@ class HermesACPAgent(acp.Agent):
                     result=result_text,
                     function_args=function_args,
                 )
-                result_meta = self._history_record_meta(message, timestamp_only=True)
-                if result_meta:
-                    complete.field_meta = result_meta
+                complete.field_meta = self._history_record_meta(
+                    message, complete.field_meta, timestamp_only=True
+                )
                 if not await _send(complete):
                     return
                 if tool_name == "todo":

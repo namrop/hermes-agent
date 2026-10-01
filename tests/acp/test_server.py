@@ -400,10 +400,11 @@ class TestListAndFork:
         }
         start = next(u for u in updates if isinstance(u, ToolCallStart))
         assert start.raw_input == {"command": "ls"}
-        assert wire_meta(start) == {"timestamp": 1001.0}
+        # The replay record sits next to the tool's identity, not in place of it.
+        assert wire_meta(start) == {"timestamp": 1001.0, "toolName": "terminal"}
         done = next(u for u in updates if isinstance(u, ToolCallProgress))
         assert done.raw_output == big
-        assert wire_meta(done) == {"timestamp": 1002.0}
+        assert wire_meta(done) == {"timestamp": 1002.0, "toolName": "terminal"}
         reply = [u for u in updates if isinstance(u, AgentMessageChunk)][-1]
         assert wire_meta(reply) == {"timestamp": 1003.0, "finishReason": "stop"}
         assert resp.field_meta["hermes"]["systemPrompt"] == "You are Lux."

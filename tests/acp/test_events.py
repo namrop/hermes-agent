@@ -168,6 +168,45 @@ class TestToolProgressCallback:
         assert updates[0].field_meta["hermes"]["subagent"]["parentToolCallId"] == "parent-call"
         assert updates[-1].raw_output == "Found the metadata boundary"
 
+    def test_children_of_a_delegate_call_that_already_returned_keep_its_id(
+        self, mock_conn, event_loop_fixture
+    ):
+        """Background delegation: delegate_task completes before its children start."""
+        tool_call_ids: dict = {}
+        tool_call_meta: dict = {}
+        progress_cb = make_tool_progress_cb(
+            mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+        step_cb = make_step_cb(mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta)
+        child = dict(parent_id=None, depth=1, goal="Reply with mango", task_index=0)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            progress_cb("tool.started", "delegate_task", None, {"goal": "Reply with mango"})
+            delegate_call_id = mock_send.call_args_list[-1].args[3].tool_call_id
+            # The step callback completes the call, emptying the delegate_task queue.
+            step_cb(1, [{"name": "delegate_task", "result": '{"status": "dispatched"}'}])
+            assert "delegate_task" not in tool_call_ids
+            progress_cb("subagent.start", "delegate_task", "Reply with mango", {}, subagent_id="c-1", **child)
+            # A later delegate call must not take over a running child.
+            progress_cb("tool.started", "delegate_task", None, {"goal": "Other"})
+            progress_cb(
+                "subagent.complete", "delegate_task", "mango", {},
+                subagent_id="c-1", status="completed", summary="mango", **child,
+            )
+
+        children = [
+            call.args[3]
+            for call in mock_send.call_args_list
+            if (call.args[3].field_meta or {}).get("hermes", {}).get("subagent")
+        ]
+        assert [c.field_meta["hermes"]["subagent"]["event"] for c in children] == [
+            "started",
+            "completed",
+        ]
+        assert {c.field_meta["hermes"]["subagent"]["parentToolCallId"] for c in children} == {
+            delegate_call_id
+        }
+
 
 # ---------------------------------------------------------------------------
 # Thinking callback

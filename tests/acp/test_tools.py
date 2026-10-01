@@ -286,6 +286,20 @@ class TestHermesToolIdentityMetadata:
         start_wire = start.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
         assert start_wire["_meta"] == {"hermes": {"toolName": "browser_exec"}}
 
+    def test_completion_decodes_arguments_the_agent_loop_passes_as_json(self):
+        # The step callback hands over the model's arguments as the API's JSON string.
+        complete = build_tool_complete(
+            "tc-search",
+            "search_files",
+            '{"total_count": 0}',
+            function_args='{"pattern": "pineapple", "target": "files", "path": "/tmp"}',
+        )
+        assert complete.raw_input == {"pattern": "pineapple", "target": "files", "path": "/tmp"}
+        assert complete.title == "search: pineapple"
+
+        unreadable = build_tool_complete("tc-x", "search_files", "{}", function_args="not json")
+        assert unreadable.raw_input is None
+
 
 # ---------------------------------------------------------------------------
 # extract_locations
