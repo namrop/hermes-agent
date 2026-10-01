@@ -295,6 +295,10 @@ def _resolve_review_runtime(
         parent_api_mode = "codex_responses"
     parent = {
         "provider": agent.provider,
+        # The parent's requested named provider travels with an unrouted fork
+        # so its usage record can name a shared custom endpoint (keeper msg
+        # 1555093184839942206). Accounting only; transport is unchanged.
+        "requested_provider": getattr(agent, "requested_provider", None) or None,
         "model": agent.model,
         "api_key": parent_runtime.get("api_key") or None,
         "base_url": parent_runtime.get("base_url") or None,
@@ -325,6 +329,7 @@ def _resolve_review_runtime(
         )
         return {
             "provider": rp.get("provider") or task_provider,
+            "requested_provider": rp.get("requested_provider") or task_provider,
             "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
@@ -1089,6 +1094,7 @@ def _snapshot_review_usage(review_agent: Any) -> Dict[str, Any]:
     return {
         "model": getattr(review_agent, "model", None),
         "provider": getattr(review_agent, "provider", None),
+        "requested_provider": getattr(review_agent, "requested_provider", None),
         "base_url": getattr(review_agent, "base_url", None),
         "api_mode": getattr(review_agent, "api_mode", None),
         "input_tokens": int(getattr(review_agent, "session_input_tokens", 0) or 0),
@@ -1156,6 +1162,7 @@ def _record_review_usage_to_parent(
             model=usage.get("model"),
             billing_provider=usage.get("provider"),
             billing_base_url=usage.get("base_url"),
+            billing_requested_provider=usage.get("requested_provider"),
             api_mode=usage.get("api_mode"),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -1395,6 +1402,7 @@ def _run_review_in_thread(
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
+                requested_provider=_rt.get("requested_provider") or None,
                 api_mode=_rt.get("api_mode"),
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,

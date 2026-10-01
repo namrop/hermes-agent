@@ -7298,6 +7298,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Never coalesce already-qualified (including unresolved) labels with
         # deltas that still need accounting-time route resolution.
         "_billing_provider_resolved",
+        # Consumed by queue_token_counts before enqueue (resolved into
+        # billing_provider in the caller's profile), so queued deltas never
+        # carry it; classified here because update_token_counts accepts it.
+        "billing_requested_provider",
         # Usage contract v2: each response id is its own route, so deltas
         # carrying distinct ids never merge (one event per physical request).
         # Id-less deltas (None == None) still coalesce as before.
@@ -7317,9 +7321,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # unresolved label must not be reinterpreted under the writer's home.
         from agent.usage_route import qualify_usage_provider
 
+        requested_provider = kwargs.pop("billing_requested_provider", None)
         if kwargs.get("billing_provider") == "custom":
             kwargs["billing_provider"] = qualify_usage_provider(
-                kwargs.get("billing_provider"), kwargs.get("billing_base_url")
+                kwargs.get("billing_provider"),
+                kwargs.get("billing_base_url"),
+                requested_provider,
             )
             kwargs["_billing_provider_resolved"] = True
         with self._token_queue_cond:
@@ -7584,6 +7591,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         api_call_count: int = 0,
         absolute: bool = False,
         _billing_provider_resolved: bool = False,
+        billing_requested_provider: Optional[str] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -7599,6 +7607,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         substitution-detection signal), NULL when no echo was in scope at
         the call site — never defaulted from the requested ``model``.
 
+        ``billing_requested_provider`` is the provider the caller asked for
+        (``agent.requested_provider``). It is not stored anywhere; it only
+        lets a bare ``custom`` label resolve to the requested named provider
+        when that provider's endpoint is the endpoint recorded here.
+
         When *absolute* is False (default), values are **incremented** — use
         this for per-API-call deltas (CLI path).
 
@@ -7609,7 +7622,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not _billing_provider_resolved:
             from agent.usage_route import qualify_usage_provider
 
-            billing_provider = qualify_usage_provider(billing_provider, billing_base_url)
+            billing_provider = qualify_usage_provider(
+                billing_provider, billing_base_url, billing_requested_provider
+            )
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
@@ -7922,6 +7937,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
         api_call_count: int = 1,
+        billing_requested_provider: Optional[str] = None,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
@@ -7946,7 +7962,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
         from agent.usage_route import qualify_usage_provider
 
-        billing_provider = qualify_usage_provider(billing_provider, billing_base_url)
+        billing_provider = qualify_usage_provider(
+            billing_provider, billing_base_url, billing_requested_provider
+        )
         # FK on session_model_usage.session_id → sessions.id: ensure the row
         # exists (same INSERT OR IGNORE guard update_token_counts uses — the
         # initial create_session() can fail under concurrent SQLite locking).

@@ -4299,6 +4299,13 @@ def run_conversation(
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
+                                # The named provider this run was asked for;
+                                # lets a bare ``custom`` label resolve on a
+                                # shared endpoint (keeper msg
+                                # 1555093184839942206). Not stored itself.
+                                billing_requested_provider=(
+                                    getattr(agent, "requested_provider", None) or None
+                                ),
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
                                 api_mode=agent.api_mode,
