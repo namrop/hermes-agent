@@ -4889,6 +4889,8 @@ def _retry_same_provider_sync(
             api_mode=resolved_api_mode,
         ),
         task,
+        provider=effective_provider or resolved_provider,
+        base_url=retry_base or resolved_base_url,
     )
 
 
@@ -4963,6 +4965,8 @@ async def _retry_same_provider_async(
             api_mode=resolved_api_mode,
         ),
         task,
+        provider=effective_provider or resolved_provider,
+        base_url=retry_base or resolved_base_url,
     )
 
 
@@ -5296,6 +5300,8 @@ def _call_fallback_candidate_sync(
                 api_mode=destination.api_mode,
             ),
             task,
+            provider=destination.provider,
+            base_url=destination.base_url,
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
@@ -5341,6 +5347,8 @@ def _call_fallback_candidate_sync(
                             api_mode=retry_destination.api_mode,
                         ),
                         task,
+                        provider=retry_destination.provider,
+                        base_url=retry_destination.base_url,
                     )
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
@@ -5402,6 +5410,8 @@ async def _call_fallback_candidate_async(
                 api_mode=destination.api_mode,
             ),
             task,
+            provider=destination.provider,
+            base_url=destination.base_url,
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
@@ -5448,6 +5458,8 @@ async def _call_fallback_candidate_async(
                             api_mode=retry_destination.api_mode,
                         ),
                         task,
+                        provider=retry_destination.provider,
+                        base_url=retry_destination.base_url,
                     )
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
@@ -8903,6 +8915,12 @@ def _build_call_kwargs(
     )
 
 
+def _client_base_url(client: Any, default: Optional[str]) -> str:
+    """Base URL a client actually targets, else *default*. Accounting only:
+    lets retry and fallback responses record the route that served them."""
+    return str(getattr(client, "base_url", "") or "") or str(default or "")
+
+
 def _validate_llm_response(
     response: Any,
     task: Optional[str] = None,
@@ -8921,9 +8939,11 @@ def _validate_llm_response(
     successful non-streaming aux response passes through here exactly once,
     so token usage is recorded against the ambient session context published
     by the agent loop (``agent.aux_accounting``, issue #23270). Recording is
-    best-effort and never affects validation. *provider*/*base_url* are
-    optional accounting hints — fallback-path calls omit them and the row
-    keeps the model (read from the response itself) with an empty route.
+    best-effort and never affects validation. *provider*/*base_url* name the
+    route that served this response. Every call site passes them, including
+    same-provider retries and fallback-chain hops (keeper Discord #gateway
+    msg 1555103642531397743); a row with an empty route cannot be priced or
+    attributed.
     """
     if response is None:
         raise RuntimeError(
@@ -9764,7 +9784,10 @@ def _call_llm_impl(
                                 ),
                             ),
                         ),
-                        task)
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(client, _base_info or resolved_base_url),
+                    )
                 except Exception as retry_transient:
                     if not _is_transient_transport_error(retry_transient):
                         raise
@@ -9786,7 +9809,11 @@ def _call_llm_impl(
                         retry_kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
-                    ), task)
+                    ),
+                    task,
+                    provider=request_provider,
+                    base_url=_client_base_url(client, _base_info or resolved_base_url),
+                )
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -9820,7 +9847,11 @@ def _call_llm_impl(
                             retry_kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(client, _base_info or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     # Same contract as the temperature rung: fall through to
                     # the max_tokens / payment / auth chains below with the
@@ -9862,7 +9893,11 @@ def _call_llm_impl(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
-                    ), task)
+                    ),
+                    task,
+                    provider=request_provider,
+                    base_url=_client_base_url(client, _base_info or resolved_base_url),
+                )
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -9897,7 +9932,11 @@ def _call_llm_impl(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(client, _base_info or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -9935,7 +9974,11 @@ def _call_llm_impl(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(refreshed_client, _base_info or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -9968,7 +10011,11 @@ def _call_llm_impl(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
-                    ), task)
+                    ),
+                    task,
+                    provider=request_provider,
+                    base_url=_client_base_url(refreshed_client, _base_info or resolved_base_url),
+                )
 
         # ── Auth refresh retry ───────────────────────────────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
@@ -10023,7 +10070,11 @@ def _call_llm_impl(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(client, _base_info or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -10512,7 +10563,10 @@ async def _async_call_llm_impl(
                     api_mode=resolved_api_mode,
                     create=_acreate,
                 ),
-                task)
+                task,
+                provider=request_provider,
+                base_url=_client_base_url(client, _client_base or resolved_base_url),
+            )
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -10528,7 +10582,11 @@ async def _async_call_llm_impl(
                         retry_kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
-                    ), task)
+                    ),
+                    task,
+                    provider=request_provider,
+                    base_url=_client_base_url(client, _client_base or resolved_base_url),
+                )
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 if not (
@@ -10559,7 +10617,11 @@ async def _async_call_llm_impl(
                             retry_kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(client, _client_base or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     # Same contract as the temperature rung: fall through to
                     # the max_tokens / payment / auth chains below with the
@@ -10601,7 +10663,11 @@ async def _async_call_llm_impl(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
-                    ), task)
+                    ),
+                    task,
+                    provider=request_provider,
+                    base_url=_client_base_url(client, _client_base or resolved_base_url),
+                )
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -10635,7 +10701,11 @@ async def _async_call_llm_impl(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(client, _client_base or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -10672,7 +10742,11 @@ async def _async_call_llm_impl(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(refreshed_client, _client_base or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -10704,7 +10778,11 @@ async def _async_call_llm_impl(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
-                    ), task)
+                    ),
+                    task,
+                    provider=request_provider,
+                    base_url=_client_base_url(refreshed_client, _client_base or resolved_base_url),
+                )
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
@@ -10753,7 +10831,11 @@ async def _async_call_llm_impl(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
-                        ), task)
+                        ),
+                        task,
+                        provider=request_provider,
+                        base_url=_client_base_url(client, _client_base or resolved_base_url),
+                    )
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
