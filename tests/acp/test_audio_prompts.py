@@ -322,6 +322,8 @@ async def test_agent_receives_the_transcript_and_the_client_sees_it(agent, mock_
     assert len(echoes) == 1
     assert echoes[0].status == "completed"
     assert echoes[0].content[0].content.text == '🎙️ "voice says hello"'
+    assert echoes[0].field_meta == {"hermes": {"toolName": "voice_note_transcript"}}
+    assert echoes[0].raw_output == "voice says hello"
 
 
 @pytest.mark.asyncio

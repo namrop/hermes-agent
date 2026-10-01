@@ -127,12 +127,142 @@ def make_tool_progress_cb(
 
     Emits ``ToolCallStart`` for ``tool.started`` events and tracks IDs in a FIFO
     queue per tool name so duplicate/parallel same-name calls still complete
-    against the correct ACP tool call.  Other event types (``tool.completed``,
-    ``reasoning.available``) are silently ignored.
+    against the correct ACP tool call. Delegated child lifecycle events are
+    sent as metadata-bearing ACP tool updates so IDE clients can show them as
+    native agents. Other event types (``tool.completed``, ``reasoning.available``)
+    are silently ignored.
     """
 
+    subagent_call_ids: Dict[str, str] = {}
+    subagent_goals: Dict[str, str] = {}
+
+    def _latest_tool_call_id(name: str) -> str | None:
+        queue = tool_call_ids.get(name)
+        if isinstance(queue, str):
+            return queue
+        return queue[-1] if queue else None
+
+    def _subagent_update(event_type: str, name: str, preview: str, kwargs: Dict[str, Any]) -> None:
+        subagent_id = kwargs.get("subagent_id")
+        if not isinstance(subagent_id, str) or not subagent_id:
+            return
+
+        if event_type == "subagent.start":
+            tool_call_id = make_tool_call_id()
+            subagent_call_ids[subagent_id] = tool_call_id
+        else:
+            tool_call_id = subagent_call_ids.get(subagent_id)
+            if tool_call_id is None:
+                return
+
+        goal_value = kwargs.get("goal") or subagent_goals.get(subagent_id) or preview
+        goal = goal_value.strip() if isinstance(goal_value, str) else ""
+        if goal:
+            subagent_goals[subagent_id] = goal
+        goal = goal or "Delegated task"
+
+        parent_id = kwargs.get("parent_id")
+        parent_id = parent_id if isinstance(parent_id, str) and parent_id else None
+        # Child-of-child tasks already carry parentAgentId; their parent is a
+        # synthetic child call, not a visible top-level delegate tool call.
+        parent_tool_call_id = (
+            subagent_call_ids.get(parent_id)
+            if parent_id is not None
+            else _latest_tool_call_id("delegate_task")
+        )
+
+        if event_type == "subagent.complete":
+            reported_status = str(kwargs.get("status") or "completed").lower()
+            if reported_status in {"completed", "complete", "success", "succeeded", "done"}:
+                task_status = "completed"
+                acp_status = "completed"
+            elif reported_status in {"cancelled", "canceled", "stopped", "interrupted"}:
+                task_status = "stopped"
+                acp_status = "failed"
+            else:
+                task_status = "failed"
+                acp_status = "failed"
+            summary_value = kwargs.get("summary") or preview
+            summary = summary_value if isinstance(summary_value, str) else ""
+            lifecycle_event = "completed"
+        elif event_type == "subagent.start":
+            task_status = "running"
+            acp_status = "in_progress"
+            summary = ""
+            lifecycle_event = "started"
+        else:
+            task_status = "running"
+            acp_status = "in_progress"
+            summary = preview if isinstance(preview, str) else ""
+            lifecycle_event = "progress"
+
+        child: Dict[str, Any] = {
+            "event": lifecycle_event,
+            "id": subagent_id,
+            "goal": goal,
+            "status": task_status,
+        }
+        optional_fields = {
+            "parentId": parent_id,
+            "model": kwargs.get("model"),
+            "role": kwargs.get("role"),
+            "childSessionId": kwargs.get("child_session_id"),
+            "lastToolName": name if event_type == "subagent.tool" else None,
+        }
+        for key, value in optional_fields.items():
+            if isinstance(value, str) and value:
+                child[key] = value
+        for key, source_key in (("depth", "depth"), ("taskIndex", "task_index"), ("taskCount", "task_count"), ("toolCount", "tool_count")):
+            value = kwargs.get(source_key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                child[key] = value
+        toolsets = kwargs.get("toolsets")
+        if isinstance(toolsets, list) and all(isinstance(item, str) for item in toolsets):
+            child["toolsets"] = toolsets
+        if parent_tool_call_id:
+            child["parentToolCallId"] = parent_tool_call_id
+        if summary:
+            child["summary"] = summary[:5000]
+        duration = kwargs.get("duration_seconds")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            child["durationSeconds"] = duration
+
+        if event_type == "subagent.start":
+            update = acp.start_tool_call(
+                tool_call_id,
+                goal,
+                kind="other",
+                status="in_progress",
+                raw_input={"goal": goal},
+            )
+        else:
+            update = acp.update_tool_call(
+                tool_call_id,
+                kind="other",
+                status=acp_status,
+                title=goal,
+                raw_output=summary or (name if event_type == "subagent.tool" else None),
+            )
+        update.field_meta = {
+            "hermes": {"toolName": "delegate_task", "subagent": child}
+        }
+        _send_update(conn, session_id, loop, update)
+
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
-        # Only emit ACP ToolCallStart for tool.started; ignore other event types
+        # A child's streamed reply text arrives one delta at a time; relaying each
+        # would flood the client. Its tools, progress and final summary are sent.
+        if event_type == "subagent.text":
+            return
+        if event_type in {
+            "subagent.start",
+            "subagent.progress",
+            "subagent.tool",
+            "subagent.complete",
+        }:
+            _subagent_update(event_type, name, preview, kwargs)
+            return
+
+        # Only emit ACP ToolCallStart for tool.started; ignore other events.
         if event_type != "tool.started":
             return
         if isinstance(args, str):

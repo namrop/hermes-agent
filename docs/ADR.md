@@ -1,5 +1,18 @@
 # Architecture Decision Records
 
+## 2026-10-01: ACP tool calls name their Hermes tool; delegated children are reported
+
+Status: Accepted — source implementation (branch `luis/acp-tool-identity-20261001`); not deployed when written. The T3 Code side that reads it is separate.
+
+Context: Luis, T3 Code thread, 2026-10-01 voice note: "The browser commands. The icons, I'm not sure, are rendering correctly", then "subagents aren't showing up under T3. just tried it". ACP tool kinds are coarse: Hermes sends browser clicks and typing as `execute`, so T3 drew them as terminal commands; `search_files` and `web_search` both became T3's "Searched files". A completion update carried no title, so T3 replaced the start's title with "Tool" and showed the output as the label. `delegate_task` was one `execute` call; its children were invisible to the client.
+
+Decision:
+- Every tool-call start and completion carries `_meta.hermes.toolName` (the Hermes tool name). Completions also carry the title and the arguments again, so a client that sees only the update still knows the call.
+- The voice-note transcript echo is named `voice_note_transcript` and carries the plain transcript as `raw_output`.
+- Each delegated child is its own ACP tool call (`kind: other`, titled with its goal) whose `_meta.hermes` holds `toolName: delegate_task` and a `subagent` record: lifecycle event (`started` / `progress` / `completed`), child id, goal, status, parent child id or parent tool-call id, and when known model, role, child session, task index and count, tool count, toolsets, duration and summary. The child's streamed reply text is not relayed (one update per delta would flood the client); its tools, progress and final summary are.
+
+Consequences: clients that ignore `_meta` see what they saw before, plus one extra tool call per child. T3 Code's Hermes adapter reads the tool name to choose icons and labels and turns child records into its Agents panel.
+
 ## 2026-10-01: ACP audio prompts are transcribed like gateway voice notes
 
 Status: Accepted — source implementation (branch `luis/acp-audio-prompts-20261001`); not deployed when written.

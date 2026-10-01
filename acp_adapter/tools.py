@@ -1074,6 +1074,7 @@ def build_tool_start(
         )
     if arguments:
         update.raw_input = arguments
+    update.field_meta = {"hermes": {"toolName": tool_name}}
     return update
 
 
@@ -1328,13 +1329,22 @@ def build_tool_complete(
             function_args=function_args,
             snapshot=snapshot,
         )
-    return acp.update_tool_call(
+    try:
+        title = build_tool_title(tool_name, function_args or {})
+    except Exception as exc:  # noqa: BLE001 — a tool-call render must never abort the turn
+        logger.debug("ACP tool-completion title failed for %r: %s", tool_name, exc)
+        title = tool_name if isinstance(tool_name, str) and tool_name else "tool"
+    update = acp.update_tool_call(
         tool_call_id,
         kind=kind,
         status="failed" if _tool_result_failed(result, tool_name) else "completed",
         content=content,
+        title=title,
+        raw_input=function_args,
         raw_output=result,
     )
+    update.field_meta = {"hermes": {"toolName": tool_name}}
+    return update
 
 
 # ---------------------------------------------------------------------------

@@ -95,6 +95,80 @@ class TestToolProgressCallback:
             assert "terminal" not in tool_call_ids
 
 
+    def test_delegate_child_updates_include_live_lifecycle_and_parent_identity(
+        self, mock_conn, event_loop_fixture
+    ):
+        from collections import deque
+
+        tool_call_ids = {"delegate_task": deque(["parent-call"])}
+        progress_cb = make_tool_progress_cb(
+            mock_conn, "session-1", event_loop_fixture, tool_call_ids, {}
+        )
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            progress_cb(
+                "subagent.start",
+                "delegate_task",
+                "Inspect the adapter",
+                {},
+                subagent_id="child-1",
+                parent_id=None,
+                depth=1,
+                goal="Inspect the adapter",
+                model="test-model",
+                task_index=0,
+                role="leaf",
+            )
+            progress_cb(
+                "subagent.progress",
+                "delegate_task",
+                "Read HermesAcpSupport.ts",
+                {},
+                subagent_id="child-1",
+                parent_id=None,
+                depth=1,
+                goal="Inspect the adapter",
+                model="test-model",
+                task_index=0,
+                role="leaf",
+            )
+            progress_cb(
+                "subagent.complete",
+                "delegate_task",
+                "Found the metadata boundary",
+                {},
+                subagent_id="child-1",
+                parent_id=None,
+                depth=1,
+                goal="Inspect the adapter",
+                model="test-model",
+                task_index=0,
+                role="leaf",
+                status="completed",
+                summary="Found the metadata boundary",
+            )
+
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        assert [update.session_update for update in updates] == [
+            "tool_call",
+            "tool_call_update",
+            "tool_call_update",
+        ]
+        assert [update.status for update in updates] == [
+            "in_progress",
+            "in_progress",
+            "completed",
+        ]
+        assert [update.field_meta["hermes"]["subagent"]["event"] for update in updates] == [
+            "started",
+            "progress",
+            "completed",
+        ]
+        assert all(update.field_meta["hermes"]["toolName"] == "delegate_task" for update in updates)
+        assert updates[0].field_meta["hermes"]["subagent"]["parentToolCallId"] == "parent-call"
+        assert updates[-1].raw_output == "Found the metadata boundary"
+
+
 # ---------------------------------------------------------------------------
 # Thinking callback
 # ---------------------------------------------------------------------------

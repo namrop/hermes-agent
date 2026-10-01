@@ -1908,20 +1908,22 @@ class HermesACPAgent(acp.Agent):
             if transcripts and self._conn and stt_echo_enabled():
                 for transcript in transcripts:
                     try:
-                        await self._conn.session_update(
-                            session_id,
-                            acp.start_tool_call(
-                                make_tool_call_id(),
-                                "Voice note transcript",
-                                kind="other",
-                                status="completed",
-                                content=[
-                                    acp.tool_content(
-                                        acp.text_block(f'🎙️ "{transcript}"')
-                                    )
-                                ],
-                            ),
+                        update = acp.start_tool_call(
+                            make_tool_call_id(),
+                            "Voice note transcript",
+                            kind="other",
+                            status="completed",
+                            content=[
+                                acp.tool_content(
+                                    acp.text_block(f'🎙️ "{transcript}"')
+                                )
+                            ],
+                            raw_output=transcript,
                         )
+                        update.field_meta = {
+                            "hermes": {"toolName": "voice_note_transcript"}
+                        }
+                        await self._conn.session_update(session_id, update)
                     except Exception:
                         logger.debug("ACP transcript echo failed", exc_info=True)
 

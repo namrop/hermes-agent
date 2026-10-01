@@ -267,6 +267,27 @@ class TestBuildToolComplete:
 
 
 # ---------------------------------------------------------------------------
+# ACP tool identity
+# ---------------------------------------------------------------------------
+
+
+class TestHermesToolIdentityMetadata:
+    def test_tool_start_and_completion_keep_name_input_and_title(self):
+        args = {"code": "print(1 + 1)"}
+        start = build_tool_start("tc-browser", "browser_exec", args)
+        complete = build_tool_complete(
+            "tc-browser", "browser_exec", "2", function_args=args
+        )
+
+        assert start.field_meta == {"hermes": {"toolName": "browser_exec"}}
+        assert complete.field_meta == {"hermes": {"toolName": "browser_exec"}}
+        assert complete.title == start.title
+        assert complete.raw_input == args
+        start_wire = start.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
+        assert start_wire["_meta"] == {"hermes": {"toolName": "browser_exec"}}
+
+
+# ---------------------------------------------------------------------------
 # extract_locations
 # ---------------------------------------------------------------------------
 
