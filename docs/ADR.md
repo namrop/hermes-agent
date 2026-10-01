@@ -1,5 +1,19 @@
 # Architecture Decision Records
 
+## 2026-10-01: ACP audio prompts are transcribed like gateway voice notes
+
+Status: Accepted — source implementation (branch `luis/acp-audio-prompts-20261001`); not deployed when written.
+
+Context: Luis wants to send audio to Hermes from T3 Code (keeper, T3 Code thread, Discord msg 1555078536044224533: "I think sending the audio to hermes is what I want to figure out next"). ACP carries audio as `ContentBlock::Audio` (base64 `data` + `mimeType`) once an agent declares `promptCapabilities.audio`. The ACP adapter declared images only and `_content_blocks_to_openai_user_content` had no audio branch, so an audio block was dropped. The models Hermes runs take text.
+
+Decision:
+- `initialize` declares `promptCapabilities.audio = true`.
+- `acp_adapter/audio_prompts.py` replaces each audio block, in place, before any other prompt handling: the bytes go through `cache_audio_from_bytes` (same cache, size cap and container sniffing as the gateway), the configured STT provider transcribes them with `transcribe_audio_local_fallback` as the fallback, and the block becomes text worded exactly as `GatewayRunner._enrich_message_with_transcription` words it (quoted transcript; empty-audio sentinel; "could not be transcribed … available at: <path>"; with STT off, "The user sent a voice message: <path>").
+- `stt_echo_transcripts` / `stt.echo_transcripts` (default on, shared with the gateway) also shows the client what was heard, as a completed `tool_call` titled "Voice note transcript" with `🎙️ "<transcript>"`, so the echo stays out of the agent's reply text.
+- A prompt that carried audio is never handled as a slash command; it can still redirect a running turn like typed text.
+
+Consequences: the agent and the persisted user message carry the transcript. Transcription runs before the turn starts, so a `session/cancel` sent while a clip is being transcribed is not seen by that turn. The ACP SDK's 50 MiB stdio line limit bounds inline audio; T3 Code sends at most 25 MiB per clip and leaves larger recordings as a path line.
+
 ## 2026-09-30: ACP approvals — the client's mode reaches Hermes, prompts wait for an answer, Supervised asks before every command
 
 Status: Accepted — source implementation; fleet pin/activation is separate.
