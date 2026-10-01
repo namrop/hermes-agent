@@ -33,7 +33,36 @@ class EditProposal:
     arguments: dict[str, Any]
 
 
-EditApprovalRequester = Callable[[EditProposal], bool]
+# A requester returns one of the EDIT_OUTCOME_* strings. A bare bool is still
+# accepted from older/test requesters: True means allowed, False denied.
+EditApprovalRequester = Callable[[EditProposal], "str | bool"]
+
+EDIT_OUTCOME_ALLOWED = "allowed"
+EDIT_OUTCOME_DENIED = "denied"
+EDIT_OUTCOME_CANCELLED = "cancelled"
+EDIT_OUTCOME_NO_ANSWER = "no_answer"
+EDIT_OUTCOME_FAILED = "failed"
+
+# What the agent is told when an edit does not happen. Only an explicit
+# answer from the user is reported as a denial.
+_EDIT_BLOCK_MESSAGES = {
+    EDIT_OUTCOME_DENIED: (
+        "Edit approval denied by the user; file was not modified. Do not retry "
+        "this edit or make the same change another way."
+    ),
+    EDIT_OUTCOME_CANCELLED: (
+        "Edit approval was cancelled before the user answered (the turn was "
+        "stopped); file was not modified."
+    ),
+    EDIT_OUTCOME_NO_ANSWER: (
+        "Edit approval got no answer before its time limit; file was not "
+        "modified. The user did not deny it."
+    ),
+    EDIT_OUTCOME_FAILED: (
+        "Edit approval request failed before the user answered; file was not "
+        "modified. The user did not deny it."
+    ),
+}
 
 _EDIT_APPROVAL_REQUESTER: ContextVar[EditApprovalRequester | None] = ContextVar(
     "ACP_EDIT_APPROVAL_REQUESTER",
@@ -251,14 +280,19 @@ def maybe_require_edit_approval(tool_name: str, arguments: dict[str, Any]) -> st
         return None
 
     try:
-        approved = bool(requester(proposal))
+        outcome = requester(proposal)
     except Exception as exc:
         logger.warning("ACP edit approval requester failed: %s", exc)
-        approved = False
+        outcome = EDIT_OUTCOME_FAILED
 
-    if approved:
+    if outcome is True:
+        outcome = EDIT_OUTCOME_ALLOWED
+    elif outcome is False:
+        outcome = EDIT_OUTCOME_DENIED
+    if outcome == EDIT_OUTCOME_ALLOWED:
         return None
-    return json.dumps({"error": "Edit approval denied by ACP client; file was not modified."}, ensure_ascii=False)
+    message = _EDIT_BLOCK_MESSAGES.get(outcome, _EDIT_BLOCK_MESSAGES[EDIT_OUTCOME_FAILED])
+    return json.dumps({"error": message}, ensure_ascii=False)
 
 
 def build_acp_edit_tool_call(proposal: EditProposal):
@@ -287,13 +321,19 @@ def make_acp_edit_approval_requester(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 60.0,
+    timeout: float | None = None,
     auto_approve_getter: Callable[[], tuple[str, str | None]] | None = None,
+    cancel_event: Any = None,
 ) -> EditApprovalRequester:
-    """Return a sync requester that bridges edit proposals to ACP permissions."""
+    """Return a sync requester that bridges edit proposals to ACP permissions.
 
-    def _requester(proposal: EditProposal) -> bool:
+    ``timeout=None`` (the default) waits until the client answers; see
+    :func:`acp_adapter.permissions.wait_for_client_response`.
+    """
+
+    def _requester(proposal: EditProposal) -> str:
         from acp.schema import PermissionOption
+        from acp_adapter.permissions import TurnCancelled, wait_for_client_response
         from agent.async_utils import safe_schedule_threadsafe
 
         if auto_approve_getter is not None:
@@ -301,7 +341,7 @@ def make_acp_edit_approval_requester(
                 policy, cwd = auto_approve_getter()
                 if should_auto_approve_edit(proposal, policy, cwd):
                     logger.info("Auto-approved ACP edit under policy %s: %s", policy, proposal.path)
-                    return True
+                    return EDIT_OUTCOME_ALLOWED
             except Exception:
                 logger.debug("ACP edit auto-approval policy check failed", exc_info=True)
 
@@ -322,17 +362,32 @@ def make_acp_edit_approval_requester(
             log_message="Edit approval request: failed to schedule on loop",
         )
         if future is None:
-            return False
+            return EDIT_OUTCOME_FAILED
         try:
-            response = future.result(timeout=timeout)
-        except (FutureTimeout, Exception) as exc:
+            response = wait_for_client_response(
+                future, timeout=timeout, cancel_event=cancel_event,
+            )
+        except FutureTimeout:
             future.cancel()
-            logger.warning("Edit approval request timed out or failed: %s", exc)
-            return False
+            logger.warning("Edit approval request got no answer within %ss", timeout)
+            return EDIT_OUTCOME_NO_ANSWER
+        except TurnCancelled:
+            future.cancel()
+            logger.info("Edit approval request abandoned: the turn was cancelled")
+            return EDIT_OUTCOME_CANCELLED
+        except Exception as exc:
+            future.cancel()
+            logger.warning("Edit approval request failed: %s", exc)
+            return EDIT_OUTCOME_FAILED
         outcome = getattr(response, "outcome", None)
-        return (
-            getattr(outcome, "outcome", None) == "selected"
-            and getattr(outcome, "option_id", None) == "allow_once"
-        )
+        kind = getattr(outcome, "outcome", None)
+        if kind == "selected":
+            if getattr(outcome, "option_id", None) == "allow_once":
+                return EDIT_OUTCOME_ALLOWED
+            return EDIT_OUTCOME_DENIED
+        if kind == "cancelled":
+            return EDIT_OUTCOME_CANCELLED
+        logger.warning("Edit approval request returned an unrecognized response: %r", response)
+        return EDIT_OUTCOME_FAILED
 
     return _requester

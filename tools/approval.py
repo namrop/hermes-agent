@@ -23,7 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -103,6 +103,44 @@ def _is_interactive_cli() -> bool:
     if ctx_val is not None:
         return is_truthy_value(ctx_val)
     return env_var_enabled("HERMES_INTERACTIVE")
+
+
+# "Ask before every command" switch for ACP clients in supervised mode. Holds
+# a zero-argument callable rather than a bool so a mode change made while a
+# turn is running applies to that turn's next command. Context-local and
+# copied into worker threads by tools.thread_context, so one ACP session's
+# mode never leaks into another session running on the same executor.
+_ask_every_command_getter: contextvars.ContextVar[Optional[Callable[[], bool]]] = (
+    contextvars.ContextVar("hermes_ask_every_command", default=None)
+)
+
+_SUPERVISED_DESCRIPTION = "Supervised mode asks before every command"
+
+
+def set_ask_every_command_getter(getter: Optional[Callable[[], bool]]) -> contextvars.Token:
+    """Bind the supervised-mode policy for the current context (one ACP turn)."""
+    return _ask_every_command_getter.set(getter)
+
+
+def reset_ask_every_command_getter(token: contextvars.Token) -> None:
+    """Restore the prior value from :func:`set_ask_every_command_getter`."""
+    _ask_every_command_getter.reset(token)
+
+
+def _ask_every_command() -> bool:
+    """True when the current turn must ask before every command.
+
+    A getter that raises fails toward asking: the user chose a mode that
+    asks, and a broken policy check must not turn that into silence.
+    """
+    getter = _ask_every_command_getter.get()
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except Exception:
+        logger.warning("Supervised-mode policy check failed; asking", exc_info=True)
+        return True
 
 
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:
@@ -3930,6 +3968,108 @@ def _run_approval_gate(
     return {"approved": True, "message": None}
 
 
+def _supervised_approval(
+    *,
+    display_target: str,
+    description: str,
+    approval_key: str,
+    session_key: str,
+    approval_callback,
+) -> dict:
+    """Ask the user about one action because the session is supervised.
+
+    Supervised mode is the user saying "ask me first", so smart approval
+    never decides here and nothing runs silently: without an approval
+    surface on this thread the action is blocked, never auto-approved and
+    never sent to the ``input()`` fallback (which in ACP would read the
+    protocol stream). "Allow for session" covers ``approval_key`` only.
+    """
+    if is_approved(session_key, approval_key):
+        return {"approved": True, "message": None}
+    if approval_callback is None:
+        logger.warning(
+            "Supervised mode: no approval surface on this thread; blocking %s",
+            display_target[:200],
+        )
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: this session is in supervised mode, which asks the "
+                "user before every command, but no approval surface is "
+                "attached to this thread, so the command could not be offered "
+                "for approval. Do NOT retry it or reach the same outcome "
+                "another way; tell the user it was blocked."
+            ),
+            "pattern_key": approval_key,
+            "description": description,
+            "outcome": "blocked",
+            "user_consent": False,
+        }
+
+    _fire_approval_hook(
+        "pre_approval_request",
+        command=display_target,
+        description=description,
+        pattern_key=approval_key,
+        pattern_keys=[approval_key],
+        session_key=session_key,
+        surface="cli",
+    )
+    choice = prompt_dangerous_approval(
+        display_target,
+        description,
+        allow_permanent=False,
+        approval_callback=approval_callback,
+    )
+    _fire_approval_hook(
+        "post_approval_response",
+        command=display_target,
+        description=description,
+        pattern_key=approval_key,
+        pattern_keys=[approval_key],
+        session_key=session_key,
+        surface="cli",
+        choice=choice,
+    )
+
+    if choice == "timeout":
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Action timed out without user response. The user "
+                "has NOT consented to this action. Do NOT retry it, do NOT "
+                "rephrase it, and do NOT attempt the same outcome via a "
+                "different path. Silence is not consent."
+            ),
+            "pattern_key": approval_key,
+            "description": description,
+            "outcome": "timeout",
+            "user_consent": False,
+        }
+    if choice == "deny":
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: User denied this command in supervised mode. Do NOT "
+                "retry — the user has explicitly rejected it."
+            ),
+            "pattern_key": approval_key,
+            "description": description,
+            "outcome": "denied",
+            "user_consent": False,
+        }
+    if choice in ("session", "always"):
+        # allow_permanent=False above, so "always" can only come from an
+        # older client; it is honored as session scope, never persisted.
+        approve_session(session_key, approval_key)
+    return {
+        "approved": True,
+        "message": None,
+        "user_approved": True,
+        "description": description,
+    }
+
+
 def _should_skip_container_guards(env_type: str, has_host_access: bool = False) -> bool:
     """Return True when the backend is isolated enough to skip dangerous-command prompts.
 
@@ -4920,6 +5060,22 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
+    # Supervised (ACP): the user asked to approve every command, so an
+    # unflagged command is asked about too, and a flagged one skips smart
+    # approval below and goes straight to the user.
+    ask_every_command = _ask_every_command()
+    if ask_every_command and (not warnings or approval_callback is None):
+        return _supervised_approval(
+            display_target=command,
+            description=(
+                "; ".join(desc for _, desc, _ in warnings)
+                or _SUPERVISED_DESCRIPTION
+            ),
+            approval_key=f"supervised:{command}",
+            session_key=session_key,
+            approval_callback=approval_callback,
+        )
+
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
@@ -4934,7 +5090,7 @@ def check_all_command_guards(command: str, env_type: str,
     has_manual_only_warning = any(
         requires_manual_approval(key, desc) for key, desc, _ in warnings
     )
-    if approval_mode == "smart" and not has_manual_only_warning:
+    if approval_mode == "smart" and not has_manual_only_warning and not ask_every_command:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,
@@ -5401,6 +5557,17 @@ def check_execute_code_guard(code: str, env_type: str,
     # pending_approval. Terminal-command (not whole-script) CLI leaks from
     # the script's own per-call terminal() guards are handled separately in
     # check_all_command_guards.
+    #   * Supervised (ACP): the user asked to approve every command, and a
+    #     script can reach subprocess/os directly, so the whole script is
+    #     asked about first (its terminal() calls are still asked per call).
+    if is_cli and not is_gateway and not is_ask and _ask_every_command():
+        return _supervised_approval(
+            display_target=f"execute_code <<'PY'\n{code}\nPY",
+            description=f"{_SUPERVISED_DESCRIPTION}. {description}",
+            approval_key=pattern_key,
+            session_key=get_current_session_key(),
+            approval_callback=approval_callback,
+        )
     if not is_gateway and not is_ask:
         return {"approved": True, "message": None}
 

@@ -68,6 +68,7 @@ async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(ag
         ("default", "Default"),
         ("accept_edits", "Accept Edits"),
         ("dont_ask", "Don't Ask"),
+        ("supervised", "Supervised"),
     ]
 
 

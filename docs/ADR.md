@@ -1,5 +1,25 @@
 # Architecture Decision Records
 
+## 2026-09-30: ACP approvals — the client's mode reaches Hermes, prompts wait for an answer, Supervised asks before every command
+
+Status: Accepted — source implementation; fleet pin/activation is separate.
+
+Origin: Luis reported in Discord message `1554984990977040527` (T3 Code thread) that T3's Auto mode was "asking for approval for file edits? but not for other things that are being done". He approved the three proposed fixes in `1555022276141781065`: "1,2 and 3. The smart approval has a policy I set so that's good already. But I want to make sure that something flagged by Hermes actually shows up in T3 under auto".
+
+Findings that shaped the decision:
+- T3 sets the session mode with `session/set_config_option` and `configId: "mode"`. Hermes handled only `edit_approval_policy` there, stored `mode` in `config_options`, and kept the session in `default`. No T3 mode choice had ever reached Hermes.
+- Commands never consulted the ACP mode; they went through `approvals.mode` (smart on Sol). A smart ESCALATE or DENY already reached the client through the ACP approval callback.
+- Both ACP prompts gave up after a hard-coded 60 s. An unanswered edit was then reported to the agent as "Edit approval denied by ACP client", and the client's card stayed open with nobody listening.
+
+Decision:
+- `session/set_config_option` with `configId: "mode"` switches the session mode exactly as `session/set_mode` does. Unknown values fall back to `default`.
+- A fourth ACP mode, `supervised`, asks before every command and every edit. Every terminal command and every `execute_code` script is offered to the client, smart approval does not decide, "Allow for session" covers that exact command (or `execute_code`) only, and without an approval surface on the thread the command is blocked rather than run. `default` keeps its meaning (ask before edits) for other ACP clients.
+- Outside `supervised`, anything the command gate flags and smart approval does not approve reaches the client as `session/request_permission`. Smart approval's own approvals stay silent, as the keeper's policy intends.
+- Command and edit prompts have no time limit by default. The wait ends when the client answers (ACP requires a `cancelled` answer on `session/cancel`), when the connection closes, or when the turn's cancel event is set. An explicit timeout is still supported.
+- The agent is told what actually happened to an edit: denied by the user, cancelled with the turn, no answer within an explicit time limit, or the request failed. Only an explicit answer is reported as a denial.
+
+The client maps its own modes onto these (T3 Code: Supervised → `supervised`, Auto and Full access → `dont_ask`, Auto-accept edits → `accept_edits`; Full access additionally auto-answers on the client side).
+
 ## 2026-09-28: Consumed process completions do not start a second gateway answer
 
 Status: Accepted — source repair; not deployed or restarted under this commission.

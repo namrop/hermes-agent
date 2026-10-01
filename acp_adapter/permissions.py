@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from concurrent.futures import TimeoutError as FutureTimeout
 from itertools import count
-from typing import Callable
+from typing import Any, Callable
 
 from acp.schema import (
     AllowedOutcome,
@@ -27,6 +28,49 @@ _OPTION_ID_TO_HERMES = {
 }
 
 _PERMISSION_REQUEST_IDS = count(1)
+
+# How often a wait for the client's answer checks whether the turn was
+# cancelled. Only used when a cancel event is supplied.
+_CANCEL_POLL_SECONDS = 0.25
+
+
+class TurnCancelled(Exception):
+    """The ACP turn was cancelled while a permission request was pending."""
+
+
+def wait_for_client_response(
+    future: Any,
+    *,
+    timeout: float | None = None,
+    cancel_event: Any = None,
+) -> Any:
+    """Wait for the client's answer to a ``session/request_permission``.
+
+    ``timeout=None`` waits until the client answers: an approval the user
+    has not reached yet is still pending, not refused. The wait still ends
+    when the client answers ``cancelled`` (ACP requires that on
+    ``session/cancel``), when the connection closes (the SDK rejects pending
+    requests), or when ``cancel_event`` is set.
+
+    Raises ``FutureTimeout`` when an explicit ``timeout`` elapses and
+    :class:`TurnCancelled` when ``cancel_event`` is set first.
+    """
+    if cancel_event is None:
+        return future.result(timeout=timeout)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        if cancel_event.is_set():
+            raise TurnCancelled()
+        wait = _CANCEL_POLL_SECONDS
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FutureTimeout()
+            wait = min(wait, remaining)
+        try:
+            return future.result(timeout=wait)
+        except FutureTimeout:
+            continue
 
 
 def _permission_option_supports_kind(kind: str) -> bool:
@@ -111,7 +155,8 @@ def make_approval_callback(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 60.0,
+    timeout: float | None = None,
+    cancel_event: Any = None,
 ) -> Callable[..., str]:
     """
     Return a Hermes-compatible approval callback that bridges to ACP.
@@ -124,7 +169,10 @@ def make_approval_callback(
         request_permission_fn: The ACP connection's ``request_permission`` coroutine.
         loop: The event loop on which the ACP connection lives.
         session_id: Current ACP session id.
-        timeout: Seconds to wait for a response before auto-denying.
+        timeout: Seconds to wait for an answer before reporting "timeout";
+            ``None`` (the default) waits until the client answers.
+        cancel_event: Optional ``threading.Event`` set when the turn is
+            cancelled; a pending request is then abandoned as a denial.
     """
 
     def _callback(
@@ -157,7 +205,9 @@ def make_approval_callback(
             return "deny"
 
         try:
-            response = future.result(timeout=timeout)
+            response = wait_for_client_response(
+                future, timeout=timeout, cancel_event=cancel_event,
+            )
         except FutureTimeout:
             future.cancel()
             logger.warning("Permission request timed out after %ss", timeout)
@@ -165,6 +215,10 @@ def make_approval_callback(
             # tools.approval callers report this as "timed out without user
             # response" instead of a user denial.
             return "timeout"
+        except TurnCancelled:
+            future.cancel()
+            logger.info("Permission request abandoned: the turn was cancelled")
+            return "deny"
         except Exception as exc:
             future.cancel()
             logger.warning("Permission request failed: %s", exc)

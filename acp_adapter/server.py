@@ -80,7 +80,9 @@ from agent.context_compressor import (
 )
 from agent.interrupt_compat import request_hard_interrupt
 from tools.approval import (
+    reset_ask_every_command_getter,
     reset_hermes_interactive_context,
+    set_ask_every_command_getter,
     set_hermes_interactive_context,
 )
 
@@ -654,16 +656,26 @@ class HermesACPAgent(acp.Agent):
 
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
+    # The config-option form of the session mode. ACP clients that drive
+    # modes through session/set_config_option (T3 Code does) send this id.
+    _MODE_CONFIG_ID = "mode"
     _MODE_DEFAULT = "default"
     _MODE_ACCEPT_EDITS = "accept_edits"
     _MODE_DONT_ASK = "dont_ask"
+    # Asks before every command and every edit; smart approval never decides.
+    _MODE_SUPERVISED = "supervised"
     _MODE_TO_EDIT_APPROVAL_POLICY = {
         _MODE_DEFAULT: "ask",
         _MODE_ACCEPT_EDITS: "workspace_session",
         _MODE_DONT_ASK: "session",
+        _MODE_SUPERVISED: "ask",
     }
+    # Written out rather than inverted: two modes share the "ask" edit
+    # policy, and that policy on its own selects the plain default mode.
     _EDIT_APPROVAL_POLICY_TO_MODE = {
-        value: key for key, value in _MODE_TO_EDIT_APPROVAL_POLICY.items()
+        "ask": _MODE_DEFAULT,
+        "workspace_session": _MODE_ACCEPT_EDITS,
+        "session": _MODE_DONT_ASK,
     }
 
     def __init__(self, session_manager: SessionManager | None = None):
@@ -709,8 +721,22 @@ class HermesACPAgent(acp.Agent):
                     name="Don't Ask",
                     description="Auto-allow file edits for this session except sensitive paths.",
                 ),
+                SessionMode(
+                    id=self._MODE_SUPERVISED,
+                    name="Supervised",
+                    description="Ask before every command and every edit.",
+                ),
             ],
         )
+
+    def _normalize_mode(self, mode_id: object) -> str:
+        normalized = str(mode_id or "").strip()
+        if normalized not in self._MODE_TO_EDIT_APPROVAL_POLICY:
+            return self._MODE_DEFAULT
+        return normalized
+
+    def _asks_every_command(self, state: SessionState) -> bool:
+        return str(getattr(state, "mode", "") or "") == self._MODE_SUPERVISED
 
     def _edit_approval_policy_for_state(self, state: SessionState) -> tuple[str, str | None]:
         mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
@@ -2029,7 +2055,16 @@ class HermesACPAgent(acp.Agent):
                     streamed_message = True
                 message_cb(text)
 
-            approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+            # No time limit on either prompt: an approval the user has not
+            # reached yet is still pending. The wait ends when the client
+            # answers (including "cancelled" on session/cancel), when the
+            # connection closes, or when this turn's cancel event is set.
+            approval_cb = make_approval_callback(
+                conn.request_permission,
+                loop,
+                session_id,
+                cancel_event=state.cancel_event,
+            )
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
 
@@ -2038,6 +2073,7 @@ class HermesACPAgent(acp.Agent):
                     loop,
                     session_id,
                     auto_approve_getter=lambda: self._edit_approval_policy_for_state(state),
+                    cancel_event=state.cancel_event,
                 )
             except Exception:
                 logger.debug("Could not create ACP edit approval requester", exc_info=True)
@@ -2073,11 +2109,13 @@ class HermesACPAgent(acp.Agent):
         # which requires a notify_cb registered in _gateway_notify_cbs.
         previous_approval_cb = None
         interactive_token = None
+        ask_every_command_token = None
         edit_approval_token = None
         previous_session_id = None
 
         def _run_agent() -> dict:
-            nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
+            nonlocal previous_approval_cb, interactive_token, ask_every_command_token
+            nonlocal edit_approval_token, previous_session_id
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -2125,6 +2163,11 @@ class HermesACPAgent(acp.Agent):
             # contextvar (not os.environ) so concurrent executor workers don't
             # race on the flag (GHSA-96vc-wcxf-jjff).
             interactive_token = set_hermes_interactive_context(True)
+            # Supervised asks before every command. Read live so a mode
+            # switch during the turn applies to its next command.
+            ask_every_command_token = set_ask_every_command_getter(
+                lambda: self._asks_every_command(state)
+            )
             # Propagate the originating ACP session id to tools that want to
             # tag side-effects with it (e.g. ``kanban_create`` stamps it on
             # the new task so clients can render a per-session board). Save
@@ -2158,6 +2201,8 @@ class HermesACPAgent(acp.Agent):
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
+                if ask_every_command_token is not None:
+                    reset_ask_every_command_getter(ask_every_command_token)
                 # Restore HERMES_SESSION_ID symmetrically.
                 if previous_session_id is None:
                     os.environ.pop("HERMES_SESSION_ID", None)
@@ -2681,9 +2726,7 @@ class HermesACPAgent(acp.Agent):
         if state is None:
             logger.warning("Session %s: mode switch requested for missing session", session_id)
             return None
-        normalized_mode = str(mode_id or "").strip()
-        if normalized_mode not in self._MODE_TO_EDIT_APPROVAL_POLICY:
-            normalized_mode = self._MODE_DEFAULT
+        normalized_mode = self._normalize_mode(mode_id)
         setattr(state, "mode", normalized_mode)
         self.session_manager.save_session(session_id)
         logger.info("Session %s: mode switched to %s", session_id, normalized_mode)
@@ -2701,6 +2744,10 @@ class HermesACPAgent(acp.Agent):
         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
             mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
             setattr(state, "mode", mode)
+        elif str(config_id) == self._MODE_CONFIG_ID:
+            # Before this branch the value landed in config_options below and
+            # the session silently kept its old mode.
+            setattr(state, "mode", self._normalize_mode(value))
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
