@@ -63,6 +63,7 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
+from acp_adapter.audio_prompts import stt_echo_enabled, transcribe_audio_blocks
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     make_message_cb,
@@ -73,7 +74,7 @@ from acp_adapter.events import (
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
-from acp_adapter.tools import build_tool_complete, build_tool_start
+from acp_adapter.tools import build_tool_complete, build_tool_start, make_tool_call_id
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
@@ -1365,7 +1366,7 @@ class HermesACPAgent(acp.Agent):
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                prompt_capabilities=PromptCapabilities(image=True),
+                prompt_capabilities=PromptCapabilities(image=True, audio=True),
                 session_capabilities=SessionCapabilities(
                     fork=SessionForkCapabilities(),
                     list=SessionListCapabilities(),
@@ -1897,9 +1898,37 @@ class HermesACPAgent(acp.Agent):
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
 
+        # Audio arrives like a gateway voice note: transcribe it with the
+        # configured STT provider and hand the agent text (acp_adapter/
+        # audio_prompts.py). A prompt that carried audio is never a slash
+        # command, but it can still redirect a running turn like typed text.
+        had_audio = any(isinstance(block, AudioContentBlock) for block in prompt)
+        if had_audio:
+            prompt, transcripts = await transcribe_audio_blocks(prompt)
+            if transcripts and self._conn and stt_echo_enabled():
+                for transcript in transcripts:
+                    try:
+                        await self._conn.session_update(
+                            session_id,
+                            acp.start_tool_call(
+                                make_tool_call_id(),
+                                "Voice note transcript",
+                                kind="other",
+                                status="completed",
+                                content=[
+                                    acp.tool_content(
+                                        acp.text_block(f'🎙️ "{transcript}"')
+                                    )
+                                ],
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("ACP transcript echo failed", exc_info=True)
+
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
+        command_eligible = text_only_prompt and not had_audio
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
         )
@@ -1918,7 +1947,7 @@ class HermesACPAgent(acp.Agent):
         #      silently append to state.queued_prompts and respond with
         #      "No active turn — queued for the next turn", which looks like
         #      /queue even though the user never typed /queue.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
+        if command_eligible and isinstance(user_content, str) and user_text.startswith("/steer"):
             steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
             interrupted_prompt = ""
             rewrite_idle = False
@@ -1963,7 +1992,7 @@ class HermesACPAgent(acp.Agent):
         # Slash commands are text-only; if the client included images/resources,
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+        if command_eligible and isinstance(user_content, str) and user_text.startswith("/"):
             response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
                 if self._conn:
