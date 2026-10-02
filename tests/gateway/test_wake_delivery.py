@@ -9,12 +9,14 @@ Two strategies:
 """
 
 import asyncio
+import logging
+import socket
 
 import pytest
 
 from gateway.config import Platform
 from gateway.session import SessionSource
-from gateway.wake import deliver_wake, adapter_supports_push
+from gateway.wake import WakeTargetNotOwned, deliver_wake, adapter_supports_push
 
 
 class PushAdapter:
@@ -125,3 +127,160 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
+# ---------------------------------------------------------------------------
+# Session ownership (scar 01a0fba9, 2026-10-02): after a reboot the gateway
+# self-posted leftover subagent results into three T3 (ACP) sessions and ran
+# hidden turns on them. The self-post must only reach sessions the API server
+# owns.
+# ---------------------------------------------------------------------------
+
+
+class _SessionRows:
+    """The slice of SessionDB the ownership check reads."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def get_session(self, session_id):
+        return self.rows.get(session_id)
+
+
+class OwnedApiServerAdapter(ApiServerLikeAdapter):
+    """API-server stub that exposes a SessionDB, like ApiServerAdapter."""
+
+    def __init__(self, rows, **kwargs):
+        super().__init__(**kwargs)
+        self._db = _SessionRows(rows)
+
+    def _ensure_session_db(self):
+        return self._db
+
+
+def _counting_handler(calls):
+    from aiohttp import web
+
+    async def handler(request):
+        calls.append(request.headers.get("X-Hermes-Session-Id"))
+        return web.json_response({"choices": []})
+
+    return handler
+
+
+@pytest.mark.parametrize("source", ["acp", "cli", "tui", "ACP"])
+def test_deliver_wake_refuses_session_driven_by_another_process(source):
+    """A T3/ACP, CLI or TUI session is never self-posted into."""
+    calls = []
+
+    async def run():
+        runner, port = await _serve(_counting_handler(calls))
+        try:
+            adapter = OwnedApiServerAdapter(
+                {"t3-sess": {"id": "t3-sess", "source": source}}, port=port,
+            )
+            with pytest.raises(WakeTargetNotOwned) as excinfo:
+                await deliver_wake(adapter, text="wake", session_id="t3-sess")
+            return excinfo.value
+        finally:
+            await runner.cleanup()
+
+    err = asyncio.run(run())
+    assert calls == []
+    assert err.session_id == "t3-sess"
+    assert err.source == source.lower()
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        {"hq-sess": {"id": "hq-sess", "source": "api_server"}},
+        # API clients may name their own source (POST /api/sessions).
+        {"hq-sess": {"id": "hq-sess", "source": "lantern-reader"}},
+        # No row yet: unchanged behaviour, the API server decides.
+        {},
+    ],
+    ids=["api_server", "client-chosen-source", "no-row"],
+)
+def test_deliver_wake_self_posts_sessions_the_api_server_owns(rows):
+    calls = []
+
+    async def run():
+        runner, port = await _serve(_counting_handler(calls))
+        try:
+            adapter = OwnedApiServerAdapter(rows, port=port)
+            await deliver_wake(adapter, text="wake", session_id="hq-sess")
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert calls == ["hq-sess"]
+
+
+def test_deliver_wake_unavailable_session_db_raises_without_posting():
+    """An owner that cannot be checked is not woken; the caller retries later."""
+    calls = []
+
+    class NoDbAdapter(ApiServerLikeAdapter):
+        def _ensure_session_db(self):
+            return None
+
+    async def run():
+        runner, port = await _serve(_counting_handler(calls))
+        try:
+            with pytest.raises(RuntimeError, match="SessionDB unavailable"):
+                await deliver_wake(NoDbAdapter(port=port), text="w", session_id="s")
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# A sent wake is never posted twice (scar 01a0fba9): a turn that outlasted the
+# client timeout used to be retried, and every retry queued another full turn
+# on the same session behind its turn lease.
+# ---------------------------------------------------------------------------
+
+
+def test_deliver_wake_slow_turn_is_not_retried(monkeypatch, caplog):
+    from aiohttp import web
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "WAKE_TURN_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01))
+    calls = []
+
+    async def handler(request):
+        calls.append(request.headers.get("X-Hermes-Session-Id"))
+        await asyncio.sleep(1.0)  # the turn outlasts the client timeout
+        return web.json_response({"choices": []})
+
+    async def run():
+        runner, port = await _serve(handler)
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            await deliver_wake(adapter, text="w", session_id="slow-sid")
+        finally:
+            await runner.cleanup()
+
+    with caplog.at_level(logging.WARNING, logger="gateway.wake"):
+        asyncio.run(run())  # returns: delivered, outcome unknown
+    assert calls == ["slow-sid"]
+    assert "was sent but got no complete answer" in caplog.text
+
+
+def test_deliver_wake_connection_refused_is_retried_then_raises(monkeypatch, caplog):
+    """Nothing reached the server, so a retry cannot start a second turn."""
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01))
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        free_port = s.getsockname()[1]
+
+    adapter = ApiServerLikeAdapter(port=free_port)
+    with caplog.at_level(logging.WARNING, logger="gateway.wake"):
+        with pytest.raises(RuntimeError, match="gave up .* after 4 attempts"):
+            asyncio.run(deliver_wake(adapter, text="w", session_id="sid"))
+    assert caplog.text.count("could not connect") == 4

@@ -25809,7 +25809,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     raw_sid = _sk
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
-                from gateway.wake import adapter_supports_push, deliver_wake
+                from gateway.wake import (
+                    WakeTargetNotOwned,
+                    adapter_supports_push,
+                    deliver_wake,
+                )
                 if adapter is not None and not adapter_supports_push(adapter):
                     try:
                         logger.info(
@@ -25819,6 +25823,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
                         return True
+                    except WakeTargetNotOwned as e:
+                        # Another process (T3/ACP, CLI, TUI) drives this
+                        # session; a self-post would be a hidden second turn
+                        # on it (scar 01a0fba9). No route here: the durable
+                        # row stays pending for the owning process.
+                        logger.info(
+                            "Not waking session %s: %s; leaving the "
+                            "notification for that process",
+                            raw_sid, e,
+                        )
+                        return None
                     except Exception as e:
                         logger.warning(
                             "Watch notification self-post wake failed for "
@@ -25876,7 +25891,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which binds chat_id = session_id). handle_message would run the
             # wake under a build_session_key()-derived key that never matches
             # the raw X-Hermes-Session-Id session — self-post instead.
-            from gateway.wake import deliver_wake
+            from gateway.wake import WakeTargetNotOwned, deliver_wake
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
             try:
                 logger.info(
@@ -25886,6 +25901,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
                 return True
+            except WakeTargetNotOwned as e:
+                logger.info(
+                    "Not waking session %s: %s; leaving the notification for "
+                    "that process",
+                    raw_sid, e,
+                )
+                return None
             except Exception as e:
                 logger.warning(
                     "Watch notification self-post wake failed for session "

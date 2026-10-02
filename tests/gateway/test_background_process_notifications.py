@@ -580,6 +580,41 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     assert posts == ["raw-origin-sid"]
 
 
+@pytest.mark.asyncio
+async def test_inject_watch_notification_leaves_acp_session_alone(monkeypatch, tmp_path):
+    """A raw session key whose session T3/ACP drives is not self-posted into:
+    no route (None), so a durable row stays pending for the ACP process.
+    Scar 01a0fba9, 2026-10-02."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    rows = {"t3-acp-session": {"id": "t3-acp-session", "source": "acp"}}
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+        _host="127.0.0.1", _port=8642, _api_key="k", _model_name="m",
+        _ensure_session_db=lambda: SimpleNamespace(get_session=rows.get),
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append(session_id)
+
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+
+    evt = {
+        "type": "async_delegation",
+        "session_key": "t3-acp-session",
+        "parent_session_id": "t3-acp-session",
+        "origin_session_id": "",
+    }
+    result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
+    assert result is None
+    assert posts == []
+    api_adapter.handle_message.assert_not_awaited()
+
+
 def test_gateway_drain_retains_and_formats_overflow_events():
     """watch_overflow_* events must survive the gateway drain and render
     their summary — previously they were discarded at the drain (only

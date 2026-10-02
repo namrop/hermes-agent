@@ -1,5 +1,18 @@
 # Architecture Decision Records
 
+## 2026-10-02: The gateway wakes only sessions it owns, and posts a wake once
+
+Status: Accepted — source implementation (branch `luis/gateway-wake-ownership-20261002`); not deployed when written. Steps 1, 4 and 6 of the repair plan in Atrium scar `01a0fba9` (`07_systems/hermes/incidents/scar_hermes_gateway_wakes_t3_acp_sessions_hidden_second_driver_2026-10-02.md`); steps 2, 3 and 5 are not built.
+
+Context: the gateway and every `hermes acp` process share `state.db`. Background `delegate_task` results from T3 Code (ACP) sessions stay `pending` in `async_delegations`. After Sol rebooted on 2026-10-02, the gateway restored them, could not route the bare ACP session ids, fell back to the API-server self-post, and ran hidden tool-using turns on three T3 sessions. The self-post also counted its own 600 s client timeout as a failed delivery and posted again; each posted request waited for the session's turn lease and then ran its own turn, so duplicate turns queued. Luis, T3 Code thread `58fb08b3`: "come up with a plan to fix this double-driving issue", then for these steps "yeah do those steps please. the quick ones".
+
+Decision:
+- `deliver_wake` reads the target's `sessions.source` through the API server's SessionDB before a self-post. Sources driven by another process (`acp`, `cli`, `tui`) raise `WakeTargetNotOwned` and nothing is posted. Sessions created through the API server carry `api_server` or a client-chosen source, so the check lists foreign drivers instead of allowing only `api_server`. A session with no row is posted as before; an unavailable SessionDB raises so the caller retries.
+- `_inject_watch_notification` maps `WakeTargetNotOwned` to "no route" (`None`): the durable row's claim is released and the row stays `pending` for the owning process; the watcher does not requeue it in memory. The attempt cap still drops it after repeated restarts.
+- The self-post retries only connection failures before the request was sent (`ClientConnectorError`, `ConnectionTimeoutError`, 30 s connect timeout) and HTTP 429. Once sent, a timeout or dropped connection means the turn may still be running: the wake counts as delivered with an unknown outcome and is not posted again.
+
+Consequences: until step 3 (the ACP side acknowledges and picks up its own pending results) ships, a T3 session whose background result was left pending by a process restart does not get that result automatically; it stays readable in `async_delegations`. Before this change it arrived only as a hidden turn T3 did not show. A real API-server wake whose turn outlasts 600 s is now acknowledged once instead of being posted up to four times. The gateway still logs "waking api_server session ... via self-post" before the ownership check; the refusal follows as "Not waking session ...".
+
 ## 2026-10-01: ACP tool calls name their Hermes tool; delegated children are reported
 
 Status: Accepted — source implementation (branch `luis/acp-tool-identity-20261001`); not deployed when written. The T3 Code side that reads it is separate.
