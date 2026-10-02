@@ -516,6 +516,98 @@ class TestPrompt:
 
         assert captured.get("child") == resp.session_id
 
+    @staticmethod
+    def _prompt_texts(mock_conn):
+        texts = []
+        for call in mock_conn.session_update.await_args_list:
+            update = call.args[1] if len(call.args) > 1 else call.kwargs.get("update")
+            content = getattr(update, "content", None)
+            text = getattr(content, "text", None)
+            if text:
+                texts.append(text)
+        return texts
+
+    async def _start_session(self, agent, mock_manager):
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        state.agent._supports_active_turn_redirect = False
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        return resp.session_id, state, mock_conn
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_a_tool_releases_the_session(self, agent, mock_manager):
+        """A cancelled turn with no final text must not leave the session busy.
+
+        Regression (T3 thread a4f3514a, 2026-10-02): T3 steered mid-command, so
+        it sent session/cancel. The interrupted turn came back with
+        ``final_response=None``; ``final_response.startswith`` raised, the
+        client got JSON-RPC "Internal error", and ``is_running`` stayed True.
+        Every later prompt on the session was then parked in
+        ``queued_prompts`` ("Queued for the next turn") and never ran.
+        """
+        session_id, state, mock_conn = await self._start_session(agent, mock_manager)
+        user_messages = []
+
+        def cancelled_mid_tool(*args, **kwargs):
+            user_messages.append(kwargs.get("user_message"))
+            # What session/cancel does while the agent thread runs a tool.
+            state.cancel_event.set()
+            return {
+                "final_response": None,
+                "interrupted": True,
+                "messages": [
+                    {"role": "user", "content": "run the tests"},
+                    {"role": "assistant", "content": "Operation interrupted."},
+                ],
+            }
+
+        state.agent.run_conversation = cancelled_mid_tool
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="run the tests")],
+            session_id=session_id,
+        )
+        assert resp.stop_reason == "cancelled"
+        assert state.is_running is False
+
+        def answers(*args, **kwargs):
+            user_messages.append(kwargs.get("user_message"))
+            return {"final_response": "done", "messages": []}
+
+        state.agent.run_conversation = answers
+        mock_conn.session_update.reset_mock()
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="continue please")],
+            session_id=session_id,
+        )
+
+        assert resp.stop_reason == "end_turn"
+        assert user_messages == ["run the tests", "continue please"]
+        assert state.queued_prompts == []
+        assert not any(text.startswith("Queued for the next turn") for text in self._prompt_texts(mock_conn))
+
+    @pytest.mark.asyncio
+    async def test_failure_after_the_run_still_releases_the_session(self, agent, mock_manager):
+        """An exception while finishing a turn must not leave the session busy."""
+        session_id, state, _mock_conn = await self._start_session(agent, mock_manager)
+        state.agent.run_conversation = lambda *a, **k: {
+            "final_response": "ok",
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}],
+        }
+
+        with patch.object(mock_manager, "save_session", side_effect=RuntimeError("disk full")):
+            with pytest.raises(RuntimeError, match="disk full"):
+                await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text="hi")],
+                    session_id=session_id,
+                )
+
+        assert state.is_running is False
+        assert state.current_prompt_text == ""
+
 
 
 
