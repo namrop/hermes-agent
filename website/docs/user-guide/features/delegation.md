@@ -168,7 +168,26 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model.
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+### Per-call model pins
+
+The config pin is the default. A single `delegate_task` call can override it with `model`:
+
+```python
+# Every task on one model
+delegate_task(tasks=[...], model="gpt-6-luna")
+
+# One model per task, in task order ("" keeps the default for that task)
+delegate_task(
+    tasks=[{"goal": "..."}, {"goal": "..."}, {"goal": "..."}],
+    model=["glm-5.3", "claude-opus-5-5 --provider custom:meridian-primary", ""],
+)
+```
+
+- A list must have exactly one entry per task. A list with a different length, including a list given with a single `goal`, is an error and no child starts. To run the same goal on several models, repeat the task once per model.
+- Each entry is resolved the way `/model` resolves a name (aliases, configured-provider routing, the OpenRouter subscription guard). When a name is served by more than one provider, add `--provider <slug>`, the same flag `/model` takes.
+- Names resolve from the connection children would otherwise use: the `delegation.provider` pin when one is set, else the parent. A name that stays on the parent's provider (with no pin) only swaps the model, so the child keeps the parent's credentials and fallback chain. A name on any other provider gets that provider's own endpoint and credentials, the same way a `delegation.provider` pin does, and falls back through `delegation.fallback_providers`.
+- Every entry is resolved before any child starts, so one bad name fails the whole call. Each result entry reports the model that actually ran.
+- Per-task fields other than `goal`, `context`, `role`, and `output_schema` are rejected, so a `model` written inside a task errors instead of being ignored.
 
 ## Inherited Tool Access
 

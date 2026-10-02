@@ -274,6 +274,39 @@ def test_manifest_includes_model_and_provider():
     assert len(manifest["tasks"]) == 2
 
 
+def test_manifest_records_per_task_models_when_pinned():
+    """A per-call model list puts each task's own model/provider on its entry."""
+    delegation_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "task 1"}, {"goal": "task 2"}],
+        model="glm-5.3, gpt-6-luna",
+        task_runtimes=[
+            {"model": "glm-5.3", "provider": "zai"},
+            {"model": "gpt-6-luna", "provider": "openai-codex"},
+        ],
+    )
+
+    manifest = json.loads(
+        (live_transcript_root() / delegation_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["model"] == "glm-5.3, gpt-6-luna"
+    assert [(t["model"], t["provider"]) for t in manifest["tasks"]] == [
+        ("glm-5.3", "zai"),
+        ("gpt-6-luna", "openai-codex"),
+    ]
+
+
+def test_manifest_tasks_have_no_model_keys_without_pins():
+    delegation_id, _writers, _paths = create_live_transcripts([{"goal": "task 1"}])
+    manifest = json.loads(
+        (live_transcript_root() / delegation_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "model" not in manifest["tasks"][0]
+
+
 def test_manifest_model_provider_are_optional_and_default_none():
     """When not provided, model and provider should be null in the manifest."""
     delegation_id, _writers, _paths = create_live_transcripts(

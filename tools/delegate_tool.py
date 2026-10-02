@@ -31,7 +31,7 @@ import weakref
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
@@ -1779,12 +1779,29 @@ def _build_child_agent(
     # re-derive here before construction.
     _parent_provider = getattr(parent_agent, "provider", None) or ""
     _effective_provider_norm = (effective_provider or "").strip().lower()
+    from hermes_cli.models import opencode_provider_family
+
     if override_api_mode is not None:
         effective_api_mode = override_api_mode
     elif _effective_provider_norm in {"nous", "nous-portal", "nousresearch"}:
         from hermes_cli.providers import nous_api_mode
 
         effective_api_mode = nous_api_mode(effective_model)
+    elif opencode_provider_family(effective_provider) is not None:
+        # OpenCode Zen/Go is multi-wire within one provider (GLM on
+        # chat_completions, MiniMax/Qwen/Claude on Messages, GPT on
+        # Responses). A child given a different model than its parent on the
+        # same OpenCode provider must follow its own model's wire and the
+        # matching /v1 base-url form, exactly like the Nous branch above.
+        from hermes_cli.models import (
+            normalize_opencode_base_url,
+            opencode_model_api_mode,
+        )
+
+        effective_api_mode = opencode_model_api_mode(effective_provider, effective_model)
+        effective_base_url = normalize_opencode_base_url(
+            effective_provider, effective_api_mode, effective_base_url
+        ) or effective_base_url
     elif effective_provider != _parent_provider:
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:
@@ -3609,6 +3626,218 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+# Fields a task entry may carry: the schema-declared ones plus the
+# trusted-config-only acp_command/acp_args (stripped from model-supplied tasks
+# at dispatch, still accepted from internal callers). Anything else is
+# rejected: an undeclared field that is silently dropped reads as a working
+# feature that does nothing (adapted from upstream 0bfcc92c4e).
+_ALLOWED_TASK_FIELDS = frozenset(
+    {"goal", "context", "role", "output_schema", "acp_command", "acp_args"}
+)
+
+
+def _unknown_task_fields_error(task_list: List[Dict[str, Any]]) -> Optional[str]:
+    for i, task in enumerate(task_list):
+        unknown = sorted(set(task) - _ALLOWED_TASK_FIELDS)
+        if not unknown:
+            continue
+        names = ", ".join(repr(k) for k in unknown)
+        hint = ""
+        if {"model", "provider"} & set(unknown):
+            hint = (
+                " To pin per-task models, pass the top-level 'model' as a "
+                "list with one entry per task, in task order."
+            )
+        return f"Task {i} has unknown field(s) {names}.{hint}"
+    return None
+
+
+def _normalize_model_param(
+    model: Any, n_tasks: int
+) -> Tuple[Optional[List[Optional[str]]], Optional[str]]:
+    """Expand the model-facing ``model`` argument into one spec per task.
+
+    Returns ``(specs, error)``. ``specs`` is None when no model was requested;
+    otherwise a list of length ``n_tasks`` whose entries are a /model-style
+    spec string (``"name"`` or ``"name --provider slug"``) or None for "keep
+    the default for this task". A string applies to every task; a list pins
+    task i to entry i and must have exactly one entry per task.
+    """
+    if model is None:
+        return None, None
+    if isinstance(model, str):
+        stripped = model.strip()
+        if not stripped:
+            return None, None
+        if not stripped.startswith("["):
+            uniform: List[Optional[str]] = [stripped] * n_tasks
+            return uniform, None
+        # Some models emit the list as a JSON string; no model name starts
+        # with "[", so parse it rather than resolving it as a name.
+        try:
+            model = json.loads(stripped)
+        except ValueError:
+            return None, (
+                "'model' looks like a JSON list but could not be parsed. "
+                "Pass a string or a list of strings."
+            )
+    if not isinstance(model, list):
+        return None, (
+            "'model' must be a string or a list of strings, got "
+            f"{type(model).__name__}."
+        )
+    if not model:
+        return None, None
+    for i, entry in enumerate(model):
+        if entry is not None and not isinstance(entry, str):
+            return None, (
+                f"'model' entry {i} must be a string, got {type(entry).__name__}."
+            )
+    if len(model) != n_tasks:
+        return None, (
+            f"'model' is a list of {len(model)} but there "
+            f"{'is 1 task' if n_tasks == 1 else f'are {n_tasks} tasks'}. "
+            "A model list needs one task per entry, in the same order."
+        )
+    return [((entry or "").strip() or None) for entry in model], None
+
+
+def _resolve_task_model_creds(spec: str, parent_agent, base_creds: dict) -> dict:
+    """Resolve one per-task model spec to a child credential bundle.
+
+    ``spec`` is a /model-style string: ``"glm-5.3"``, ``"opus"``, or
+    ``"claude-opus-5-5 --provider custom:meridian-primary"``. Resolution runs
+    the same ``model_switch.switch_model`` pipeline /model uses (aliases,
+    configured-provider routing, the OpenRouter subscription guard), anchored
+    on the connection children would use without a model: the
+    delegation.provider pin when one is configured, otherwise the parent.
+
+    The result is shaped like ``_resolve_delegation_credentials`` output:
+
+    - Unpinned and the name stays on the parent's provider: only the model
+      changes; the child keeps inheriting the parent's connection, pool and
+      fallback chain.
+    - Anything else (a different provider, or any name under a pin): the
+      target is resolved through ``_resolve_delegation_credentials``, the same
+      path a delegation.provider pin takes, so the child gets that provider's
+      own endpoint, key and wire for the resolved model. Never the anchor's
+      connection with a foreign model name.
+
+    Raises ValueError with the resolver's message when the spec cannot be
+    resolved, so the caller fails the whole call before any child starts.
+    """
+    from hermes_cli.model_switch import parse_model_flags_detailed, switch_model
+
+    parsed = parse_model_flags_detailed(spec)
+    name = parsed.model_input
+    explicit_provider = parsed.explicit_provider
+    if not name and not explicit_provider:
+        return base_creds
+
+    pinned = bool(base_creds.get("provider"))
+    if pinned:
+        anchor_provider = str(base_creds.get("provider") or "")
+        anchor_model = str(base_creds.get("model") or "")
+        anchor_base_url = str(base_creds.get("base_url") or "")
+        anchor_api_key = str(base_creds.get("api_key") or "")
+    else:
+        anchor_provider = str(getattr(parent_agent, "provider", "") or "")
+        anchor_model = str(
+            base_creds.get("model") or getattr(parent_agent, "model", "") or ""
+        )
+        anchor_base_url = str(
+            _inherit_parent_base_url(parent_agent, getattr(parent_agent, "base_url", None))
+            or ""
+        )
+        anchor_api_key = getattr(parent_agent, "api_key", None)
+        if not anchor_api_key and isinstance(
+            getattr(parent_agent, "_client_kwargs", None), dict
+        ):
+            anchor_api_key = parent_agent._client_kwargs.get("api_key")
+        anchor_api_key = str(anchor_api_key or "")
+
+    user_providers: Dict[str, Any] = {}
+    custom_providers = None
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        full_cfg = load_config_readonly()
+        user_providers = full_cfg.get("providers") or {}
+        custom_providers = full_cfg.get("custom_providers")
+    except Exception:
+        logger.debug("delegate_task: could not load provider config", exc_info=True)
+
+    try:
+        result = switch_model(
+            raw_input=name,
+            current_provider=anchor_provider,
+            current_model=anchor_model,
+            current_base_url=anchor_base_url,
+            current_api_key=anchor_api_key,
+            is_global=False,
+            explicit_provider=explicit_provider,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
+        )
+    except Exception as exc:  # resolver bugs/network errors fail loudly too
+        raise ValueError(str(exc) or type(exc).__name__) from exc
+    if not result.success:
+        message = result.error_message or "the name did not resolve"
+        searched = str(getattr(result, "target_provider", "") or anchor_provider)
+        if "--provider" not in message and searched:
+            message = (
+                f"{message} Looked up on {searched}; add ' --provider <slug>' "
+                "for another provider."
+            )
+        raise ValueError(message)
+
+    new_model = result.new_model or name
+    target = result.target_provider or anchor_provider
+
+    if not pinned and target == anchor_provider:
+        creds = dict(base_creds)
+        creds["model"] = new_model
+        return creds
+
+    if target.strip().lower() == _RUNTIME_PROVIDER_CUSTOM:
+        # Bare custom endpoint: there is no provider name to re-resolve, so
+        # carry an endpoint. Staying on a pinned direct endpoint
+        # (delegation.base_url) keeps that endpoint; re-resolving bare
+        # "custom" from config could land on an unrelated default.
+        if anchor_provider.strip().lower() == _RUNTIME_PROVIDER_CUSTOM:
+            target_cfg = {
+                "model": new_model,
+                "base_url": anchor_base_url,
+                "api_key": anchor_api_key,
+                "api_mode": str(base_creds.get("api_mode") or ""),
+            }
+        else:
+            target_cfg = {
+                "model": new_model,
+                "base_url": result.base_url or "",
+                "api_key": result.api_key or "",
+                "api_mode": result.api_mode or "",
+            }
+    else:
+        target_cfg = {"provider": target, "model": new_model}
+    resolved = _resolve_delegation_credentials(target_cfg, parent_agent)
+    # A per-task pin names its model; never let the resolver's own default
+    # model replace it.
+    resolved["model"] = resolved.get("model") or new_model
+    return resolved
+
+
+def _batch_model_label(task_creds: List[dict], default_model: Optional[str]) -> Optional[str]:
+    """One model label for single-model metadata (async record, manifest)."""
+    models = [str(c["model"]) for c in task_creds if c.get("model")]
+    distinct = list(dict.fromkeys(models))
+    if not distinct:
+        return default_model
+    if len(distinct) == 1 and len(models) == len(task_creds):
+        return distinct[0]
+    return ", ".join(distinct)
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -3620,6 +3849,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    model: Any = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3629,6 +3859,11 @@ def delegate_task(
     Spawn modes (action='spawn' or omitted):
       - Single: provide goal (+ optional context and role)
       - Batch:  provide tasks array [{goal, context, role}, ...]
+
+    ``model`` pins children to a model: a string pins every task; a list pins
+    task i to entry i and must have one entry per task. Entries are
+    /model-style specs ("glm-5.3", "name --provider slug"); an empty entry
+    keeps the default for that task. See _resolve_task_model_creds.
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3763,6 +3998,9 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+    unknown_fields_error = _unknown_task_fields_error(task_list)
+    if unknown_fields_error:
+        return tool_error(unknown_fields_error)
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3791,6 +4029,30 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # Per-call model pins. Every spec is resolved before any child exists, so
+    # one bad name fails the whole call and nothing starts. Identical specs
+    # resolve once (a string applied to N tasks is one lookup).
+    task_model_specs, model_error = _normalize_model_param(model, len(task_list))
+    if model_error:
+        return tool_error(model_error)
+    task_creds: List[dict] = [creds] * len(task_list)
+    if task_model_specs:
+        resolved_by_spec: Dict[str, dict] = {}
+        for i, spec in enumerate(task_model_specs):
+            if not spec:
+                continue
+            if spec not in resolved_by_spec:
+                try:
+                    resolved_by_spec[spec] = _resolve_task_model_creds(
+                        spec, parent_agent, creds
+                    )
+                except ValueError as exc:
+                    where = f" (task {i})" if len(task_list) > 1 else ""
+                    return tool_error(
+                        f"Could not resolve model '{spec}'{where}: {exc}"
+                    )
+            task_creds[i] = resolved_by_spec[spec]
+
     overall_start = time.monotonic()
     results = []
 
@@ -3810,7 +4072,19 @@ def delegate_task(
     )
 
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list,
+        context,
+        model=_batch_model_label(task_creds, creds.get("model")),
+        provider=(
+            task_creds[0].get("provider")
+            if len({c.get("provider") for c in task_creds}) == 1
+            else None
+        ),
+        task_runtimes=(
+            [{"model": c.get("model"), "provider": c.get("provider")} for c in task_creds]
+            if task_model_specs
+            else None
+        ),
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -3852,6 +4126,9 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Per-task credentials: the call's `model` pin for this task when one
+        # was given, otherwise the delegation default (same object as creds).
+        _creds = task_creds[i]
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3860,18 +4137,18 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=_creds["provider"],
+                override_base_url=_creds["base_url"],
+                override_api_key=_creds["api_key"],
+                override_api_mode=_creds["api_mode"],
+                override_request_overrides=_creds.get("request_overrides"),
+                override_max_tokens=_creds.get("max_output_tokens"),
+                override_acp_command=_creds.get("command"),
+                override_acp_args=_creds.get("args"),
                 role=effective_role,
             )
         except ValueError as exc:
@@ -4263,7 +4540,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_batch_model_label(task_creds, creds["model"]),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -4738,7 +5015,7 @@ def _build_top_level_description() -> str:
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "via 'model' or config (delegation.provider / delegation.model). "
         "Results are returned as an array, one entry per task."
     )
 
@@ -4900,6 +5177,23 @@ DELEGATE_TASK_SCHEMA = {
                     "(same semantics as tasks[].output_schema)."
                 ),
             },
+            "model": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}},
+                ],
+                "description": (
+                    "Optional model pin. A string runs every task on that "
+                    "model. A list pins task i to entry i and must have "
+                    "exactly one entry per task, in task order (\"\" keeps the "
+                    "default for that task). Names resolve the way /model "
+                    "does ('glm-5.3', 'gpt-6-luna', 'opus'); when a name is "
+                    "served by more than one provider add ' --provider "
+                    "<slug>', e.g. 'claude-opus-5-5 --provider "
+                    "custom:meridian-primary'. Omit to use the default "
+                    "delegation model."
+                ),
+            },
             "background": {
                 "type": "boolean",
                 "description": (
@@ -5008,6 +5302,7 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        model=args.get("model"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
