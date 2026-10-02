@@ -18,6 +18,8 @@ Follow-up (same day, found in a T3 browser test against this branch):
 - A child keeps the `delegate_task` call it started under. The step callback completes `delegate_task` before its children start, which emptied the queue the parent id was read from, so children went out without `parentToolCallId`. The last started `delegate_task` call is now kept outside that queue, and each child's parent is fixed at its first record.
 - Replayed tool calls keep `toolName` next to the replay record's `timestamp`; the replay record used to replace the whole `_meta`.
 
+Follow-up, 2026-10-02 (Luis, T3 Code thread, after testing subagents live: "even what the subagent returns gets truncated. having a way to expand that is cheap and easy to do"): a finished child's whole reply now reaches ACP clients. `delegate_task` cut it to 500 characters in the `subagent.complete` event's `summary`, so T3 could show at most that. The event now also carries `result`, the reply up to 20,000 characters (`SUBAGENT_RESULT_MAX_CHARS`); the ACP adapter sends it as the completed record's `summary` and `raw_output`. `summary` stays the 500-character preview for the gateway watch window, TUI mirror and live log, which show a line.
+
 ## 2026-10-01: ACP audio prompts are transcribed like gateway voice notes
 
 Status: Accepted — source implementation (branch `luis/acp-audio-prompts-20261001`); not deployed when written.

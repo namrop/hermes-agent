@@ -127,6 +127,9 @@ _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # every turn / agent spawn even when delegate_task is never called.
 _HIGH_CONCURRENCY_WARNED = False
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
+# A finished child's whole reply, as relayed to progress consumers that show it
+# (the ACP adapter). ``summary`` stays a short preview for the others.
+SUBAGENT_RESULT_MAX_CHARS = 20_000
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
@@ -3237,6 +3240,7 @@ def _run_single_child(
             "status": status,
             "duration_seconds": duration,
             "summary": summary[:500] if summary else entry.get("error", ""),
+            "result": summary[:SUBAGENT_RESULT_MAX_CHARS] if summary else entry.get("error", ""),
             "input_tokens": (
                 int(_input_tokens) if isinstance(_input_tokens, (int, float)) else 0
             ),

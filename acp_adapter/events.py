@@ -193,7 +193,8 @@ def make_tool_progress_cb(
             else:
                 task_status = "failed"
                 acp_status = "failed"
-            summary_value = kwargs.get("summary") or preview
+            # ``result`` is the child's whole reply; ``summary`` is cut to a preview.
+            summary_value = kwargs.get("result") or kwargs.get("summary") or preview
             summary = summary_value if isinstance(summary_value, str) else ""
             lifecycle_event = "completed"
         elif event_type == "subagent.start":
@@ -233,7 +234,7 @@ def make_tool_progress_cb(
         if parent_tool_call_id:
             child["parentToolCallId"] = parent_tool_call_id
         if summary:
-            child["summary"] = summary[:5000]
+            child["summary"] = summary[: 20_000 if lifecycle_event == "completed" else 5_000]
         duration = kwargs.get("duration_seconds")
         if isinstance(duration, (int, float)) and not isinstance(duration, bool):
             child["durationSeconds"] = duration

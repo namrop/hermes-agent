@@ -168,6 +168,26 @@ class TestToolProgressCallback:
         assert updates[0].field_meta["hermes"]["subagent"]["parentToolCallId"] == "parent-call"
         assert updates[-1].raw_output == "Found the metadata boundary"
 
+    def test_a_finished_child_sends_its_whole_reply(self, mock_conn, event_loop_fixture):
+        """``summary`` is a 500-character preview; ``result`` is what the client shows."""
+        tool_call_ids: dict = {}
+        progress_cb = make_tool_progress_cb(mock_conn, "session-1", event_loop_fixture, tool_call_ids, {})
+        reply = "First line.\n" + "z" * 6000
+        child = dict(parent_id=None, depth=1, goal="Write it up", task_index=0)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            progress_cb("tool.started", "delegate_task", None, {"goal": "Write it up"})
+            progress_cb("subagent.start", "delegate_task", "Write it up", {}, subagent_id="c-1", **child)
+            progress_cb(
+                "subagent.complete", "delegate_task", reply[:160], {},
+                subagent_id="c-1", status="completed", summary=reply[:500], result=reply, **child,
+            )
+
+        done = mock_send.call_args_list[-1].args[3]
+        assert done.field_meta["hermes"]["subagent"]["event"] == "completed"
+        assert done.field_meta["hermes"]["subagent"]["summary"] == reply
+        assert done.raw_output == reply
+
     def test_children_of_a_delegate_call_that_already_returned_keep_its_id(
         self, mock_conn, event_loop_fixture
     ):
