@@ -283,9 +283,31 @@ class TestSessionOps:
 
 
     @pytest.mark.asyncio
-    async def test_load_session_not_found_returns_none(self, agent):
-        resp = await agent.load_session(cwd="/tmp", session_id="bogus")
-        assert resp is None
+    async def test_load_session_not_found_is_resource_not_found(self, agent):
+        """A missing session is the spec's -32002, not an empty success.
+
+        An empty reply read as a successful load; T3's next call on the
+        missing session then failed and the thread stuck (2026-10-03).
+        """
+        with pytest.raises(acp.RequestError) as excinfo:
+            await agent.load_session(cwd="/tmp", session_id="bogus")
+        assert excinfo.value.code == -32002
+        assert excinfo.value.data == {"sessionId": "bogus"}
+
+    @pytest.mark.asyncio
+    async def test_load_session_not_found_reaches_the_wire_as_an_error(self, agent):
+        router = build_agent_router(agent)
+        with pytest.raises(acp.RequestError) as excinfo:
+            await router(
+                "session/load",
+                {"cwd": "/tmp", "sessionId": "bogus", "mcpServers": []},
+                False,
+            )
+        assert excinfo.value.to_error_obj() == {
+            "code": -32002,
+            "message": "Session bogus not found",
+            "data": {"sessionId": "bogus"},
+        }
 
 
 

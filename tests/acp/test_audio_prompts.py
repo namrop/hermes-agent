@@ -12,10 +12,13 @@ Pinned here:
    client is shown what was heard as a completed tool call unless
    ``stt_echo_transcripts`` is off.
 4. A prompt carrying audio is never handled as a slash command.
+5. A session whose first prompt is still being transcribed is not deleted
+   as never used when the process exits.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -348,6 +351,40 @@ async def test_prompt_with_audio_is_not_treated_as_a_slash_command(agent, mock_m
         )
     slash.assert_not_called()
     assert seen["user_message"] == '/help\n"voice says hello"'
+
+
+@pytest.mark.asyncio
+async def test_session_waiting_on_transcription_survives_exit_cleanup(tmp_path):
+    """2026-10-03: a voice note waited on speech-to-text, T3 stopped the
+    process, and the exit cleanup deleted the session as never used. The
+    thread could not reopen it."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    manager = SessionManager(
+        agent_factory=lambda: MagicMock(name="MockAIAgent"), db=db
+    )
+    agent = HermesACPAgent(session_manager=manager)
+    resp = await agent.new_session(cwd=".")
+    unprompted = await agent.new_session(cwd=".")
+    transcribing = asyncio.Event()
+
+    async def stuck(prompt, **_kwargs):
+        transcribing.set()
+        await asyncio.Event().wait()  # the GPU never frees up
+
+    with patch("acp_adapter.server.transcribe_audio_blocks", side_effect=stuck):
+        task = asyncio.create_task(
+            agent.prompt(prompt=[_audio()], session_id=resp.session_id)
+        )
+        await asyncio.wait_for(transcribing.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert manager.discard_empty_sessions() == 1
+    assert db.get_session(resp.session_id) is not None
+    assert db.get_session(unprompted.session_id) is None
 
 
 def test_module_has_no_import_time_side_effects():

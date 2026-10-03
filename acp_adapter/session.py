@@ -206,6 +206,12 @@ class SessionState:
     # True only for sessions this process created (session/new, fork). Only
     # those are candidates for the never-used cleanup on exit.
     created_here: bool = False
+    # True once the client has sent this session a prompt. A prompted session
+    # is in use even while its history is still empty: the first prompt can
+    # wait minutes on speech-to-text before the agent writes a message, and
+    # the client already holds the session id to reopen it. The never-used
+    # cleanup on exit leaves it alone.
+    prompted: bool = False
 
 
 class SessionManager:
@@ -441,8 +447,12 @@ class SessionManager:
         row in the shared session history. Called when the ACP process
         exits; same rule as the CLI's exit path: only rows with no messages,
         no title and no child sessions are removed, checked and deleted in
-        one transaction (``SessionDB.delete_session_if_empty``). Returns the
-        number of rows removed.
+        one transaction (``SessionDB.delete_session_if_empty``). A session
+        the client has prompted is never a candidate, even with no messages
+        yet: on 2026-10-03 a T3 thread's first prompt (a voice note) waited
+        on speech-to-text, T3 gave up and stopped the process, this cleanup
+        deleted the row, and the thread could not reopen its session.
+        Returns the number of rows removed.
         """
         db = self._get_db()
         if db is None:
@@ -451,7 +461,7 @@ class SessionManager:
             candidates = [
                 sid
                 for sid, state in self._sessions.items()
-                if state.created_here and not state.history
+                if state.created_here and not state.history and not state.prompted
             ]
         removed = 0
         for session_id in candidates:

@@ -1715,11 +1715,20 @@ class HermesACPAgent(acp.Agent):
         session_id: str,
         mcp_servers: list | None = None,
         **kwargs: Any,
-    ) -> LoadSessionResponse | None:
+    ) -> LoadSessionResponse:
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
-            return None
+            # The spec's "Resource not found" (-32002), so the client can tell
+            # a missing session from a loaded one and start a fresh session.
+            # Returning None went out as an empty success ({}), which T3 took
+            # for a load; its next call on the missing session then failed
+            # and left the thread stuck (2026-10-03).
+            raise acp.RequestError(
+                -32002,
+                f"Session {session_id} not found",
+                {"sessionId": session_id},
+            )
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)
         logger.info("Loaded session %s", session_id)
@@ -1898,6 +1907,9 @@ class HermesACPAgent(acp.Agent):
         if state is None:
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
+        # Before anything that can wait (speech-to-text below): from here on
+        # the session is in use, so the exit cleanup must not delete it.
+        state.prompted = True
 
         # Audio arrives like a gateway voice note: transcribe it with the
         # configured STT provider and hand the agent text (acp_adapter/

@@ -450,6 +450,17 @@ class TestDiscardEmptySessions:
 
         assert db.get_session(state.session_id) is not None
 
+    def test_keeps_a_prompted_session_whose_history_is_still_empty(self, tmp_path):
+        """A first prompt still on speech-to-text has written nothing yet."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session(cwd="/work")
+        state.prompted = True
+
+        assert manager.discard_empty_sessions() == 0
+
+        assert db.get_session(state.session_id) is not None
+
     def test_keeps_empty_sessions_this_process_only_opened(self, tmp_path):
         """Opening someone else's empty session must not delete it on exit."""
         db = SessionDB(tmp_path / "state.db")
