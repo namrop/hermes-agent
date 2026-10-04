@@ -2397,7 +2397,23 @@ def _transcribe_openai(
                 Path(file_path).name, provider_label, model_name, len(transcript_text),
             )
 
-            return {"success": True, "transcript": transcript_text, "provider": provider_label}
+            result: Dict[str, Any] = {"success": True, "transcript": transcript_text, "provider": provider_label}
+            # OpenAI-compatible self-hosted gateways (e.g. the Sol voice
+            # gateway) return provenance fields alongside ``text`` — which
+            # backend/model actually did the work. The OpenAI SDK preserves
+            # them in model_extra; carry them so voice-note enrichment can
+            # tell the agent which engine transcribed the audio (the CPU
+            # fallback is a bit less accurate on names than the primary lane).
+            extras = getattr(transcription, "model_extra", None)
+            if isinstance(extras, dict) and extras:
+                stt_meta = {
+                    key: extras[key]
+                    for key in ("backend", "model", "requested_model", "device")
+                    if key in extras
+                }
+                if stt_meta:
+                    result["stt"] = stt_meta
+            return result
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -3300,6 +3316,33 @@ def _is_local_or_private_url(url: str) -> bool:
             return False
     except Exception:
         return False
+
+
+def stt_provenance_note(result: Dict[str, Any]) -> Optional[str]:
+    """One-line agent-facing note naming the engine that transcribed a voice
+    message, when the transcription backend reported it.
+
+    The Sol voice gateway returns ``backend``/``model`` extras (carried into
+    the result dict under ``stt``). The Phonon-2 CPU fallback answers while
+    the GPU lease is held but is a bit less accurate than Whisper, so its
+    note carries that hint for the agent weighing the transcript. Returns
+    None when the backend did not identify itself (local fallbacks).
+    """
+    meta = result.get("stt")
+    if not isinstance(meta, dict):
+        return None
+    backend = str(meta.get("backend") or "")
+    model_name = str(meta.get("model") or "")
+    label = " ".join(part for part in (backend, model_name) if part)
+    if not label:
+        return None
+    if backend == "phonon-2-cpu":
+        return (
+            f"[Transcribed by {label} — the CPU fallback that answers while "
+            "the GPU is busy; it is a bit less accurate than Whisper, "
+            "especially on names and coined terms.]"
+        )
+    return f"[Transcribed by {label}.]"
 
 
 def transcribe_audio_local_fallback(

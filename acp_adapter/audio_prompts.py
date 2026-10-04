@@ -226,5 +226,13 @@ async def transcribe_audio_blocks(
             continue
         transcripts.append(transcript)
         out.append(TextContentBlock(type="text", text=f'"{transcript}"'))
+        try:
+            from tools.transcription_tools import stt_provenance_note
+
+            stt_note = stt_provenance_note(result)
+        except Exception:
+            stt_note = None
+        if stt_note:
+            out.append(TextContentBlock(type="text", text=stt_note))
 
     return out, transcripts

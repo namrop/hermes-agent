@@ -25406,6 +25406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             from tools.transcription_tools import (
+                stt_provenance_note,
                 transcribe_audio,
                 transcribe_audio_local_fallback,
             )
@@ -25460,6 +25461,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the LLM volunteer commentary about voice mode rather than
                     # reply to the content.
                     enriched_parts.append(f'"{transcript}"')
+                    stt_note = stt_provenance_note(result)
+                    if stt_note:
+                        enriched_parts.append(stt_note)
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.

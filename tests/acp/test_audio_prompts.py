@@ -163,6 +163,35 @@ async def test_local_fallback_recovers_a_failed_configured_transcription():
 
 
 @pytest.mark.asyncio
+async def test_backend_provenance_follows_the_transcript_when_reported():
+    """The Sol voice gateway reports which engine did the work; the agent
+    must see it, because the CPU fallback is a bit less accurate on names."""
+
+    class _MetaRecorder(_Recorder):
+        def transcribe(self, path: str) -> dict:
+            self.transcribed.append(path)
+            return {
+                "success": True,
+                "transcript": "deploy the phonon fallback",
+                "stt": {"backend": "phonon-2-cpu", "model": "phonon-2"},
+            }
+
+    rec = _MetaRecorder()
+    out, _ = await transcribe_audio_blocks([_audio()], **rec.kwargs())
+    assert out[0].text == '"deploy the phonon fallback"'
+    assert len(out) == 2
+    assert "phonon-2" in out[1].text
+    assert "less accurate than Whisper" in out[1].text
+
+
+@pytest.mark.asyncio
+async def test_no_provenance_block_when_backend_is_silent():
+    rec = _Recorder(transcript="plain transcript")
+    out, _ = await transcribe_audio_blocks([_audio()], **rec.kwargs())
+    assert [b.text for b in out] == ['"plain transcript"']
+
+
+@pytest.mark.asyncio
 async def test_failed_transcription_points_the_agent_at_the_cached_audio():
     rec = _Recorder(ok=False, fallback=None)
     out, transcripts = await transcribe_audio_blocks([_audio()], **rec.kwargs())
