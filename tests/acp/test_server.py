@@ -895,6 +895,109 @@ class TestRegisterSessionMcpServers:
         state.agent._invalidate_system_prompt.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("lifecycle", ["new", "load", "resume", "fork"])
+    @pytest.mark.parametrize("switch", ["protocol", "slash"])
+    async def test_session_mcp_survives_model_switch(self, agent, mock_manager, monkeypatch, lifecycle, switch):
+        """Client MCP tools survive both rebuilds, including reopened/forked sessions."""
+        import json
+        from acp.schema import McpServerStdio, EnvVariable
+        from tools.registry import ToolEntry, registry
+        from tools.tool_search import dispatch_tool_search
+
+        tool_name = "mcp__t3_code__t3_thread_launch"
+        # Registration's registry metadata lets the real tool_search classifier
+        # recognize this schema as a deferred MCP tool.
+        monkeypatch.setitem(registry._tools, tool_name, ToolEntry(
+            tool_name, "mcp-t3-code", {}, lambda args: "{}", None, [], False, "", "",
+        ))
+
+        def make_agent():
+            rebuilt = MagicMock(name="MockAIAgent")
+            rebuilt.model = "old-model"
+            rebuilt.provider = "openrouter"
+            rebuilt.base_url = None
+            rebuilt.api_mode = None
+            rebuilt.enabled_toolsets = ["hermes-acp"]
+            rebuilt.disabled_toolsets = None
+            rebuilt.tools = []
+            rebuilt.valid_tool_names = set()
+            rebuilt._memory_manager = SimpleNamespace(
+                get_all_tool_schemas=lambda: [
+                    {"name": "hindsight_recall", "description": "Recall", "parameters": {}}
+                ]
+            )
+            return rebuilt
+
+        mock_manager._agent_factory = make_agent
+        original = mock_manager.create_session(cwd="/tmp")
+        server = McpServerStdio(
+            name="t3-code", command="node", args=["acp-mcp-bridge"],
+            env=[EnvVariable(name="T3_ACP_MCP_AUTHORIZATION", value="Bearer test-only-secret")],
+        )
+
+        def tool_defs(*, enabled_toolsets, **kwargs):
+            if "mcp-t3-code" not in enabled_toolsets:
+                return []
+            return [
+                {"type": "function", "function": {
+                    "name": tool_name, "description": "Launch a T3 thread", "parameters": {},
+                }},
+                {"type": "function", "function": {"name": "memory", "parameters": {}}},
+            ]
+
+        with patch("tools.mcp_tool.register_mcp_servers", return_value=[tool_name]) as register, \
+             patch("model_tools.get_tool_definitions", side_effect=tool_defs):
+            if lifecycle == "new":
+                response = await agent.new_session(cwd="/tmp", mcp_servers=[server])
+            elif lifecycle == "fork":
+                response = await agent.fork_session(cwd="/tmp", session_id=original.session_id, mcp_servers=[server])
+            else:
+                # Force a DB-backed restore before the client reattaches its MCP server.
+                mock_manager._sessions.pop(original.session_id)
+                response = await getattr(agent, f"{lifecycle}_session")(
+                    cwd="/tmp", session_id=original.session_id, mcp_servers=[server],
+                )
+            session_id = response.session_id if lifecycle in {"new", "fork"} else original.session_id
+            state = mock_manager.get_session(session_id)
+            assert tool_name in state.agent.valid_tool_names
+            old_agent = state.agent
+            if switch == "protocol":
+                await agent.set_session_model("anthropic:claude-opus-5-5", session_id)
+            else:
+                result = agent._handle_slash_command("/model anthropic:claude-opus-5-5", state)
+                assert "Model switched to:" in result
+
+            assert state.agent is not old_agent
+            assert state.agent.enabled_toolsets == ["hermes-acp", "mcp-t3-code"]
+            assert tool_name in {tool["function"]["name"] for tool in state.agent.tools}
+            assert state.agent.valid_tool_names == {tool_name, "memory", "hindsight_recall"}
+            state.agent._invalidate_system_prompt.assert_called_once()
+            assert state.mcp_server_names == ["t3-code"]
+            hits = json.loads(dispatch_tool_search({"query": "t3"}, current_tool_defs=state.agent.tools))
+            assert tool_name in {hit["name"] for hit in hits["matches"]}
+            assert tool_name in agent._cmd_tools("", state)
+            register.assert_called_once()
+            agent._cmd_reset("", state)
+            await agent.set_config_option("mode", session_id, "default")
+            assert tool_name in state.agent.valid_tool_names
+
+        # Session metadata must never retain the client transport or credential.
+        stored = mock_manager._get_db().get_session(session_id)
+        assert "test-only-secret" not in json.dumps(stored)
+        assert "T3_ACP_MCP_AUTHORIZATION" not in json.dumps(stored)
+        assert "mcp_server" not in stored["model_config"]
+
+    @pytest.mark.asyncio
+    async def test_tools_includes_session_mcp_names(self, agent, mock_manager):
+        """The listing expands session MCP names even from a base toolset snapshot."""
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.enabled_toolsets = ["hermes-acp"]
+        state.mcp_server_names = ["t3-code"]
+        with patch("model_tools.get_tool_definitions", return_value=[]) as definitions:
+            agent._cmd_tools("", state)
+        assert definitions.call_args.kwargs["enabled_toolsets"] == ["hermes-acp", "mcp-t3-code"]
+
+    @pytest.mark.asyncio
     async def test_register_failure_logs_warning(self, agent, mock_manager):
         """If register_mcp_servers raises, warning is logged but no crash."""
         from acp.schema import McpServerStdio

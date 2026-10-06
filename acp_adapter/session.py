@@ -191,6 +191,9 @@ class SessionState:
     agent: Any  # AIAgent instance
     cwd: str = "."
     model: str = ""
+    # Client MCP names only; transport configuration and credentials remain
+    # in the runtime MCP registry, never in persisted session metadata.
+    mcp_server_names: List[str] = field(default_factory=list)
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False

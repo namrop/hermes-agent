@@ -1210,13 +1210,22 @@ class HermesACPAgent(acp.Agent):
             )
             return
 
+        for name in config_map:
+            if name not in state.mcp_server_names:
+                state.mcp_server_names.append(name)
+        self._refresh_session_mcp_tools(state)
+
+    def _refresh_session_mcp_tools(self, state: SessionState) -> None:
+        """Reapply client MCP toolsets after registration or an agent rebuild."""
+        if not state.mcp_server_names:
+            return
         try:
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
+                mcp_server_names=state.mcp_server_names,
             )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
@@ -1233,13 +1242,13 @@ class HermesACPAgent(acp.Agent):
             if callable(invalidate):
                 invalidate()
             logger.info(
-                "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
+                "Session %s: refreshed ACP MCP tool surface (%d tools)",
                 state.session_id,
                 len(state.agent.tools or []),
             )
         except Exception:
             logger.warning(
-                "Session %s: failed to refresh tool surface after ACP MCP registration",
+                "Session %s: failed to refresh ACP MCP tool surface",
                 state.session_id,
                 exc_info=True,
             )
@@ -2505,6 +2514,7 @@ class HermesACPAgent(acp.Agent):
             model=new_model,
             requested_provider=target_provider,
         )
+        self._refresh_session_mcp_tools(state)
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
@@ -2517,7 +2527,8 @@ class HermesACPAgent(acp.Agent):
             from agent.memory_manager import inject_memory_provider_tools
 
             toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
+                mcp_server_names=state.mcp_server_names,
             )
             tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
             tool_view = SimpleNamespace(
@@ -2757,6 +2768,7 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            self._refresh_session_mcp_tools(state)
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
