@@ -933,6 +933,10 @@ def init_agent(
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
+    # True when reasoning_config is a level the session explicitly chose (an
+    # ACP client's ``reasoning`` setting); fallback hops keep it instead of
+    # re-resolving from config. Set by the ACP adapter.
+    agent._session_reasoning_pinned = False
     # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.

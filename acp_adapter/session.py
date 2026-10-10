@@ -215,6 +215,32 @@ class SessionState:
     # the client already holds the session id to reopen it. The never-used
     # cleanup on exit leaves it alone.
     prompted: bool = False
+    # Reasoning level the client chose for this session through the
+    # ``reasoning`` setting (``none``, ``low`` ... ``ultra``). None follows
+    # config.yaml: ``agent.reasoning_overrides`` for the model, then
+    # ``agent.reasoning_effort``. Held per process like ``mode``; clients
+    # re-send their settings when they reopen a session.
+    reasoning_effort: Optional[str] = None
+
+
+def resolve_session_reasoning_config(
+    model: Any, reasoning_effort: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Return the reasoning config an ACP session's agent runs with.
+
+    A level the session chose wins. Otherwise it is resolved from
+    config.yaml through the same chokepoint the gateway, CLI and cron use,
+    for ``model`` (the config default model when ``model`` is empty).
+    """
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    if reasoning_effort is not None:
+        return parse_reasoning_effort(reasoning_effort)
+    from hermes_cli.config import load_config
+
+    return resolve_reasoning_config(
+        load_config() or {}, model if isinstance(model, str) else ""
+    )
 
 
 class SessionManager:
@@ -708,6 +734,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        reasoning_effort: str | None = None,
     ):
         if self._agent_factory is not None:
             return self._agent_factory()
@@ -747,6 +774,12 @@ class SessionManager:
             # it an ACP session has nowhere to go when its provider is benched
             # or capped: it keeps retrying the capped provider instead.
             "fallback_model": get_fallback_chain(config) or None,
+            # Without it the agent sent no reasoning level until a fallback
+            # hop re-resolved one, so the configured level never reached
+            # an ACP session's primary model.
+            "reasoning_config": resolve_session_reasoning_config(
+                model or default_model, reasoning_effort
+            ),
         }
 
         try:
@@ -794,6 +827,9 @@ class SessionManager:
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.
         agent.session_cwd = cwd
+        # A level the session chose outlasts fallback hops (see
+        # agent.chat_completion_helpers.refresh_fallback_reasoning_config).
+        agent._session_reasoning_pinned = reasoning_effort is not None
         # ACP stdio transport requires stdout to remain protocol-only JSON-RPC.
         # Route any incidental human-readable agent output to stderr instead.
         agent._print_fn = _acp_stderr_print

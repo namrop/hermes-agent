@@ -152,6 +152,64 @@ class TestCreateSession:
             ("kimi-coding", "k3"),
         ]
 
+    @staticmethod
+    def _reasoning_fixture(monkeypatch, agent_cfg):
+        class FakeAgent:
+            model = "claude-opus-5-5"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        config = {
+            "model": {"default": "claude-opus-5-5", "provider": "custom:meridian-yugen"},
+            "agent": agent_cfg,
+            "mcp_servers": {},
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "anthropic_messages",
+                "base_url": "http://127.0.0.1:3457",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+        return SessionManager(db=None)
+
+    def test_make_agent_reads_the_configured_reasoning_level(self, monkeypatch):
+        """ACP sessions start on agent.reasoning_effort, like every other platform.
+
+        Before, the agent was built with no reasoning config, so a T3 turn
+        ran on the provider's default until a fallback re-resolved it.
+        """
+        manager = self._reasoning_fixture(monkeypatch, {"reasoning_effort": "xhigh"})
+
+        state = manager.create_session(cwd="/tmp/project")
+
+        assert state.agent.kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert state.agent._session_reasoning_pinned is False
+
+    def test_make_agent_honors_a_per_model_reasoning_override(self, monkeypatch):
+        manager = self._reasoning_fixture(
+            monkeypatch,
+            {"reasoning_effort": "xhigh", "reasoning_overrides": {"claude-opus-5-5": "high"}},
+        )
+
+        state = manager.create_session(cwd="/tmp/project")
+
+        assert state.agent.kwargs["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+    def test_make_agent_uses_the_sessions_chosen_level_over_config(self, monkeypatch):
+        manager = self._reasoning_fixture(monkeypatch, {"reasoning_effort": "xhigh"})
+
+        agent = manager._make_agent(session_id="s1", cwd="/tmp/project", reasoning_effort="low")
+
+        assert agent.kwargs["reasoning_config"] == {"enabled": True, "effort": "low"}
+        assert agent._session_reasoning_pinned is True
+
 
 
 

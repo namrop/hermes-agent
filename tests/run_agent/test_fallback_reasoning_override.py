@@ -106,6 +106,44 @@ class TestFallbackReasoningOverride:
         # reasoning_config should be restored to primary's value (medium)
         assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
 
+    def test_fallback_re_resolution_uses_the_fallback_model(self, monkeypatch):
+        from agent.chat_completion_helpers import refresh_fallback_reasoning_config
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"reasoning_effort": "xhigh",
+                               "reasoning_overrides": {"gpt-6.1-sol": "high"}}},
+        )
+        agent = MagicMock()
+        agent.model = "gpt-6.1-sol"
+        agent._session_reasoning_pinned = False
+        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        refresh_fallback_reasoning_config(agent)
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+
+    def test_fallback_keeps_a_level_the_session_chose(self, monkeypatch):
+        """A level chosen for the session (ACP setting) outlasts a fallback hop.
+
+        The re-resolution exists for per-model config overrides; an explicit
+        session choice ranks above those, so the hop must not replace it.
+        """
+        from agent.chat_completion_helpers import refresh_fallback_reasoning_config
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"reasoning_effort": "xhigh"}},
+        )
+        agent = MagicMock()
+        agent.model = "gpt-6.1-sol"
+        agent._session_reasoning_pinned = True
+        agent.reasoning_config = {"enabled": True, "effort": "low"}
+
+        refresh_fallback_reasoning_config(agent)
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+
     def test_fallback_global_fallback_with_yaml_false(self):
         """Fallback global fallback must not coerce YAML boolean False.
 

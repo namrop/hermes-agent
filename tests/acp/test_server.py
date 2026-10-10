@@ -58,10 +58,16 @@ def agent(mock_manager):
 
 
 @pytest.mark.asyncio
-async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(agent):
+async def test_new_session_exposes_edit_approvals_as_modes_and_as_a_setting(agent):
+    """Modes stay for clients that read them; settings now carry them too.
+
+    Upstream advertised no settings, for Zed's model picker. The fork offers
+    a reasoning setting (2026-10-09), and the ACP spec tells settings-aware
+    clients to ignore ``modes``, so the mode is listed among the settings.
+    """
     resp = await agent.new_session(cwd="/tmp")
 
-    assert resp.config_options is None
+    assert [option.id for option in resp.config_options] == ["mode", "reasoning"]
     assert isinstance(resp.modes, SessionModeState)
     assert resp.modes.current_mode_id == "default"
     assert [(mode.id, mode.name) for mode in resp.modes.available_modes] == [
@@ -73,7 +79,7 @@ async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(ag
 
 
 @pytest.mark.asyncio
-async def test_set_config_option_persists_edit_approval_policy_without_advertising_config(agent):
+async def test_set_config_option_persists_edit_approval_policy_and_reports_the_mode(agent):
     resp = await agent.new_session(cwd="/tmp")
     update = await agent.set_config_option(
         "edit_approval_policy",
@@ -83,7 +89,8 @@ async def test_set_config_option_persists_edit_approval_policy_without_advertisi
     state = agent.session_manager.get_session(resp.session_id)
 
     assert isinstance(update, SetSessionConfigOptionResponse)
-    assert update.config_options == []
+    mode = next(option for option in update.config_options if option.id == "mode")
+    assert mode.current_value == "accept_edits"
     assert getattr(state, "mode", None) == "accept_edits"
 
 
@@ -482,7 +489,11 @@ class TestSessionConfiguration:
         )
 
         assert mode_result == {}
-        assert config_result["configOptions"] == []
+        # An id Hermes does not offer is still accepted; the answer lists
+        # every setting Hermes does offer, with its current value.
+        options = {option["id"]: option for option in config_result["configOptions"]}
+        assert list(options) == ["mode", "reasoning"]
+        assert options["mode"]["currentValue"] == "accept_edits"
 
 
 

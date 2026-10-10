@@ -2592,6 +2592,39 @@ def fallback_entry_busy(fb: dict) -> Optional[str]:
     return None
 
 
+def refresh_fallback_reasoning_config(agent) -> None:
+    """Re-resolve ``agent.reasoning_config`` for the fallback model just activated.
+
+    Shared chokepoint: per-model override > global reasoning_effort (YAML
+    boolean False = disabled), so per-model overrides apply to the fallback
+    model too (Closes #21256). A level the session explicitly chose (an ACP
+    client's ``reasoning`` setting, ``agent._session_reasoning_pinned``)
+    ranks above those config defaults and is kept. A config load failure
+    keeps the current value rather than breaking the swap.
+    """
+    if getattr(agent, "_session_reasoning_pinned", False) is True:
+        logger.info(
+            "Fallback %s: keeping the session's chosen reasoning_config: %s",
+            agent.model, agent.reasoning_config,
+        )
+        return
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+
+        agent.reasoning_config = resolve_reasoning_config(
+            load_config() or {}, agent.model
+        )
+        logger.info(
+            "Fallback %s: reasoning_config resolved: %s",
+            agent.model, agent.reasoning_config,
+        )
+    except Exception as _reasoning_err:
+        logger.debug(
+            "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
+            agent.model, _reasoning_err,
+        )
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -3022,27 +3055,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_mode=agent.api_mode,
             )
 
-        # Re-resolve reasoning_config for the new fallback model (Closes #21256).
-        # Shared chokepoint: per-model override > global reasoning_effort
-        # (YAML boolean False = disabled). Wrapped in try/except because a
-        # config load failure must not kill the swap.
-        try:
-            from hermes_cli.config import load_config
-            from hermes_constants import resolve_reasoning_config
-
-            agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
-            )
-            logger.info(
-                "Fallback %s: reasoning_config resolved: %s",
-                agent.model, agent.reasoning_config,
-            )
-        except Exception as _reasoning_err:
-            logger.debug(
-                "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
-                agent.model, _reasoning_err,
-            )
-            # Keep whatever reasoning_config was active — don't break the fallback swap.
+        refresh_fallback_reasoning_config(agent)
 
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.

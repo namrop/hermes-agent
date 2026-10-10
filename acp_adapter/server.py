@@ -41,6 +41,8 @@ from acp.schema import (
     PromptCapabilities,
     PromptResponse,
     ResumeSessionResponse,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SetSessionConfigOptionResponse,
     SetSessionModelResponse,
     SetSessionModeResponse,
@@ -73,7 +75,12 @@ from acp_adapter.events import (
 )
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionManager,
+    SessionState,
+    _expand_acp_enabled_toolsets,
+    resolve_session_reasoning_config,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start, make_tool_call_id
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -678,6 +685,12 @@ class HermesACPAgent(acp.Agent):
         "workspace_session": _MODE_ACCEPT_EDITS,
         "session": _MODE_DONT_ASK,
     }
+    # The session's reasoning level, offered as a setting (category
+    # ``thought_level``). ``default`` follows config.yaml; the other values
+    # are Hermes's own levels, the ones ``/reasoning`` accepts in the gateway.
+    _REASONING_CONFIG_ID = "reasoning"
+    _REASONING_DEFAULT = "default"
+    _REASONING_LABELS = {"none": "Off", "xhigh": "Extra high"}
 
     def __init__(self, session_manager: SessionManager | None = None):
         super().__init__()
@@ -693,12 +706,14 @@ class HermesACPAgent(acp.Agent):
 
 
     def _session_modes(self, state: SessionState) -> SessionModeState:
-        """Return ACP session modes while preserving Zed's separate model picker.
+        """Return the ACP session modes (edit approval policy).
 
-        Zed renders ``config_options`` in the prominent selector slot where the
-        model picker was visible. Claude/Codex expose policy-like controls as ACP
-        modes, which coexist with the model picker, so Hermes maps edit approval
-        policy onto modes instead of advertising config options.
+        Upstream kept Hermes off ``config_options`` because Zed renders them
+        where its model picker sits. This fork advertises them for the
+        reasoning setting T3 Code offers (2026-10-09); the same modes are
+        also listed there (``_mode_config_option``), since the ACP spec tells
+        clients that read settings to ignore ``modes``. The model stays on
+        the models API.
         """
 
         current = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
@@ -735,6 +750,90 @@ class HermesACPAgent(acp.Agent):
         if normalized not in self._MODE_TO_EDIT_APPROVAL_POLICY:
             return self._MODE_DEFAULT
         return normalized
+
+    # ---- Session settings (ACP config options) -------------------------------
+
+    def _session_config_options(self, state: SessionState) -> list[SessionConfigOptionSelect]:
+        """Every setting the session offers, with its current value."""
+        return [self._mode_config_option(state), self._reasoning_config_option(state)]
+
+    def _mode_config_option(self, state: SessionState) -> SessionConfigOptionSelect:
+        modes = self._session_modes(state)
+        return SessionConfigOptionSelect(
+            id=self._MODE_CONFIG_ID,
+            name="Mode",
+            description="When Hermes asks before edits and commands.",
+            category="mode",
+            type="select",
+            current_value=modes.current_mode_id,
+            options=[
+                SessionConfigSelectOption(
+                    value=mode.id, name=mode.name, description=mode.description
+                )
+                for mode in modes.available_modes
+            ],
+        )
+
+    @staticmethod
+    def _reasoning_levels() -> tuple[str, ...]:
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        return ("none", *VALID_REASONING_EFFORTS)
+
+    def _session_model_name(self, state: SessionState) -> str:
+        model = state.model or getattr(state.agent, "model", "")
+        return model if isinstance(model, str) else ""
+
+    def _reasoning_config_option(self, state: SessionState) -> SessionConfigOptionSelect:
+        configured = resolve_session_reasoning_config(self._session_model_name(state), None)
+        if configured is None:
+            default_name = "Default (provider's own)"
+        elif configured.get("enabled") is False:
+            default_name = "Default (off)"
+        else:
+            default_name = f"Default ({configured.get('effort')})"
+        choices = [
+            SessionConfigSelectOption(
+                value=self._REASONING_DEFAULT,
+                name=default_name,
+                description="Follow Hermes config (agent.reasoning_effort).",
+            )
+        ]
+        choices.extend(
+            SessionConfigSelectOption(
+                value=level,
+                name=self._REASONING_LABELS.get(level, level.capitalize()),
+            )
+            for level in self._reasoning_levels()
+        )
+        return SessionConfigOptionSelect(
+            id=self._REASONING_CONFIG_ID,
+            name="Reasoning",
+            description="Reasoning effort for this session.",
+            category="thought_level",
+            type="select",
+            current_value=state.reasoning_effort or self._REASONING_DEFAULT,
+            options=choices,
+        )
+
+    def _apply_session_reasoning(self, state: SessionState) -> None:
+        """Put the session's reasoning level on its agent.
+
+        Also written into the agent's primary-runtime snapshot, which the
+        turn after a fallback restores, so the restore cannot put an older
+        level back. With no choice the level is re-resolved from config for
+        the session's own model, so each turn picks up config changes as the
+        gateway's turns do.
+        """
+        agent = state.agent
+        reasoning = resolve_session_reasoning_config(
+            self._session_model_name(state), state.reasoning_effort
+        )
+        agent.reasoning_config = reasoning
+        agent._session_reasoning_pinned = state.reasoning_effort is not None
+        primary = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary, dict):
+            primary["reasoning_config"] = dict(reasoning) if reasoning else None
 
     def _asks_every_command(self, state: SessionState) -> bool:
         return str(getattr(state, "mode", "") or "") == self._MODE_SUPERVISED
@@ -1713,6 +1812,7 @@ class HermesACPAgent(acp.Agent):
             session_id=state.session_id,
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._provenance_meta(
                 state.session_id, getattr(state.agent, "session_id", state.session_id)
             ),
@@ -1770,6 +1870,7 @@ class HermesACPAgent(acp.Agent):
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._reopened_session_meta(state),
         )
 
@@ -1804,6 +1905,7 @@ class HermesACPAgent(acp.Agent):
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._reopened_session_meta(state),
         )
 
@@ -1846,6 +1948,7 @@ class HermesACPAgent(acp.Agent):
             session_id=new_id,
             models=self._build_model_state(state) if state is not None else None,
             modes=self._session_modes(state) if state is not None else None,
+            config_options=self._session_config_options(state) if state is not None else None,
         )
 
     async def list_sessions(
@@ -2138,6 +2241,9 @@ class HermesACPAgent(acp.Agent):
             approval_cb = None
 
         agent = state.agent
+        # Each turn starts on the session's level: a fallback hop in an
+        # earlier turn may have re-resolved it, and config may have changed.
+        self._apply_session_reasoning(state)
         agent.tool_progress_callback = tool_progress_cb
         # ACP thought panes should not receive Hermes' local kawaii waiting/status
         # updates. Route provider/model reasoning deltas instead; if the provider
@@ -2513,7 +2619,9 @@ class HermesACPAgent(acp.Agent):
             cwd=state.cwd,
             model=new_model,
             requested_provider=target_provider,
+            reasoning_effort=state.reasoning_effort,
         )
+        self._apply_session_reasoning(state)
         self._refresh_session_mcp_tools(state)
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
@@ -2767,7 +2875,9 @@ class HermesACPAgent(acp.Agent):
                 requested_provider=requested_provider,
                 base_url=current_base_url,
                 api_mode=current_api_mode,
+                reasoning_effort=state.reasoning_effort,
             )
+            self._apply_session_reasoning(state)
             self._refresh_session_mcp_tools(state)
             self.session_manager.save_session(session_id)
             logger.info(
@@ -2797,7 +2907,12 @@ class HermesACPAgent(acp.Agent):
     async def set_config_option(
         self, config_id: str, session_id: str, value: str, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
-        """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
+        """Apply an ACP setting and answer with every setting's current value.
+
+        The answer is the full list because clients replace their copy with
+        it (T3 Code does). Ids Hermes does not offer are still accepted and
+        stored, as before.
+        """
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.warning("Session %s: config update requested for missing session", session_id)
@@ -2810,6 +2925,28 @@ class HermesACPAgent(acp.Agent):
             # Before this branch the value landed in config_options below and
             # the session silently kept its old mode.
             setattr(state, "mode", self._normalize_mode(value))
+        elif str(config_id) == self._REASONING_CONFIG_ID:
+            level = str(value).strip().lower()
+            if level == self._REASONING_DEFAULT:
+                state.reasoning_effort = None
+            elif level in self._reasoning_levels():
+                state.reasoning_effort = level
+            else:
+                raise acp.RequestError(
+                    -32602,
+                    f"Unknown reasoning level {value!r}",
+                    {
+                        "configId": self._REASONING_CONFIG_ID,
+                        "allowedValues": [self._REASONING_DEFAULT, *self._reasoning_levels()],
+                        "receivedValue": value,
+                    },
+                )
+            self._apply_session_reasoning(state)
+            logger.info(
+                "Session %s: reasoning set to %s",
+                session_id,
+                state.reasoning_effort or self._REASONING_DEFAULT,
+            )
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
@@ -2818,4 +2955,4 @@ class HermesACPAgent(acp.Agent):
             setattr(state, "config_options", options)
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
-        return SetSessionConfigOptionResponse(config_options=[])
+        return SetSessionConfigOptionResponse(config_options=self._session_config_options(state))
