@@ -126,8 +126,8 @@ _background_review_pass_state: "_ctxvars.ContextVar[_BackgroundReviewPassState]"
 # Post-turn review scope (keeper ruling 2026-09-24, task 633; Discord #gateway
 # message 1552775230093529211). The post-turn review fork keeps exactly one
 # direct skill write: patching (or, failing that, editing) a skill that was
-# loaded in the reviewed conversation and turned out wrong. Every other pattern
-# goes to the Atrium beam photon ledger through the beam_photon tool.
+# loaded in the reviewed conversation and turned out wrong. Other method patterns
+# stay unrecorded after Luis retired beam-ledger capture on 2026-10-11.
 #
 # The value is the frozenset of skill names loaded in the reviewed
 # conversation, installed on the review thread before run_conversation (tool
@@ -174,8 +174,8 @@ def _post_turn_review_guard(action: str, name: str) -> Optional[Dict[str, Any]]:
         "success": False,
         "error": (
             f"Refused: {why}. Its only direct skill write is patching a skill "
-            "loaded in this conversation that turned out wrong. Record other "
-            "patterns with beam_photon (search_memory, then record)."
+            "loaded in this conversation that turned out wrong. Leave other "
+            "patterns unrecorded; beam-ledger capture was retired by the keeper."
         ),
     }
 

@@ -405,9 +405,9 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # the actual text lives here so future edits are one-place.
 # Keeper ruling 2026-09-24 (task 633; Discord #gateway 1552775230093529211):
 # the post-turn review stops growing skill files. One direct skill write stays
-# (fixing a skill loaded in the conversation that turned out wrong); every
-# other pattern goes to the owning Atrium beam's photon ledger through the
-# beam_photon tool, corroborated against memory photons at review time. The
+# (fixing a skill loaded in the conversation that turned out wrong).
+# Luis retired beam-photon capture in T3 on 2026-10-11 after the clean sweep;
+# other method patterns stay unrecorded by this background pass. The
 # refusal side is enforced in tools/skill_manager_tool.py
 # (_post_turn_review_guard), so this text describes rules the code keeps.
 _SKILL_ROUTING_RULES = (
@@ -429,25 +429,15 @@ _SKILL_ROUTING_RULES = (
     "fix). Change only what was wrong. Creating skills, adding support "
     "files, deleting, and writing to skills not loaded in this "
     "conversation are refused.\n"
-    "  2. EVERYTHING ELSE GOES TO THE BEAM PHOTON LEDGER. Record the "
-    "pattern with the beam_photon tool instead of writing it into a "
-    "skill. Beam photons are Atrium ledger rows, not memory photons.\n"
-    "     a. beam_photon action=search_memory with a query drawn from the "
-    "pattern, to find memory photons (fact_store) that corroborate it.\n"
-    "     b. beam_photon action=route with skill=<the skill that governs "
-    "this class of work> and query=<a few words naming the domain>, when "
-    "you do not already know the owning beam.\n"
-    "     c. beam_photon action=record with title, text (the pattern, "
-    "stated so a later reader can apply it), skill, beam (the owning "
-    "beam, only if you know it), memory_queries (the searches you ran), "
-    "and memory_fact_ids (only memory photons that actually support the "
-    "pattern; none is a valid answer). Use origin_type=luis_origin when "
-    "the user stated the rule.\n"
-    "     One record per distinct pattern. Do not record what the "
-    "governing skill already says.\n"
-    "  A user correction follows the same split: patch the loaded skill "
-    "it corrected, or record a beam photon tied to the skill that "
-    "governs that task.\n\n"
+    "  2. Leave other patterns unrecorded in this background pass. "
+    "Beam-photon ledgers were retired after the keeper-approved clean "
+    "sweep on 2026-10-11; do not create or append beam-ledger rows. "
+    "This does not retire memory photons: user facts and durable "
+    "preferences still follow the memory rules when that half of the "
+    "review is active. New durable notes are proposed in a live session, "
+    "not minted by this pass.\n"
+    "  A user correction may patch the loaded skill it corrected; "
+    "otherwise leave the method pattern unrecorded.\n\n"
 )
 
 
@@ -511,8 +501,8 @@ _SKILL_REVIEW_PROMPT = (
     "being in play does not make one yours to edit. If such a skill is "
     "wrong or outdated, say so in your reply and recommend "
     "'hermes curator adopt <name>' — do not try to patch it.\n"
-    "If the skill that needs a fix is protected, record the fix as a "
-    "beam photon tied to that skill instead.\n\n"
+    "If the skill that needs a fix is protected, report it without "
+    "making a persistent write.\n\n"
     "Do NOT capture (these become persistent self-imposed constraints "
     "that bite you later when the environment changes):\n"
     "  • Environment-dependent failures: missing binaries, fresh-install "
@@ -538,10 +528,10 @@ _SKILL_REVIEW_PROMPT = (
     "only if you are independently confident of a real working alternative "
     "(not something you are merely guessing might work), capture ONLY that "
     "alternative — never the dead ends, and never dressed up as best practice.\n\n"
-    "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) as a beam photon tied to the "
-    "setup or troubleshooting skill — never 'this tool does not work' as a "
-    "standalone constraint.\n\n"
+    "If a tool failed because of setup state, capture the FIX only when "
+    "it corrects a loaded, writable setup or troubleshooting skill — "
+    "never 'this tool does not work' as a standalone constraint. "
+    "Otherwise leave that method unrecorded.\n\n"
     "If no signal fired, say 'Nothing to save.' and stop."
 )
 
@@ -570,8 +560,8 @@ _COMBINED_REVIEW_PROMPT = (
     "request). Your writes to these WILL be refused, including to skills "
     "loaded or consulted this session. If one is wrong, say so in your "
     "reply and recommend 'hermes curator adopt <name>' instead.\n"
-    "If the skill that needs a fix is protected, record the fix as a "
-    "beam photon tied to that skill instead.\n\n"
+    "If the skill that needs a fix is protected, report it without "
+    "making a persistent write.\n\n"
     "Do NOT capture as skills (these become persistent self-imposed "
     "constraints that bite you later when the environment changes):\n"
     "  • Environment-dependent failures: missing binaries, fresh-install "
@@ -597,14 +587,19 @@ _COMBINED_REVIEW_PROMPT = (
     "only if you are independently confident of a real working alternative "
     "(not something you are merely guessing might work), capture ONLY that "
     "alternative — never the dead ends, and never dressed up as best practice.\n\n"
-    "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) as a beam photon tied to the "
-    "setup or troubleshooting skill — never 'this tool does not work' as a "
-    "standalone constraint.\n\n"
+    "If a tool failed because of setup state, capture the FIX only when "
+    "it corrects a loaded, writable setup or troubleshooting skill — "
+    "never 'this tool does not work' as a standalone constraint. "
+    "Otherwise leave that method unrecorded.\n\n"
     "Act on whichever half has real signal. If neither does, say "
     "'Nothing to save.' and stop."
 )
 
+
+
+def review_tool_names(names: set[str]) -> set[str]:
+    """Keep memory and skill tools, but fence retired beam-ledger capture."""
+    return set(names) - {"beam_photon"}
 
 
 def skills_loaded_in_conversation(messages: Optional[List[Dict]]) -> set:
@@ -1539,13 +1534,13 @@ def _run_review_in_thread(
             # live sessions. fact_store is allowed only when the parent has one
             # (ReviewFactStoreRouter: adds, reads, logged edits and removals).
             review_toolsets = ["skills"]
-            review_whitelist = {
+            review_whitelist = review_tool_names({
                 t["function"]["name"]
                 for t in get_tool_definitions(
                     enabled_toolsets=review_toolsets,
                     quiet_mode=True,
                 )
-            }
+            })
             if getattr(review_agent, "_review_fact_store", None) is not None:
                 review_whitelist.add(_REVIEW_FACT_STORE_TOOL)
             set_thread_tool_whitelist(

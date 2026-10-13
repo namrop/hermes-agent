@@ -25,11 +25,12 @@ def test_patch_of_loaded_skill_passes_guard():
     assert _in_review({"productivity/oasis-mailroom-operations"}, lambda: smt._post_turn_review_guard("edit", "oasis-mailroom-operations")) is None
 
 
-def test_other_writes_are_refused_with_beam_photon_pointer():
+def test_other_writes_are_refused_without_beam_photon_pointer():
     for action, name in (("patch", "not-loaded"), ("create", "x"), ("write_file", "oasis-mailroom-operations"), ("delete", "oasis-mailroom-operations"), ("remove_file", "oasis-mailroom-operations")):
         refusal = _in_review({"oasis-mailroom-operations"}, lambda: smt._post_turn_review_guard(action, name))
         assert refusal and refusal["success"] is False, (action, name)
-        assert "beam_photon" in refusal["error"]
+        assert "beam_photon" not in refusal["error"]
+        assert "unrecorded" in refusal["error"]
 
 
 def test_skill_manage_refuses_create_before_touching_disk():

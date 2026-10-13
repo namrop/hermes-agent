@@ -2,9 +2,9 @@
 
 Keeper ruling 2026-09-24 (task 633): the post-turn review no longer grows the
 skill library. "Nothing to save." is a normal result; its one direct skill
-write is patching a skill loaded in the conversation that turned out wrong;
-every other pattern is recorded with beam_photon in the owning Atrium beam's
-photon ledger, after searching memory photons for corroboration.
+write is patching a skill loaded in the conversation that turned out wrong.
+The 2026-10-11 keeper-approved clean sweep retired beam-ledger capture;
+memory photons remain a separate, active destination.
 
 User-preference corrections (style, format, verbosity, legibility) are
 first-class skill signals, not just memory signals.
@@ -20,7 +20,7 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def _assert_beam_photon_routing(prompt: str, label: str) -> None:
+def _assert_retired_beam_routing(prompt: str, label: str) -> None:
     lower = prompt.lower()
     # No write quota: inaction is a normal outcome.
     assert "be active" not in lower, f"{label}: write quota must be gone"
@@ -31,22 +31,22 @@ def _assert_beam_photon_routing(prompt: str, label: str) -> None:
     assert "loaded in this conversation" in lower
     assert "action=patch" in prompt
     assert "refused" in lower
-    # Everything else goes to the beam photon ledger, memory searched first.
-    assert "beam_photon" in prompt
-    assert "action=search_memory" in prompt and "action=record" in prompt
-    assert "memory_queries" in prompt and "memory_fact_ids" in prompt
-    assert "not memory photons" in lower, f"{label}: must keep the two photon senses apart"
+    # The clean sweep retired ledger capture, not memory photons.
+    assert "beam_photon action=" not in prompt
+    assert "leave other patterns unrecorded" in lower
+    assert "do not create or append beam-ledger rows" in lower
+    assert "does not retire memory photons" in lower
     # Old accretion paths are gone.
     assert "write_file" not in prompt, f"{label}: support-file writes are no longer offered"
     assert "CREATE A NEW CLASS-LEVEL UMBRELLA" not in prompt
 
 
-def test_skill_review_prompt_routes_patterns_to_beam_photons():
-    _assert_beam_photon_routing(AIAgent._SKILL_REVIEW_PROMPT, "_SKILL_REVIEW_PROMPT")
+def test_skill_review_prompt_leaves_non_skill_patterns_unrecorded():
+    _assert_retired_beam_routing(AIAgent._SKILL_REVIEW_PROMPT, "_SKILL_REVIEW_PROMPT")
 
 
-def test_combined_review_prompt_routes_patterns_to_beam_photons():
-    _assert_beam_photon_routing(AIAgent._COMBINED_REVIEW_PROMPT, "_COMBINED_REVIEW_PROMPT")
+def test_combined_review_prompt_preserves_memory_but_not_beam_capture():
+    _assert_retired_beam_routing(AIAgent._COMBINED_REVIEW_PROMPT, "_COMBINED_REVIEW_PROMPT")
 
 
 def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
