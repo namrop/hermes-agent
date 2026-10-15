@@ -3455,8 +3455,8 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     torn down per-turn as before to prevent resource leakage (the original
     intent of this hook for the Morph backend, see commit fbd3a2fd).
 
-    Skips ``cleanup_browser`` in headed mode so the browser window stays
-    visible between turns. The inactivity reaper in
+    Preserves the legacy headed browser window between turns, but always
+    releases exact task-owned CDP targets. The inactivity reaper in
     ``browser_tool._cleanup_inactive_browser_sessions`` still handles
     idle sessions.
     """
@@ -3480,6 +3480,8 @@ def cleanup_task_resources(agent, task_id: str) -> None:
         except Exception:
             headed = bool(os.environ.get("AGENT_BROWSER_HEADED"))
         if headed:
+            from tools.browser_tool import _cleanup_owned_cdp_targets
+            _cleanup_owned_cdp_targets(task_id)
             if agent.verbose_logging:
                 logging.debug(
                     f"Skipping per-turn cleanup_browser for headed session {task_id}; "

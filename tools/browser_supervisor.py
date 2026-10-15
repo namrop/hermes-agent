@@ -342,6 +342,9 @@ class CDPSupervisor:
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
         self._child_sessions: Dict[str, Dict[str, Any]] = {}  # session_id -> info
+        # Borrowed pages never enter this list. A supervisor-created empty page
+        # has an exact durable owner, independent of WebSocket reconnections.
+        self._target_owners: List[Any] = []
 
         # Dialog auto-dismiss watchdog handles (per dialog id).
         self._dialog_watchdogs: Dict[str, asyncio.TimerHandle] = {}
@@ -624,6 +627,11 @@ class CDPSupervisor:
             else:
                 logger.warning("CDP supervisor %s crashed: %s", self.task_id, e)
         finally:
+            try:
+                loop.run_until_complete(self._release_owned_targets())
+            except BaseException as exc:
+                logger.warning("CDP supervisor %s: owned-target release deferred: %s",
+                               self.task_id, _redact_cdp_error_text(exc))
             # Flush any remaining tasks before closing the loop so we don't
             # emit "Task was destroyed but it is pending" warnings.
             try:
@@ -738,14 +746,31 @@ class CDPSupervisor:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
+    def _new_target_owner(self):
+        from tools.cdp_ownership import TargetOwner
+
+        return TargetOwner(self.cdp_url, self.task_id)
+
+    async def _release_owned_targets(self) -> None:
+        for owner in self._target_owners:
+            try:
+                # The owner persists release before waiting on CDP, so this
+                # deadline cannot discard the exact-target retry handle.
+                await asyncio.wait_for(owner.release(), timeout=5.0)
+            except Exception as exc:
+                logger.warning("CDP supervisor %s: target cleanup pending: %s",
+                               self.task_id, _redact_cdp_error_text(exc))
+        self._target_owners.clear()
+
     async def _attach_initial_page(self) -> None:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
         resp = await self._cdp("Target.getTargets")
         targets = resp.get("result", {}).get("targetInfos", [])
         page_target = next((t for t in targets if t.get("type") == "page"), None)
         if page_target is None:
-            created = await self._cdp("Target.createTarget", {"url": "about:blank"})
-            target_id = created["result"]["targetId"]
+            owner = self._new_target_owner()
+            self._target_owners.append(owner)
+            target_id = await owner.create("about:blank")
         else:
             target_id = page_target["targetId"]
 

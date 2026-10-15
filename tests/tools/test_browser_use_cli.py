@@ -812,7 +812,7 @@ class TestBrowserExec:
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert "bu:r7k2" in result["output"]
+        assert "bu:" + bu_cli._scoped_daemon_name(None, "r7k2") in result["output"]
         assert result["session"] == "r7k2"
 
     def test_invalid_session_name_rejected(self, monkeypatch, tmp_path):

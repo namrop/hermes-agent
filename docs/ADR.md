@@ -1,5 +1,70 @@
 # Architecture Decision Records
 
+## 2026-10-15: Shared CDP producers own exact targets through a durable lifecycle
+
+Status: Accepted — source implementation and focused tests. Fleet activation is a
+separate deployment step, recorded in the Atrium shared-browser repair record.
+
+Context: a connected CDP browser is a shared resource, not a task's browser to
+close. Rendered extraction, supervisor-created pages, raw `browser_cdp`
+`Target.createTarget`, and browser-use can all create tabs. Earthglass's separate
+MCP ownership fix does not cover these Hermes producers. The installed
+browser-harness daemon creates a named session's initial target **before** it
+executes Hermes's own-tab preamble; wrapping only `new_tab` or comparing tab lists
+would miss that target or incorrectly claim a human/sibling tab.
+
+Decision:
+- `tools.cdp_ownership.TargetOwner(endpoint, task_id)` is the shared core. Each
+  owner has a random UUID and a durable PID plus `psutil.Process.create_time()`
+  identity in the profile's `get_hermes_home()/browser-owned.sqlite3`. SQLite
+  transactions serialize keep, release, creation intents and reaper claims.
+- `await owner.create(url, **createTarget_params)` commits a random exact
+  `about:blank#hermes-owned-<uuid>` intent, creates that marker, commits the returned
+  target ID, then navigates. The browser WebSocket generation and target ID are
+  the ownership key. `owner.browser_websocket_url` is available after create (or
+  `await owner.resolve()`). HTTP discovery/list/close preserve endpoint query
+  selectors. A lost create response is recoverable only by its exact committed
+  nonce, not a site URL, blank-tab rule, age, regex, opener guess, or list diff.
+- `owner.release()`, `release_task(task_id)`, and `release_all()` synchronously
+  commit the release barrier before returning an awaitable cleanup. Task release
+  covers all producers in this exact process/task, not only proxy instances.
+  `owner.keep(target_id)` and `keep_task_target(task_id, target_id)` explicitly
+  hand off a target before release; kept records are never reaped.
+- `await reconcile()` closes only released owners or dead exact process
+  identities, claims each owner transactionally, retains failed/unmatched records,
+  verifies target absence before forgetting, and retires old browser-generation
+  records without closing targets in a replacement browser. Cleanup has a bounded
+  budget. HTTP exact-target close is a fallback only when an HTTP discovery
+  endpoint is known and its browser generation still matches. Raw WebSocket-only
+  owners retain pending cleanup for a later exact WebSocket retry.
+- Recovery runs before future creates, on task/all-browser cleanup and process
+  exit, and every 30 seconds after the first producer starts. No whole-browser
+  close/restart or unowned-tab sweep is part of recovery.
+- For an explicit shared CDP override, browser-use receives a per-task local
+  WebSocket proxy. It intercepts every `Target.createTarget`, including daemon
+  startup, the old-harness own-tab preamble, helper calls and raw CDP. Other CDP
+  requests/events retain their upstream connection/session semantics. Daemon
+  names are process/task/logical-session scoped, so a new task cannot reconnect
+  to a global named daemon. Private cloud-provider behavior is unchanged; local
+  auto-discovery without an explicit override is not enrolled in the proxy.
+  Task cleanup closes the proxy's sockets/event loop, then invokes the inspected
+  CLI's existing daemon-stop helper for that exact scoped name. Disconnecting
+  first prevents the harness's own dedicated-target shutdown from undoing a kept
+  handoff. This stops the task daemon, not the shared browser, and does not spawn
+  a replacement daemon.
+- `cleanup_browser` releases exact owners even without a legacy active-session
+  row. The headed turn-finalizer still preserves its legacy visible browser, but
+  no longer exempts task-owned shared-CDP targets from release.
+
+Verification: regression tests were run RED before implementation (global
+daemon-name collision, absent exec-only cleanup, headed cleanup omission, and
+query-selector discovery), then exercised against real local WebSocket/HTTP
+fixtures and a subprocess CLI wire fixture. Tests cover concurrent owners and
+reapers, close failure/retry, real subprocess death, PID reuse, browser-generation
+change, permanent handoff, cancellation, write-ahead nonce recovery, and startup /
+helper / raw-create interception. These fixtures do not launch a browser or touch
+a live CDP endpoint. Runtime smoke and deployment remain separate parent work.
+
 ## 2026-10-02: The gateway wakes only sessions it owns, and posts a wake once
 
 Status: Accepted — source implementation (branch `luis/gateway-wake-ownership-20261002`); not deployed when written. Steps 1, 4 and 6 of the repair plan in Atrium scar `01a0fba9` (`07_systems/hermes/incidents/scar_hermes_gateway_wakes_t3_acp_sessions_hidden_second_driver_2026-10-02.md`); steps 2, 3 and 5 are not built.

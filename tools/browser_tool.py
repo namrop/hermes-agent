@@ -4924,6 +4924,9 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     for session_key in session_keys:
         _cleanup_single_browser_session(session_key)
 
+    # browser_exec may be the only producer: it has no _active_sessions row.
+    _cleanup_owned_cdp_targets(task_id)
+
     # Drop stale last-active ownership. Cleaning a bare task drops its binding;
     # cleaning a sidecar drops the binding only if that sidecar was still the
     # recorded owner. This prevents a later click/snapshot from resurrecting a
@@ -4933,6 +4936,35 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
             _last_active_session_key.pop(bare_task_id, None)
     else:
         _last_active_session_key.pop(bare_task_id, None)
+
+
+def _cleanup_owned_cdp_targets(task_id: Optional[str] = None) -> None:
+    """Release shared-browser targets without closing a headed/shared browser."""
+    import asyncio
+
+    def cleanup():
+        try:
+            from tools.cdp_ownership import release_all, release_task
+            from tools.cdp_proxy import cleanup_task_proxies
+
+            # The call establishes the durable barrier synchronously.
+            pending = release_all() if task_id is None else release_task(task_id)
+            try:
+                cleanup_task_proxies(task_id)
+            finally:
+                asyncio.run(pending)
+        except Exception:
+            logger.warning("Exact CDP target cleanup remains pending", exc_info=True)
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        cleanup()
+    else:
+        # Sync finalizers also run inside async gateway paths; don't nest loops.
+        thread = threading.Thread(target=cleanup, name="cdp-task-cleanup", daemon=True)
+        thread.start()
+        thread.join(timeout=30)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:
@@ -5033,6 +5065,9 @@ def cleanup_all_browsers() -> None:
         task_ids = list(_active_sessions.keys())
     for task_id in task_ids:
         cleanup_browser(task_id)
+
+    # Includes browser_exec-only tasks that never entered _active_sessions.
+    _cleanup_owned_cdp_targets()
 
     # Tear down CDP supervisors for all tasks so background threads exit.
     try:

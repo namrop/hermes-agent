@@ -422,13 +422,15 @@ def test_query_endpoint_resolves_new_target_through_browser_websocket(monkeypatc
             ]
         raise AssertionError(url)
 
-    async def fake_create_target(browser_ws: str, url: str):
-        assert browser_ws == "ws://browser"
-        assert url == "https://example.com/"
-        return "target-1"
+    class Owner:
+        browser_websocket_url = "ws://browser"
+
+        async def create(self, url):
+            assert url == "https://example.com/"
+            return "target-1"
 
     monkeypatch.setattr(sys.modules["plugins.web.rendered_cdp"], "fetch_json", fake_fetch_json)
-    monkeypatch.setattr(provider, "_create_target_via_browser_websocket", fake_create_target)
+    monkeypatch.setattr(provider, "_new_target_owner", lambda: Owner())
 
     import asyncio
 
@@ -439,7 +441,6 @@ def test_query_endpoint_resolves_new_target_through_browser_websocket(monkeypatc
     assert resolved.browser_websocket_url == "ws://browser"
     assert resolved.owned is True
     assert calls == [
-        ("http://127.0.0.1:49225/json/version?fingerprint=hermes-spike-20260608", "GET"),
         ("http://127.0.0.1:49225/json?fingerprint=hermes-spike-20260608", "GET"),
     ]
 
@@ -462,14 +463,17 @@ async def test_query_endpoint_closes_created_target_when_target_list_resolution_
             return []
         raise AssertionError(url)
 
-    async def fake_create_target(browser_ws: str, url: str):
-        return "target-orphan"
+    class Owner:
+        browser_websocket_url = "ws://browser"
+
+        async def create(self, url):
+            return "target-orphan"
 
     async def fake_close(target):
         closed.append(target)
 
     monkeypatch.setattr(sys.modules["plugins.web.rendered_cdp"], "fetch_json", fake_fetch_json)
-    monkeypatch.setattr(provider, "_create_target_via_browser_websocket", fake_create_target)
+    monkeypatch.setattr(provider, "_new_target_owner", lambda: Owner())
     monkeypatch.setattr(provider, "_close_target", fake_close)
 
     with pytest.raises(RuntimeError, match="not visible"):

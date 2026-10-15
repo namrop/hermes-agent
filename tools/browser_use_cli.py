@@ -4,6 +4,7 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import time
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,6 +31,25 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # browser, or a named Browser Use cloud browser). Popped before the
 # subprocess launches — never exported to the CLI.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
+_SHARED_CDP_SENTINEL = "_HERMES_BU_SHARED_CDP"
+_PROCESS_NAMESPACE = uuid4().hex
+
+
+def _scoped_daemon_name(task_id, name):
+    key = f"{_PROCESS_NAMESPACE}:{os.getpid()}:{task_id or 'default'}:{name or 'default'}"
+    return "hermes-" + hashlib.sha256(key.encode()).hexdigest()[:40]
+
+
+def _stop_shared_daemon(cmd, env):
+    # The inspected CLI recognizes this admin helper before ensure_daemon(),
+    # so stopping a task never starts/restarts a browser or a replacement daemon.
+    try:
+        result = subprocess.run(cmd, input=f"stop_remote_daemon({env['BU_NAME']!r})",
+                                env=env, text=True, capture_output=True, timeout=10)
+        if result.returncode:
+            logger.warning("Task-scoped browser-use daemon did not confirm shutdown")
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Task-scoped browser-use daemon shutdown failed", exc_info=True)
 
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
@@ -70,6 +91,17 @@ def _hermes_ensure_own_tab():
         pass
 _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
+"""
+
+# Only the task's shared-CDP proxy implements this local ownership method.
+# The isolated CLI interpreter must not import the owning Hermes process.
+_SHARED_CDP_PREAMBLE = """\
+def keep_tab(target=None):
+    "Hand off this session's owned tab to the user instead of closing it."
+    if target is None:
+        target = current_tab()
+    tid = target["targetId"] if isinstance(target, dict) else target
+    return cdp("Hermes.keepTarget", targetId=tid)
 """
 
 _DEFAULT_TIMEOUT_S = 300
@@ -475,6 +507,7 @@ def _resolve_backend_cdp(
     Returns an error string on provider failure, None on success.
     """
     if env.get("BU_CDP_WS") or env.get("BU_CDP_URL"):
+        env[_PRIVATE_BROWSER_SENTINEL if env.get("BU_BROWSER_ID") else _SHARED_CDP_SENTINEL] = "1"
         return None
 
     try:
@@ -493,6 +526,7 @@ def _resolve_backend_cdp(
         override = ""
     if override:
         env["BU_CDP_URL" if override.startswith(("http://", "https://")) else "BU_CDP_WS"] = override
+        env[_SHARED_CDP_SENTINEL] = "1"
         return None
 
     try:
@@ -541,8 +575,7 @@ def _resolve_backend_cdp(
     # A provider browser keyed bu-named-<name> is exclusive to this session —
     # the own-tab preamble is unnecessary there (it would just leak a blank
     # tab into a browser nobody else touches).
-    if session_name:
-        env[_PRIVATE_BROWSER_SENTINEL] = "1"
+    env[_PRIVATE_BROWSER_SENTINEL] = "1"
     return None
 
 
@@ -597,7 +630,25 @@ def browser_exec(
     # the model's code. Private per-name browsers (provider-keyed or BU
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
-    if session and not private_browser:
+    shared_cdp = env.pop(_SHARED_CDP_SENTINEL, None)
+    logical_name = session or env.get("BU_NAME", "default")
+    if not private_browser:
+        # A display name is task-local, not a global daemon identifier.
+        env["BU_NAME"] = _scoped_daemon_name(task_id, logical_name)
+    if shared_cdp and not private_browser:
+        from tools.cdp_proxy import shared_proxy
+
+        endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+        try:
+            proxy = shared_proxy(endpoint, task_id, logical_name)
+        except Exception as exc:
+            return tool_error(f"Shared CDP ownership transport unavailable ({type(exc).__name__})")
+        env.pop("BU_CDP_URL", None)
+        env["BU_CDP_WS"] = proxy.url
+        env["BU_NAME"] = "hermes-" + proxy.owner.owner_id.replace("-", "")
+        proxy.stop_daemon = lambda: _stop_shared_daemon(cmd, dict(env))
+        code = _SHARED_CDP_PREAMBLE + code
+    if (session or shared_cdp) and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -700,7 +751,10 @@ _HEADER_BASE = (
     "call, so progress survives timeouts. For an isolated concurrent "
     "browser session (parallel tasks that must not share tabs), pass "
     "session=<name> (never BU_NAME env syntax) and reuse the same name on "
-    "every related call."
+    "every related call. On shared CDP browsers, task-owned tabs close at "
+    "turn completion unless `keep_tab()` explicitly hands the current tab "
+    "off to the user. `keep_tab(target)` also accepts an exact target ID or "
+    "helper tab dict; only this session's owned tabs can be kept."
 )
 
 _HEADER_VISION = (

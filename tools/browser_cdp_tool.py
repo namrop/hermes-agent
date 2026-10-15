@@ -391,6 +391,24 @@ def _browser_cdp_via_supervisor(
     return json.dumps(payload, ensure_ascii=False)
 
 
+async def _create_owned_target(endpoint: str, task_id: str, params: Dict[str, Any], timeout: float):
+    from tools.cdp_ownership import TargetOwner
+
+    owner = TargetOwner(endpoint, task_id)
+    create_params = dict(params)
+    url = create_params.pop("url", "about:blank")
+    try:
+        async with asyncio.timeout(timeout):
+            target_id = await owner.create(url, **create_params)
+        return {"targetId": target_id}
+    except BaseException:
+        try:
+            await asyncio.wait_for(owner.release(), timeout=5.0)
+        except BaseException:
+            logger.warning("Raw CDP create cleanup deferred to durable reconciliation")
+        raise
+
+
 def browser_cdp(
     method: str,
     params: Optional[Dict[str, Any]] = None,
@@ -425,6 +443,20 @@ def browser_cdp(
         success, or ``{"error": "..."}`` on failure.
     """
     effective_task_id = task_id or "default"
+
+    # This internal method mutates local ownership, not page/browser state.
+    # Never send it upstream or probe an unrelated current page/iframe first.
+    if method == "Hermes.keepTarget":
+        tid = params.get("targetId") if isinstance(params, dict) else None
+        if not isinstance(tid, str) or not tid:
+            return tool_error("Hermes.keepTarget requires params.targetId as an exact non-empty target ID", method=method)
+        from tools.cdp_ownership import keep_task_target
+
+        try:
+            keep_task_target(effective_task_id, tid)
+        except (ValueError, RuntimeError) as exc:
+            return tool_error(str(exc), method=method)
+        return json.dumps({"success": True, "method": method, "result": {"targetId": tid, "kept": True}})
 
     # --- Route iframe-scoped calls through the supervisor ---------------
     if frame_id:
@@ -497,7 +529,9 @@ def browser_cdp(
 
     try:
         result = _run_async(
-            _cdp_call(endpoint, method, call_params, target_id, safe_timeout)
+            _create_owned_target(endpoint, effective_task_id, call_params, safe_timeout)
+            if method == "Target.createTarget"
+            else _cdp_call(endpoint, method, call_params, target_id, safe_timeout)
         )
     except asyncio.TimeoutError as exc:
         return tool_error(
@@ -554,6 +588,10 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
         "to look up parameters and return shape.\n\n"
         "**Common patterns:**\n"
         "- List tabs: method='Target.getTargets', params={}\n"
+        "- Hand off a task-owned tab to the user: method='Hermes.keepTarget', "
+        "params={'targetId': <tabId>}. This is local-only and requires an "
+        "active same-task owner; shared task-owned tabs otherwise close at "
+        "turn completion.\n"
         "- Handle a native JS dialog: method='Page.handleJavaScriptDialog', "
         "params={'accept': true, 'promptText': ''}, target_id=<tabId>\n"
         "- Get all cookies: method='Network.getAllCookies', params={}\n"

@@ -31,6 +31,7 @@ class ResolvedCdpTarget:
     target_id: Optional[str] = None
     browser_websocket_url: Optional[str] = None
     owned: bool = False
+    owner: Any = None
 
 
 _CAPTURE_EXPR = r"""
@@ -414,17 +415,22 @@ class CdpRenderedExtractProvider(WebSearchProvider):
                         )
             raise RuntimeError("No active CDP page target with webSocketDebuggerUrl")
 
-        browser_info = await fetch_json(build_cdp_discovery_url(endpoint))
-        browser_ws = browser_info.get("webSocketDebuggerUrl") if isinstance(browser_info, dict) else None
-        if not browser_ws:
-            raise RuntimeError("CDP /json/version did not return browser webSocketDebuggerUrl")
-
-        target_id = await self._create_target_via_browser_websocket(str(browser_ws), url)
+        owner = self._new_target_owner()
+        try:
+            target_id = await owner.create(url)
+        except BaseException:
+            # The write-ahead intent survives an interrupted create response;
+            # release it even if we never obtained a target id.
+            await self._close_target_after_resolution_failure(
+                ResolvedCdpTarget(websocket_url="", owned=True, owner=owner)
+            )
+            raise
         unresolved_target = ResolvedCdpTarget(
             websocket_url="",
             target_id=target_id,
-            browser_websocket_url=str(browser_ws),
+            browser_websocket_url=owner.browser_websocket_url,
             owned=True,
+            owner=owner,
         )
         try:
             target = await self._wait_for_created_target(endpoint, target_id=target_id)
@@ -439,9 +445,17 @@ class CdpRenderedExtractProvider(WebSearchProvider):
         return ResolvedCdpTarget(
             websocket_url=str(websocket_url),
             target_id=target_id,
-            browser_websocket_url=str(browser_ws),
+            browser_websocket_url=owner.browser_websocket_url,
             owned=True,
+            owner=owner,
         )
+
+    def _new_target_owner(self):
+        from tools.cdp_ownership import TargetOwner
+
+        # Every capture gets a distinct owner, even when providers are cached
+        # and concurrent callers share this provider instance.
+        return TargetOwner(self.endpoint, "rendered-extract")
 
     async def _wait_for_created_target(
         self,
@@ -529,19 +543,14 @@ class CdpRenderedExtractProvider(WebSearchProvider):
         except TimeoutError as exc:
             raise TimeoutError(f"Timed out waiting for response to {method}") from exc
 
-    async def _create_target_via_browser_websocket(self, browser_websocket_url: str, url: str) -> str:
-        result = await self._cdp_command(
-            browser_websocket_url,
-            "Target.createTarget",
-            {"url": url},
-        )
-        target_id = result.get("targetId")
-        if not target_id:
-            raise RuntimeError("CDP Target.createTarget did not return targetId")
-        return str(target_id)
-
     async def _close_target(self, target: ResolvedCdpTarget) -> None:
         if not target.owned:
+            return
+        owner = getattr(target, "owner", None)
+        if owner is not None:
+            # release records pending cleanup before its first network await.
+            # A close timeout/process death must not lose the retry handle.
+            await owner.release()
             return
         if not target.target_id:
             raise RuntimeError("Owned CDP target is missing targetId")
