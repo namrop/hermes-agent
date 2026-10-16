@@ -2610,7 +2610,9 @@ class HermesACPAgent(acp.Agent):
             provider = getattr(state.agent, "provider", None) or "auto"
             return f"Current model: {model}\nProvider: {provider}"
 
-        current_provider = getattr(state.agent, "provider", None) or "openrouter"
+        current_provider = getattr(state.agent, "requested_provider", None)
+        if not isinstance(current_provider, str) or not current_provider:
+            current_provider = getattr(state.agent, "provider", None) or "openrouter"
         target_provider, new_model = self._resolve_model_selection(args, current_provider)
 
         state.model = new_model
@@ -2859,7 +2861,9 @@ class HermesACPAgent(acp.Agent):
         """Switch the model for a session (called by ACP protocol)."""
         state = self.session_manager.get_session(session_id)
         if state:
-            current_provider = getattr(state.agent, "provider", None)
+            current_provider = getattr(state.agent, "requested_provider", None)
+            if not isinstance(current_provider, str) or not current_provider:
+                current_provider = getattr(state.agent, "provider", None)
             requested_provider, resolved_model = self._resolve_model_selection(
                 model_id,
                 current_provider or "openrouter",

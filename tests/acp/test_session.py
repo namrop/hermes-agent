@@ -218,6 +218,88 @@ class TestCreateSession:
 # ---------------------------------------------------------------------------
 
 
+class TestSelectedProviderIdentity:
+    @pytest.fixture()
+    def provider_manager(self, monkeypatch):
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                self.model = kwargs["model"]
+                self.provider = kwargs.get("provider")
+                self.requested_provider = kwargs.get("requested_provider") or self.provider
+                self.base_url = kwargs.get("base_url")
+                self.api_mode = kwargs.get("api_mode")
+
+        config = {"model": {"default": "claude-opus-5-5", "provider": "anthropic"}}
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *args: None)
+        monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **kwargs: None)
+
+        def resolve(requested=None):
+            return {"provider": "custom" if (requested or "").startswith("custom:") else requested,
+                    "requested_provider": requested, "api_mode": "anthropic_messages",
+                    "base_url": "http://127.0.0.1:9", "api_key": "test-key"}
+
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+        return SessionManager(), config
+
+    @pytest.mark.parametrize("identity", ["custom:meridian-primary", "custom:meridian-yugen"])
+    @pytest.mark.parametrize("origin", ["runtime", "argument", "config"])
+    def test_factory_retains_selected_provider(self, provider_manager, monkeypatch, identity, origin):
+        manager, config = provider_manager
+        config["model"]["provider"] = identity if origin == "config" else "anthropic"
+        runtime = {"provider": "custom", "api_mode": "anthropic_messages", "api_key": "test-key"}
+        if origin == "runtime":
+            runtime["requested_provider"] = identity
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kwargs: runtime)
+
+        requested = {"runtime": "auto", "config": None, "argument": identity}[origin]
+        agent = manager._make_agent(session_id="selected", cwd="/tmp", requested_provider=requested)
+
+        assert agent.provider == "custom"
+        assert agent.requested_provider == identity
+
+    @pytest.mark.parametrize("identity", ["custom:meridian-primary", "custom:meridian-yugen"])
+    @pytest.mark.parametrize("lifecycle", ["fork", "restore"])
+    def test_selected_identity_survives_reconstruction(self, provider_manager, identity, lifecycle):
+        manager, config = provider_manager
+        config["model"]["provider"] = identity
+        state = manager.create_session(cwd="/tmp")
+        config["model"]["provider"] = "anthropic"
+        if lifecycle == "fork":
+            rebuilt = manager.fork_session(state.session_id, cwd="/tmp")
+        else:
+            manager._sessions.pop(state.session_id)
+            rebuilt = manager.get_session(state.session_id)
+        assert rebuilt.agent.requested_provider == identity
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("identity", ["custom:meridian-primary", "custom:meridian-yugen"])
+    @pytest.mark.parametrize("switch", ["protocol", "slash"])
+    async def test_model_rebuild_keeps_selected_identity(self, provider_manager, monkeypatch, identity, switch):
+        from acp_adapter.server import HermesACPAgent
+
+        manager, config = provider_manager
+        config["model"]["provider"] = identity
+        state = manager.create_session(cwd="/tmp")
+        server = HermesACPAgent(session_manager=manager)
+        selections = []
+
+        def select(raw_model, current_provider):
+            selections.append(current_provider)
+            return current_provider, raw_model
+
+        monkeypatch.setattr(server, "_resolve_model_selection", select)
+        monkeypatch.setattr(server, "_apply_session_reasoning", lambda state: None)
+        monkeypatch.setattr(server, "_refresh_session_mcp_tools", lambda state: None)
+        if switch == "protocol":
+            await server.set_session_model("claude-sonnet-4-6", state.session_id)
+        else:
+            server._cmd_model("claude-sonnet-4-6", state)
+        assert selections == [identity]
+        assert state.agent.requested_provider == identity
+
+
 class TestWslCwdTranslation:
     def test_translate_acp_cwd_converts_windows_drive_path_when_wsl(self, monkeypatch):
         monkeypatch.setattr("hermes_constants._wsl_detected", True)
