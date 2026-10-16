@@ -299,6 +299,68 @@ class TestSelectedProviderIdentity:
         assert selections == [identity]
         assert state.agent.requested_provider == identity
 
+    @pytest.mark.parametrize("identity", ["custom:meridian-primary", "custom:meridian-yugen"])
+    @pytest.mark.parametrize("lifecycle", ["restore", "fork"])
+    def test_legacy_bare_custom_recovers_by_endpoint(self, provider_manager, monkeypatch, identity, lifecycle):
+        manager, config = provider_manager
+        endpoints = {
+            "custom:meridian-primary": "https://primary.example.invalid/v1",
+            "custom:meridian-yugen": "https://yugen.example.invalid/v1",
+        }
+        endpoint = endpoints[identity]
+        # Both entries serve the same model, and the global default points to
+        # the OTHER account: only the persisted endpoint disambiguates them.
+        config["model"]["provider"] = next(key for key in endpoints if key != identity)
+        config["providers"] = {
+            key.removeprefix("custom:"): {"base_url": url, "models": ["shared-model"]}
+            for key, url in endpoints.items()
+        }
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+        monkeypatch.setattr("hermes_cli.runtime_provider._get_model_config", lambda: config["model"])
+        resolved = []
+
+        def resolve(requested=None):
+            resolved.append(requested)
+            return {"provider": "custom", "requested_provider": requested,
+                    "base_url": endpoints.get(requested or ""), "api_mode": "anthropic_messages",
+                    "api_key": "synthetic-key"}
+
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+        manager._get_db().create_session(
+            session_id="legacy-custom", source="acp", model="shared-model",
+            model_config={"cwd": "/tmp", "provider": "custom", "base_url": endpoint,
+                          "api_mode": "anthropic_messages"},
+        )
+        if lifecycle == "restore":
+            rebuilt = manager.get_session("legacy-custom")
+        else:
+            # An agent created before the identity field existed can still be
+            # in memory when the client forks it; do not pre-heal that fixture.
+            manager._sessions["legacy-custom"] = SessionState(
+                session_id="legacy-custom", cwd="/tmp", model="shared-model",
+                agent=SimpleNamespace(provider="custom", base_url=endpoint,
+                                      api_mode="anthropic_messages"),
+            )
+            rebuilt = manager.fork_session("legacy-custom", cwd="/tmp")
+
+        assert resolved == [identity]
+        assert rebuilt.agent.requested_provider == identity
+        assert rebuilt.agent.base_url == endpoint
+        assert rebuilt.agent.api_mode == "anthropic_messages"
+
+    @pytest.mark.parametrize("identity", ["custom:meridian-primary", "custom:meridian-yugen"])
+    def test_explicit_named_identity_does_not_need_recovery(self, provider_manager, monkeypatch, identity):
+        manager, _ = provider_manager
+
+        def unexpected_recovery(**kwargs):
+            pytest.fail("an explicit named identity must not be canonicalized")
+
+        monkeypatch.setattr("hermes_cli.runtime_provider.canonical_custom_identity", unexpected_recovery)
+        agent = manager._make_agent(session_id="named", cwd="/tmp", requested_provider=identity,
+                                    base_url="https://selected.example.invalid/v1")
+        assert agent.requested_provider == identity
+        assert agent.base_url == "https://selected.example.invalid/v1"
+
 
 class TestWslCwdTranslation:
     def test_translate_acp_cwd_converts_windows_drive_path_when_wsl(self, monkeypatch):

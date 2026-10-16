@@ -327,6 +327,8 @@ class SessionManager:
             model=original.model or None,
             requested_provider=(getattr(original.agent, "requested_provider", None)
                                 or getattr(original.agent, "provider", None)),
+            base_url=getattr(original.agent, "base_url", None),
+            api_mode=getattr(original.agent, "api_mode", None),
         )
         state = SessionState(
             session_id=new_id,
@@ -748,7 +750,7 @@ class SessionManager:
         from run_agent import AIAgent
         from hermes_cli.config import load_config
         from hermes_cli.fallback_config import get_fallback_chain
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import canonical_custom_identity, resolve_runtime_provider
 
         config = load_config()
         model_cfg = config.get("model")
@@ -759,6 +761,15 @@ class SessionManager:
             config_provider = model_cfg.get("provider")
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
+
+        requested_provider = requested_provider or config_provider
+        if isinstance(requested_provider, str) and requested_provider.strip().lower() == "custom":
+            # Legacy ACP rows/agents kept only the transport family. Recover
+            # the routable identity before resolution, with the saved endpoint
+            # taking precedence over a later change to the global default.
+            requested_provider = canonical_custom_identity(
+                base_url=base_url, config_provider=config_provider, model=model or default_model,
+            ) or requested_provider
 
         configured_mcp_servers = [
             name
