@@ -2962,6 +2962,7 @@ def run_conversation(
                         platform=agent.platform or "",
                         model=agent.model,
                         provider=agent.provider,
+                        requested_provider=getattr(agent, "requested_provider", None) or agent.provider,
                         base_url=agent.base_url,
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,

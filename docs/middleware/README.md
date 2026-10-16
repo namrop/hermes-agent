@@ -93,6 +93,17 @@ Responses API `input`, model settings, tool definitions, stream options, and
 provider-specific options. Execution middleware receives the same effective
 request plus `next_call`.
 
+`llm_request` also receives `provider` (the resolved transport family, such as
+`custom`) and `requested_provider` (the live selected identity, such as
+`custom:meridian-yugen`). Use the latter for exact provider-specific opt-ins;
+the transport family alone cannot distinguish two custom endpoints. Model
+switches and fallback update the agent's selected identity before this hook.
+Older direct callers may omit it, so plugins can fall back to `provider`.
+Provider-specific request-only body fields can travel in SDK `extra_body`;
+the native Anthropic send helper preserves that field on streaming and
+non-streaming calls. Such fields must only be sent to a provider that supports
+them, not inferred from the generic `custom` family.
+
 ### Tool Calls
 
 For each tool call, Hermes applies middleware in this order:
